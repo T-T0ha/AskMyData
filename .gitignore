@@ -1,0 +1,29 @@
+# python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# app state
+backend/var/
+backend/tests/fixtures/*.xlsx
+.env
+.env.local
+!.env.example
+
+# node
+node_modules/
+frontend/dist/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
+
+# claude
+.claude/settings.local.json
+
+# docs, papers, reports, and other non-execution material
+*.md
+*.pdf
+docs/

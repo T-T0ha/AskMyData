@@ -1,0 +1,35 @@
+# --- web -------------------------------------------------------------------
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.20
+pydantic-settings>=2.7
+
+# --- data ------------------------------------------------------------------
+pandas>=2.2
+openpyxl>=3.1
+numpy>=1.26
+python-dateutil>=2.9
+rapidfuzz>=3.10
+
+# --- storage ---------------------------------------------------------------
+sqlalchemy>=2.0
+psycopg[binary]>=3.2
+pgvector>=0.3
+# Parses and transpiles SQL dumps written for another database into SQLite so
+# they can be replayed and read; also the SELECT-only guard in Phase 5.
+sqlglot>=25.0
+# Optional: only needed to ingest from a live MySQL/MariaDB source.
+# pymysql>=1.1
+
+# --- agent orchestration ---------------------------------------------------
+langgraph>=1.0
+langgraph-checkpoint-postgres>=2.0
+langgraph-checkpoint-sqlite>=2.0
+
+# --- llm + embeddings ------------------------------------------------------
+anthropic>=0.40
+sentence-transformers>=3.3
+
+# --- tests -----------------------------------------------------------------
+pytest>=8.3
+httpx>=0.28

@@ -1,0 +1,772 @@
+/** AskMyData — application shell.
+ *
+ *  Everything sits behind a sign-in: datasets belong to accounts, and the
+ *  backend will not answer for one without knowing whose it is.
+ *
+ *  Five stages, in the order the pipeline runs them:
+ *
+ *    Add data          → ingestion and structural repair (files or a database)
+ *    Triage            → data quality buckets + cross-sheet equivalences
+ *    Field semantics   → the editable field semantic view
+ *    Co-planned cleaning → the agent's plan, approved step by step
+ *    Relationships     → keys, references and dependencies, with evidence
+ *
+ *  The stage names are the user's vocabulary, not the pipeline's: the internal
+ *  phase numbers are a fact about the implementation and appear only in the
+ *  source and the report, never in the interface.
+ */
+
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { api, getToken, onSessionExpired, setToken } from './api'
+import { AccountMenu, AuthPanel } from './components/AuthPanel'
+import { EquivalencePanel } from './components/EquivalencePanel'
+import { EvidencePanel, RelationshipList } from './components/EvidencePanel'
+import { RelationshipDiagram } from './components/RelationshipDiagram'
+import { FieldSemanticGrid } from './components/FieldSemanticGrid'
+import { PlanBoard } from './components/PlanBoard'
+import { SourcePicker } from './components/SourcePicker'
+import { CleaningProgress, CleaningSummary, StepValidation } from './components/StepValidation'
+import { TriageBoard } from './components/TriageBoard'
+import { Button, EmptyState, ErrorBanner, Panel, Spinner, StatusBadge } from './components/ui'
+
+const STAGES = [
+  { key: 'upload', label: 'Add data' },
+  { key: 'triage', label: 'Triage' },
+  { key: 'semantics', label: 'Field semantics' },
+  { key: 'cleaning', label: 'Co-planned cleaning' },
+  { key: 'relationships', label: 'Relationships' },
+]
+
+function useTheme() {
+  const [theme, setTheme] = useState(() => localStorage.getItem('theme') ?? 'system')
+  useEffect(() => {
+    const root = document.documentElement
+    if (theme === 'system') root.removeAttribute('data-theme')
+    else root.setAttribute('data-theme', theme)
+    localStorage.setItem('theme', theme)
+  }, [theme])
+  return [theme, setTheme]
+}
+
+/** Which model, which embedder and which checkpoint store are in use are facts
+ *  about the deployment, not about the user's data — a working system should
+ *  not spend header space announcing that it is working.  What the user does
+ *  need to know is when the system is running on less than it normally has,
+ *  because the answers get worse: that is the Degradability requirement, and
+ *  it is why this renders nothing at all until something is actually missing.
+ */
+function DegradedNotice({ status }) {
+  if (!status) return null
+  const reasons = []
+  if (!status.claude.available) {
+    reasons.push(
+      `The language model is unavailable${
+        status.claude.reason ? ` (${status.claude.reason})` : ''
+      }, so labelling falls back to the rule engine and cleaning to the built-in statistical planner.`,
+    )
+  }
+  if (!status.embeddings.semantic) {
+    reasons.push(
+      'Semantic embeddings are unavailable, so column-name matching falls back to string comparison and will miss synonyms.',
+    )
+  }
+  if (!reasons.length) return null
+  return (
+    <StatusBadge status="warning" title={reasons.join(' ')}>
+      Limited mode
+    </StatusBadge>
+  )
+}
+
+/** The last dataset a given account was looking at.  Namespaced by account so
+ *  that signing in as somebody else on a shared machine does not open — or
+ *  even name — the previous user's dataset. */
+const lastDatasetKey = (userId) => `sessionId:${userId}`
+
+export default function App() {
+  const [theme, setTheme] = useTheme()
+  const [status, setStatus] = useState(null)
+  const [vocabulary, setVocabulary] = useState(null)
+  const [user, setUser] = useState(null)
+  const [authConfig, setAuthConfig] = useState(null)
+  const [authChecked, setAuthChecked] = useState(false)
+  const [sessionId, setSessionId] = useState(null)
+  const [session, setSession] = useState(null)
+  const [triage, setTriage] = useState(null)
+  const [equivalences, setEquivalences] = useState([])
+  const [semantics, setSemantics] = useState(null)
+  const [cleaning, setCleaning] = useState(null)
+  const [relationships, setRelationships] = useState(null)
+  const [selectedEdge, setSelectedEdge] = useState(null)
+  const [evidence, setEvidence] = useState(null)
+  const [evidenceLoading, setEvidenceLoading] = useState(false)
+  const [preview, setPreview] = useState(null)
+  const [stage, setStage] = useState('upload')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+
+  const run = useCallback(async (task) => {
+    setBusy(true)
+    setError(null)
+    try {
+      return await task()
+    } catch (err) {
+      setError(err.message)
+      return null
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+
+  const resetWorkspace = useCallback(() => {
+    setSessionId(null)
+    setSession(null)
+    setTriage(null)
+    setEquivalences([])
+    setSemantics(null)
+    setCleaning(null)
+    setRelationships(null)
+    setSelectedEdge(null)
+    setEvidence(null)
+    setPreview(null)
+    setStage('upload')
+  }, [])
+
+  useEffect(() => {
+    api.status().then(setStatus).catch(() => setError('Backend is not reachable on :8000'))
+    api.authConfig().then(setAuthConfig).catch(() => {})
+  }, [])
+
+  // Restore the signed-in account before rendering anything: a stored token
+  // may have expired, been revoked, or belong to a deleted account.
+  useEffect(() => {
+    if (!getToken()) {
+      setAuthChecked(true)
+      return
+    }
+    api
+      .me()
+      .then((payload) => setUser(payload.user))
+      .catch(() => setToken(null))
+      .finally(() => setAuthChecked(true))
+  }, [])
+
+  // The vocabulary endpoint is public, but there is no reason to fetch the
+  // dropdown contents for somebody who is not signed in.
+  useEffect(() => {
+    if (user) api.vocabulary().then(setVocabulary).catch(() => {})
+  }, [user])
+
+  useEffect(
+    () =>
+      onSessionExpired(() => {
+        setUser(null)
+        resetWorkspace()
+        setError('Your session expired — sign in again.')
+      }),
+    [resetWorkspace],
+  )
+
+  const loadSession = useCallback(
+    async (id) => {
+      if (!id) return
+      const [sessionData, triageData, equivalenceData, semanticsData, cleaningData, relationshipData] =
+        await Promise.all([
+          api.getSession(id),
+          api.triage(id),
+          api.equivalences(id),
+          api.getSemantics(id),
+          api.cleaningState(id),
+          api.relationships(id),
+        ])
+      setSession(sessionData)
+      setTriage(triageData)
+      setEquivalences(equivalenceData.equivalences)
+      setSemantics(semanticsData)
+      setCleaning(cleaningData)
+      setRelationships(relationshipData)
+    },
+    [],
+  )
+
+  // Reopen whatever this account was last working on.
+  useEffect(() => {
+    if (!user) return
+    setSessionId(localStorage.getItem(lastDatasetKey(user.id)))
+  }, [user])
+
+  useEffect(() => {
+    if (!user || !sessionId) return
+    localStorage.setItem(lastDatasetKey(user.id), sessionId)
+    run(async () => {
+      try {
+        await loadSession(sessionId)
+      } catch (err) {
+        if (err.status !== 404) throw err
+        // Deleted, or created under a different account. Forget it quietly —
+        // an error banner about an id the user never typed explains nothing.
+        localStorage.removeItem(lastDatasetKey(user.id))
+        resetWorkspace()
+      }
+      return true
+    })
+  }, [user, sessionId, loadSession, run, resetWorkspace])
+
+  const startSession = () =>
+    run(async () => {
+      const created = await api.createSession(`Session ${new Date().toLocaleString()}`)
+      setSessionId(created.id)
+      setSession(created)
+      setTriage(null)
+      setEquivalences([])
+      setSemantics(null)
+      setCleaning(null)
+      setStage('upload')
+      return created
+    })
+
+  const signIn = async (email, password) => {
+    const payload = await api.login(email, password)
+    setToken(payload.access_token)
+    setError(null)
+    setUser(payload.user)
+  }
+
+  const registerAccount = async (email, password, name) => {
+    const payload = await api.register(email, password, name)
+    setToken(payload.access_token)
+    setError(null)
+    setUser(payload.user)
+  }
+
+  const signOut = () =>
+    run(async () => {
+      // Best effort: a token the server has already forgotten still has to
+      // disappear from this browser.
+      await api.logout().catch(() => {})
+      setToken(null)
+      setUser(null)
+      resetWorkspace()
+      return true
+    })
+
+  const changePassword = (current, next) => api.changePassword(current, next)
+
+  const deleteAccount = async (password) => {
+    await api.deleteAccount(password)
+    if (user) localStorage.removeItem(lastDatasetKey(user.id))
+    setToken(null)
+    setUser(null)
+    resetWorkspace()
+  }
+
+  const ensureSession = useCallback(
+    async (name) => {
+      if (sessionId) return sessionId
+      const created = await api.createSession(name)
+      setSessionId(created.id)
+      return created.id
+    },
+    [sessionId],
+  )
+
+  const handleUpload = (files) =>
+    run(async () => {
+      // One request per file: each is ingested, triaged and named on its own,
+      // and a failure on the third file must not discard the first two.
+      const chosen = (Array.isArray(files) ? files : [files]).filter(Boolean)
+      if (!chosen.length) return null
+      const id = await ensureSession(chosen[0].name)
+      for (const file of chosen) {
+        await api.upload(id, file)
+      }
+      await loadSession(id)
+      setStage('triage')
+      return true
+    })
+
+  const inspectSource = (url) => run(() => api.inspectSource(url))
+
+  const handleConnect = (url, tables) =>
+    run(async () => {
+      // Never name a session after the raw URL: it carries the password.
+      const id = await ensureSession(`Database ${url.split('@').pop()}`)
+      await api.connectDatabase(id, url, tables)
+      await loadSession(id)
+      setStage('triage')
+      return true
+    })
+
+  const runSemantics = () =>
+    run(async () => {
+      const result = await api.runSemantics(sessionId)
+      setSemantics(result)
+      setStage('semantics')
+      return result
+    })
+
+  const overrideColumn = (columnId, patch) =>
+    run(async () => {
+      await api.overrideColumn(sessionId, columnId, patch)
+      setSemantics(await api.getSemantics(sessionId))
+      return true
+    })
+
+  const decideKey = (table, columns) =>
+    run(async () => {
+      await api.decideKey(sessionId, table, columns)
+      setTriage(await api.triage(sessionId))
+      return true
+    })
+
+  const decideEquivalence = (candidateId, confirmed) =>
+    run(async () => {
+      await api.decideEquivalence(sessionId, candidateId, confirmed)
+      const refreshed = await api.equivalences(sessionId)
+      setEquivalences(refreshed.equivalences)
+      return true
+    })
+
+  const startCleaning = () =>
+    run(async () => {
+      const state = await api.startCleaning(sessionId)
+      setCleaning(state)
+      setStage('cleaning')
+      return state
+    })
+
+  const submitPlan = (action, plan) =>
+    run(async () => {
+      setCleaning(await api.submitPlan(sessionId, action, plan))
+      return true
+    })
+
+  const submitStep = (action, params) =>
+    run(async () => {
+      setCleaning(await api.submitStep(sessionId, action, params))
+      return true
+    })
+
+  const detectRelationships = () =>
+    run(async () => {
+      const payload = await api.detectRelationships(sessionId)
+      setRelationships(payload)
+      setStage('relationships')
+      return payload
+    })
+
+  // Evidence reads whole tables, so it is fetched when a relationship is
+  // actually opened rather than for all of them up front.
+  const selectEdge = (relationshipId) =>
+    run(async () => {
+      if (selectedEdge === relationshipId) {
+        setSelectedEdge(null)
+        setEvidence(null)
+        return null
+      }
+      setSelectedEdge(relationshipId)
+      setEvidence(null)
+      setEvidenceLoading(true)
+      try {
+        const payload = await api.relationshipEvidence(sessionId, relationshipId)
+        setEvidence(payload.evidence)
+      } finally {
+        setEvidenceLoading(false)
+      }
+      return true
+    })
+
+  const decideRelationship = (relationshipId, confirmed) =>
+    run(async () => {
+      await api.decideRelationship(sessionId, relationshipId, confirmed)
+      setRelationships(await api.relationships(sessionId))
+      return true
+    })
+
+  const drawRelationship = (edge) =>
+    run(async () => {
+      const created = await api.drawRelationship(sessionId, edge)
+      setRelationships(await api.relationships(sessionId))
+      setSelectedEdge(created.id)
+      setEvidence(null)
+      return true
+    })
+
+  const showPreview = (table) =>
+    run(async () => {
+      if (preview?.table === table) {
+        setPreview(null)
+        return null
+      }
+      setPreview(await api.preview(sessionId, table))
+      return true
+    })
+
+  const tableNames = useMemo(
+    () => (cleaning?.tables ?? session?.tables ?? []).map((table) => table.name),
+    [cleaning, session],
+  )
+
+  const stageAvailable = {
+    upload: true,
+    triage: Boolean(triage?.sheets?.length),
+    semantics: Boolean(triage?.sheets?.length),
+    cleaning: Boolean(triage?.sheets?.length),
+    relationships: Boolean(triage?.sheets?.length),
+  }
+
+  const selectedRelationship =
+    relationships?.relationships?.find((row) => row.id === selectedEdge) ?? null
+
+  if (!authChecked) {
+    return (
+      <div className="flex min-h-full items-center justify-center">
+        <Spinner label="Restoring your session…" />
+      </div>
+    )
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-full">
+        {error && (
+          <div className="mx-auto max-w-md px-6 pt-6">
+            <ErrorBanner error={error} onDismiss={() => setError(null)} />
+          </div>
+        )}
+        <AuthPanel
+          config={authConfig}
+          backendReachable={Boolean(status)}
+          busy={busy}
+          onSignIn={signIn}
+          onRegister={registerAccount}
+          theme={theme}
+          onThemeChange={setTheme}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="min-h-full">
+      {/* z-30 clears the z-20 chart tooltips in the main column, which would
+          otherwise draw over a header the page can now be scrolled under. */}
+      <header
+        className="sticky top-0 z-30 border-b"
+        style={{ borderColor: 'var(--border)', background: 'var(--surface-1)' }}
+      >
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-x-4 gap-y-2 px-6 py-3">
+          <div className="flex min-w-0 items-baseline gap-2.5">
+            <h1 className="shrink-0 text-[15px] font-semibold tracking-tight">AskMyData</h1>
+            {session?.name && (
+              <>
+                <span aria-hidden="true" style={{ color: 'var(--border)' }}>
+                  /
+                </span>
+                <span className="truncate text-xs" style={{ color: 'var(--text-muted)' }}>
+                  {session.name}
+                </span>
+              </>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <DegradedNotice status={status} />
+            <select
+              className="focus-ring cursor-pointer rounded-md border-0 bg-transparent py-1 pl-2 pr-1 text-xs"
+              style={{ color: 'var(--text-muted)' }}
+              value={theme}
+              onChange={(event) => setTheme(event.target.value)}
+              aria-label="Colour theme"
+            >
+              <option value="system">Auto</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+            <Button variant="primary" onClick={startSession} disabled={busy}>
+              New session
+            </Button>
+            <AccountMenu
+              user={user}
+              busy={busy}
+              onSignOut={signOut}
+              onChangePassword={changePassword}
+              onDeleteAccount={deleteAccount}
+            />
+          </div>
+        </div>
+
+        <nav className="mx-auto flex max-w-7xl gap-0.5 overflow-x-auto px-6">
+          {STAGES.map((item) => {
+            const active = stage === item.key
+            return (
+              <button
+                key={item.key}
+                type="button"
+                disabled={!stageAvailable[item.key]}
+                onClick={() => setStage(item.key)}
+                aria-current={active ? 'page' : undefined}
+                className={`focus-ring relative shrink-0 rounded-t-md px-3 py-2.5 text-[13px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${
+                  active ? '' : 'hover:bg-[var(--surface-3)]'
+                }`}
+                style={{ color: active ? 'var(--text-primary)' : 'var(--text-secondary)' }}
+              >
+                {item.label}
+                {active && (
+                  <span
+                    aria-hidden="true"
+                    className="absolute inset-x-2 -bottom-px h-0.5 rounded-full"
+                    style={{ background: 'var(--series-1)' }}
+                  />
+                )}
+              </button>
+            )
+          })}
+        </nav>
+      </header>
+
+      <main className="mx-auto max-w-7xl space-y-4 px-6 py-6">
+        <ErrorBanner error={error} onDismiss={() => setError(null)} />
+        {busy && <Spinner />}
+
+        {stage === 'upload' && (
+          <SourcePicker
+            vocabulary={vocabulary}
+            session={session}
+            busy={busy}
+            onUpload={handleUpload}
+            onInspect={inspectSource}
+            onConnect={handleConnect}
+          />
+        )}
+
+        {stage === 'triage' && (
+          <>
+            <TriageBoard
+              triage={triage}
+              onPreview={showPreview}
+              preview={preview}
+              onDecideKey={decideKey}
+              busy={busy}
+            />
+            <EquivalencePanel
+              equivalences={equivalences}
+              onDecide={decideEquivalence}
+              busy={busy}
+            />
+            <div className="flex justify-end">
+              <Button variant="primary" disabled={busy} onClick={runSemantics}>
+                Analyse field semantics →
+              </Button>
+            </div>
+          </>
+        )}
+
+        {stage === 'semantics' && (
+          <>
+            {semantics?.tables?.length ? (
+              <FieldSemanticGrid
+                semantics={semantics}
+                vocabulary={vocabulary ?? { column_types: [], taxonomy_labels: [] }}
+                onOverride={overrideColumn}
+                busy={busy}
+              />
+            ) : (
+              <Panel title="Field semantics">
+                <EmptyState>
+                  Nothing analysed yet.
+                  <span className="ml-2">
+                    <Button variant="primary" disabled={busy} onClick={runSemantics}>
+                      Run analysis
+                    </Button>
+                  </span>
+                </EmptyState>
+              </Panel>
+            )}
+            {semantics?.tables?.length > 0 && (
+              <div className="flex justify-end gap-2">
+                <Button disabled={busy} onClick={runSemantics}>
+                  Re-run detection
+                </Button>
+                <Button variant="primary" disabled={busy} onClick={startCleaning}>
+                  Plan the cleaning →
+                </Button>
+              </div>
+            )}
+          </>
+        )}
+
+        {stage === 'cleaning' && (
+          <>
+            <CleaningStage
+              cleaning={cleaning}
+              vocabulary={vocabulary}
+              tableNames={tableNames}
+              busy={busy}
+              onStart={startCleaning}
+              onSubmitPlan={submitPlan}
+              onSubmitStep={submitStep}
+            />
+            {['completed', 'cancelled'].includes(cleaning?.status) && (
+              <div className="flex justify-end">
+                <Button variant="primary" disabled={busy} onClick={detectRelationships}>
+                  Detect relationships →
+                </Button>
+              </div>
+            )}
+          </>
+        )}
+
+        {stage === 'relationships' && (
+          <RelationshipStage
+            relationships={relationships}
+            selectedId={selectedEdge}
+            selectedRelationship={selectedRelationship}
+            evidence={evidence}
+            evidenceLoading={evidenceLoading}
+            busy={busy}
+            onDetect={detectRelationships}
+            onSelect={selectEdge}
+            onDecide={decideRelationship}
+            onDraw={drawRelationship}
+          />
+        )}
+      </main>
+    </div>
+  )
+}
+
+function RelationshipStage({
+  relationships,
+  selectedId,
+  selectedRelationship,
+  evidence,
+  evidenceLoading,
+  busy,
+  onDetect,
+  onSelect,
+  onDecide,
+  onDraw,
+}) {
+  if (!relationships || !relationships.counts?.total) {
+    return (
+      <Panel
+        title="Relationships"
+        subtitle="Foreign keys between tables and functional dependencies inside them, found by value overlap — never by the model."
+      >
+        <EmptyState>
+          <span className="mr-2">Nothing detected yet.</span>
+          <Button variant="primary" disabled={busy} onClick={onDetect}>
+            Detect relationships
+          </Button>
+        </EmptyState>
+      </Panel>
+    )
+  }
+
+  const counts = relationships.counts
+  const rows = relationships.relationships ?? []
+
+  return (
+    <div className="space-y-4">
+      <Panel
+        title="Data model"
+        subtitle={`${counts.foreign_keys} foreign key(s), ${counts.dependencies} dependency(ies) · ${counts.confirmed} confirmed, ${counts.proposed} awaiting your review`}
+        actions={
+          <Button disabled={busy} onClick={onDetect}>
+            Re-run detection
+          </Button>
+        }
+      >
+        <RelationshipDiagram
+          graph={relationships.graph}
+          selectedId={selectedId}
+          onSelectEdge={onSelect}
+          onDrawEdge={onDraw}
+        />
+        {relationships.skipped_tables?.length > 0 && (
+          <p className="mt-3 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+            Not searched for relationships: {relationships.skipped_tables.join(', ')} — with that
+            few rows, values land inside another column&apos;s by coincidence often enough that any
+            verdict would be noise.
+          </p>
+        )}
+      </Panel>
+
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
+        <Panel title="Everything found" subtitle="Highest score first">
+          <RelationshipList
+            relationships={rows}
+            selectedId={selectedId}
+            onSelect={onSelect}
+            busy={busy}
+          />
+        </Panel>
+        <EvidencePanel
+          relationship={selectedRelationship}
+          evidence={evidence}
+          loading={evidenceLoading}
+          busy={busy}
+          onDecide={onDecide}
+          onClose={() => onSelect(selectedId)}
+        />
+      </div>
+    </div>
+  )
+}
+
+function CleaningStage({ cleaning, vocabulary, tableNames, busy, onStart, onSubmitPlan, onSubmitStep }) {
+  if (!cleaning || cleaning.status === 'not_started') {
+    return (
+      <Panel
+        title="Co-planned cleaning"
+        subtitle="Claude proposes a plan from statistics only. You edit it, then approve each step as it runs."
+      >
+        <EmptyState>
+          <span className="mr-2">No cleaning run yet.</span>
+          <Button variant="primary" disabled={busy} onClick={onStart}>
+            Propose a cleaning plan
+          </Button>
+        </EmptyState>
+      </Panel>
+    )
+  }
+
+  const pending = cleaning.pending
+  const plan = cleaning.plan ?? []
+
+  if (pending?.kind === 'plan_review') {
+    return (
+      <PlanBoard
+        plan={pending.plan ?? plan}
+        planSource={cleaning.plan_source}
+        rejections={cleaning.plan_rejections}
+        tables={tableNames}
+        stepTypes={vocabulary?.step_types ?? []}
+        onSubmit={onSubmitPlan}
+        busy={busy}
+      />
+    )
+  }
+
+  if (pending) {
+    return (
+      <div className="space-y-4">
+        <CleaningProgress plan={plan} cursor={cleaning.cursor ?? 0} />
+        <StepValidation
+          pending={pending}
+          progress={{ total: plan.length }}
+          onDecide={onSubmitStep}
+          busy={busy}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4">
+      <CleaningProgress plan={plan} cursor={plan.length} />
+      <CleaningSummary state={cleaning} onRestart={onStart} />
+    </div>
+  )
+}
