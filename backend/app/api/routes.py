@@ -7,6 +7,7 @@ import shutil
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -24,11 +25,13 @@ from app.cleaning.graph import (
 from app.cleaning.store import drop_store, get_store
 from app.core.config import get_settings
 from app.core.schemas import (
+    TABLE_LABELS,
     TAXONOMY_LABELS,
     ColumnType,
     RelationshipOrigin,
     RelationshipType,
     StepType,
+    TableType,
 )
 from app.db.base import pending_schema_changes, session_scope
 from app.db.models import (
@@ -109,6 +112,18 @@ class RelationshipDecision(BaseModel):
     confirmed: bool
 
 
+class ProfileOverride(BaseModel):
+    """The user's correction to a table's profile (SemTabla §4.2).
+
+    All three fields are optional and independent: an empty ``table_type``
+    withdraws a previous override rather than setting one.
+    """
+
+    table_type: str | None = Field(default=None, max_length=40)
+    add_label: str | None = Field(default=None, max_length=60)
+    remove_label: str | None = Field(default=None, max_length=60)
+
+
 class ManualRelationship(BaseModel):
     """An edge drawn by hand in the relationship diagram."""
 
@@ -154,6 +169,8 @@ def vocabulary() -> dict[str, Any]:
         "step_types": [s.value for s in StepType],
         "relationship_types": [r.value for r in RelationshipType],
         "relationship_origins": [o.value for o in RelationshipOrigin],
+        "table_types": [t.value for t in TableType],
+        "table_labels": list(TABLE_LABELS),
         "accepted_extensions": sorted(FILE_SUFFIXES),
         "accepted_file_kinds": [
             {"kind": "excel", "label": "Excel workbook", "extensions": sorted(EXCEL_SUFFIXES)},
@@ -249,6 +266,9 @@ def delete_session(
 ) -> None:
     db.delete(record)
     drop_store(session_id)
+    # The exported database is the user's data too, and it lives outside the
+    # cascade — deleting the session has to take it with it.
+    services.forget_export(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +569,7 @@ def draw_relationship(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return row.to_dict()
+    return {**row.to_dict(), "profiles": services.profile_tables(db, record)["profiles"]}
 
 
 @router.get(
@@ -577,15 +597,182 @@ def decide_relationship(
     session_id: str,
     relationship_id: str,
     body: RelationshipDecision,
+    record: IngestionSession = Depends(require_session),
     db: Session = Depends(session_scope),
 ) -> dict[str, Any]:
-    """Confirm or reject a relationship, having seen its evidence."""
+    """Confirm or reject a relationship, having seen its evidence.
+
+    Six of the thirteen table labels are read off the relationship set, so a
+    verdict here changes what the tables *are* — the profiles are rebuilt in
+    the same request rather than drifting until something else triggers them.
+    """
 
     try:
         row = services.decide_relationship(db, session_id, relationship_id, body.confirmed)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return row.to_dict()
+    return {**row.to_dict(), "profiles": services.profile_tables(db, record)["profiles"]}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — table semantic profiling
+# ---------------------------------------------------------------------------
+
+
+@router.post("/sessions/{session_id}/profiles")
+def run_profiles(
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    """Summarise every table into the thirteen labels and a table type.
+
+    Runs automatically at the end of relationship detection; this endpoint is
+    for rebuilding after the user has corrected something upstream, which is
+    the update the paper describes.
+    """
+
+    if not get_store(record.id).names():
+        raise HTTPException(status_code=409, detail="upload a file before profiling tables")
+    return services.profile_tables(db, record, claude=get_claude_client())
+
+
+@router.get("/sessions/{session_id}/profiles", dependencies=[Depends(require_session)])
+def list_profiles(session_id: str, db: Session = Depends(session_scope)) -> dict[str, Any]:
+    return services.profiles_payload(db, session_id)
+
+
+@router.patch("/sessions/{session_id}/tables/{table}/profile")
+def correct_profile(
+    table: str,
+    body: ProfileOverride,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    """Override the table type, or add and remove a label by hand."""
+
+    try:
+        return services.override_profile(
+            db,
+            record,
+            table,
+            table_type=body.table_type,
+            add_label=body.add_label,
+            remove_label=body.remove_label,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/sessions/{session_id}/export")
+def run_semantic_export(
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    """Build the clean database and its semantic layer.
+
+    Replaces any previous export of this dataset: the schema is dropped and
+    rebuilt, so the result always matches the analysis as it stands now.
+    """
+
+    try:
+        return services.export_semantic_layer(db, record, claude=get_claude_client())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        logger.exception("export failed for session %s", record.id)
+        raise HTTPException(
+            status_code=500, detail=f"the export could not be written: {exc}"
+        ) from exc
+
+
+@router.get("/sessions/{session_id}/export", dependencies=[Depends(require_session)])
+def get_semantic_export(session_id: str, db: Session = Depends(session_scope)) -> dict[str, Any]:
+    return services.export_payload(db, session_id)
+
+
+@router.get("/sessions/{session_id}/export/bundle", dependencies=[Depends(require_session)])
+def get_semantic_bundle(
+    session_id: str,
+    version: int | None = None,
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    """The portable JSON semantic layer.
+
+    The current one by default, or an archived ``version`` — which is what
+    makes two builds of the same dataset comparable rather than merely
+    countable.
+    """
+
+    bundle = services.layer_bundle(db, session_id, version)
+    if bundle is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"this dataset has no semantic layer version {version}"
+                if version is not None
+                else "this dataset has not been exported yet"
+            ),
+        )
+    return bundle
+
+
+@router.get("/sessions/{session_id}/export/versions", dependencies=[Depends(require_session)])
+def list_layer_versions(
+    session_id: str, db: Session = Depends(session_scope)
+) -> dict[str, Any]:
+    """Every build of this dataset's semantic layer, newest first."""
+
+    versions = services.layer_versions(db, session_id)
+    current = services.export_record(db, session_id)
+    return {
+        "current": current.semantic_version if current is not None else 0,
+        "versions": [row.to_dict() for row in versions],
+    }
+
+
+@router.get(
+    "/sessions/{session_id}/export/documentation",
+    dependencies=[Depends(require_session)],
+    response_class=PlainTextResponse,
+)
+def get_semantic_documentation(
+    version: int | None = None,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> PlainTextResponse:
+    """The semantic layer as Markdown documentation (FR-18).
+
+    For most datasets this is the first documentation they have ever had, so
+    it is served as a file the user can keep rather than as a screen.
+    """
+
+    document = services.layer_documentation(db, record, version)
+    if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"this dataset has no semantic layer version {version}"
+                if version is not None
+                else "this dataset has not been exported yet"
+            ),
+        )
+    return PlainTextResponse(document, media_type="text/markdown; charset=utf-8")
+
+
+@router.get(
+    "/sessions/{session_id}/export/ddl",
+    dependencies=[Depends(require_session)],
+    response_class=PlainTextResponse,
+)
+def get_semantic_ddl(session_id: str, db: Session = Depends(session_scope)) -> str:
+    """The ``CREATE TABLE`` script, as PostgreSQL would spell it."""
+
+    row = services.export_record(db, session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="this dataset has not been exported yet")
+    return (row.report or {}).get("ddl", "")
 
 
 # ---------------------------------------------------------------------------

@@ -166,6 +166,56 @@ class RelationshipStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class TableType(str, Enum):
+    """What a whole table *is*, as decided by the table-type decision tree.
+
+    SemTabla (§4.1.5) trains a decision tree over the thirteen table-level
+    labels; this project writes the tree down instead, for the same reason the
+    column taxonomy uses rules rather than the paper's Random Forest — there is
+    no labelled corpus of business workbooks to train on, and a written tree is
+    something the user can be shown and can argue with.  A branch that fires
+    only weakly returns :attr:`UNKNOWN`, which is what the paper does with a
+    low-confidence classification.
+    """
+
+    #: Rows are events with measures, hanging off other tables' keys.
+    FACT = "fact"
+    #: Descriptive attributes of an entity that other tables point at.
+    DIMENSION = "dimension"
+    #: Little more than two foreign keys: a many-to-many junction.
+    BRIDGE = "bridge"
+    #: Keyed by time, one row per instant.
+    TIME_SERIES = "time_series"
+    #: Rows sit inside a tree — a self-reference, or a chain of dependencies.
+    HIERARCHY = "hierarchy"
+    #: A small closed set of codes other tables borrow from.
+    LOOKUP = "lookup"
+    #: Denormalised: everything about everything, in one very wide table.
+    WIDE = "wide"
+    UNKNOWN = "unknown"
+
+
+#: The thirteen table-level semantic labels of SemTabla, Table 8, verbatim.
+#: Each one is a yes/no statement about a table that the decision tree reads,
+#: and each is reported with the evidence that produced it so the user can
+#: check it — the same contract every other detection in this system honours.
+TABLE_LABELS: tuple[str, ...] = (
+    "is_primary_key_time",
+    "is_primary_key_periodic",
+    "is_single_value_column",
+    "is_single_enum_column",
+    "is_data_discrete",
+    "is_enum_containing_most",
+    "is_label_having_hierarchy_column",
+    "is_mostly_referenced",
+    "is_self_reference",
+    "is_no_single_value_as_primary_key",
+    "is_exactly_two_foreign_keys_existing",
+    "is_having_dependency_chain",
+    "is_fd_stable_after_null_drop",
+)
+
+
 class Confidence(str, Enum):
     HIGH = "high"
     MEDIUM = "medium"

@@ -60,6 +60,17 @@ async function request(path, options = {}) {
   return payload
 }
 
+/** Plain-text responses (the DDL script) — `request` parses JSON and would
+ *  throw on a CREATE TABLE statement. */
+async function requestText(path) {
+  const headers = {}
+  if (token) headers.Authorization = `Bearer ${token}`
+  const response = await fetch(`${BASE}${path}`, { headers })
+  const body = await response.text()
+  if (!response.ok) throw new ApiError(`${response.status} ${response.statusText}`, response.status)
+  return body
+}
+
 export const api = {
   status: () => request('/status'),
   vocabulary: () => request('/vocabulary'),
@@ -130,6 +141,25 @@ export const api = {
     request(`/sessions/${id}/relationships/${relationshipId}/evidence`),
   drawRelationship: (id, edge) =>
     request(`/sessions/${id}/relationships/manual`, { method: 'POST', body: JSON.stringify(edge) }),
+
+  runProfiles: (id) => request(`/sessions/${id}/profiles`, { method: 'POST' }),
+  profiles: (id) => request(`/sessions/${id}/profiles`),
+  // `table_type: ''` withdraws an override rather than setting one.
+  correctProfile: (id, table, patch) =>
+    request(`/sessions/${id}/tables/${table}/profile`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+
+  runExport: (id) => request(`/sessions/${id}/export`, { method: 'POST' }),
+  exportState: (id) => request(`/sessions/${id}/export`),
+  exportBundle: (id) => request(`/sessions/${id}/export/bundle`),
+  exportDdl: (id) => requestText(`/sessions/${id}/export/ddl`),
+  exportDocs: (id, version) =>
+    requestText(
+      `/sessions/${id}/export/documentation${version ? `?version=${version}` : ''}`,
+    ),
+  exportVersions: (id) => request(`/sessions/${id}/export/versions`),
 
   startCleaning: (id) => request(`/sessions/${id}/cleaning/start`, { method: 'POST' }),
   cleaningState: (id) => request(`/sessions/${id}/cleaning/state`),

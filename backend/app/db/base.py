@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -110,17 +110,56 @@ def init_db() -> dict[str, Any]:
     return status
 
 
+def _embedding_ddl() -> str:
+    """``vector(n)`` where pgvector is live, JSON everywhere else.
+
+    The same choice :class:`~app.db.models.EmbeddingVector` makes for a table
+    being created; made again here because ``ALTER TABLE`` is spelled by hand
+    and a JSON column on PostgreSQL would be an embedding no index can reach.
+    """
+
+    if pgvector_available():
+        return f"vector({get_settings().embedding_dim})"
+    return "JSON"
+
+
+def _timestamp_ddl() -> str:
+    """PostgreSQL keeps the offset; SQLite has no timestamp type to qualify."""
+
+    return "TIMESTAMP WITH TIME ZONE" if get_settings().is_postgres else "TIMESTAMP"
+
+
 #: Columns added to existing tables after the first release, as
-#: ``table -> {column: DDL type}``.  ``create_all`` only creates tables that do
+#: ``table -> {column: DDL type}``, where the type is either literal SQL or a
+#: callable that spells it for the connected dialect.  ``create_all`` only creates tables that do
 #: not exist yet, so without this a developer whose database predates a new
 #: column gets an "unknown column" error on the next query instead of an
 #: upgrade.  Additive only: this never drops or retypes anything, which is the
 #: whole class of migration a project without Alembic can safely automate.
-_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+_ADDED_COLUMNS: dict[str, dict[str, "str | Callable[[], str]"]] = {
     "sheet_records": {
         "source_kind": "VARCHAR(40)",
         "native_schema": "JSON",
         "key_analysis": "JSON",
+        # Table semantic profiling, added with Phase 4.
+        "semantic_profile": "JSON",
+        # The table's one-line description and its embedding, added when the
+        # control plane was aligned with the ER model.
+        "table_description": "TEXT",
+        "llm_table_description": "TEXT",
+        "table_embedding": _embedding_ddl,
+    },
+    # Key and reference roles, projected onto the column semantics so that the
+    # control plane — not only the exported copy — knows which column is an
+    # identifier and what it points at.
+    "column_semantics": {
+        "is_primary_key": "BOOLEAN DEFAULT FALSE",
+        "is_foreign_key": "BOOLEAN DEFAULT FALSE",
+        "references_table": "VARCHAR(255)",
+        "references_column": "VARCHAR(255)",
+    },
+    "semantic_layer_exports": {
+        "semantic_version": "INTEGER DEFAULT 0",
     },
     # Ownership, added when authentication landed.  Declared without the
     # REFERENCES clause on purpose: SQLite cannot add a foreign key to an
@@ -129,6 +168,10 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     # NULL and are visible to nobody.
     "ingestion_sessions": {
         "user_id": "VARCHAR(32)",
+        # Materialization and versioning, added with the semantic layer.
+        "db_schema_name": "VARCHAR(100)",
+        "semantic_version": "INTEGER DEFAULT 0",
+        "enriched_at": _timestamp_ddl,
     },
 }
 
@@ -168,7 +211,8 @@ def _add_missing_columns() -> list[str]:
 
     for qualified in pending_schema_changes():
         table, column = qualified.split(".", 1)
-        ddl_type = _ADDED_COLUMNS[table][column]
+        declared = _ADDED_COLUMNS[table][column]
+        ddl_type = declared() if callable(declared) else declared
         try:
             with engine.begin() as connection:
                 connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
@@ -182,17 +226,26 @@ def _add_missing_columns() -> list[str]:
 
 
 def _create_vector_index() -> None:
-    """HNSW index over the column-name embeddings (Phase 0 / Phase 4)."""
+    """HNSW indexes over the two embedded columns of the control plane.
 
-    statement = text(
+    ``column_semantics.embedding`` is what a question is matched against
+    column by column; ``sheet_records.table_embedding`` is what narrows it to a
+    handful of tables first.  Both are best-effort: without the index the same
+    query still answers, by scanning.
+    """
+
+    statements = (
         "CREATE INDEX IF NOT EXISTS idx_column_semantics_embedding "
-        "ON column_semantics USING hnsw (embedding vector_cosine_ops)"
+        "ON column_semantics USING hnsw (embedding vector_cosine_ops)",
+        "CREATE INDEX IF NOT EXISTS idx_sheet_records_table_embedding "
+        "ON sheet_records USING hnsw (table_embedding vector_cosine_ops)",
     )
-    try:
-        with get_engine().begin() as connection:
-            connection.execute(statement)
-    except Exception as exc:  # pragma: no cover - depends on environment
-        logger.warning("could not create HNSW index: %s", exc)
+    for statement in statements:
+        try:
+            with get_engine().begin() as connection:
+                connection.execute(text(statement))
+        except Exception as exc:  # pragma: no cover - depends on environment
+            logger.warning("could not create HNSW index: %s", exc)
 
 
 def reset_engine() -> None:

@@ -138,6 +138,30 @@ Rules:
 - Do not invent business context the evidence does not support.
 - Answer with the JSON object and nothing else."""
 
+DESCRIBE_TABLES_SYSTEM_PROMPT = """You write one-sentence descriptions of the tables \
+in a business database.
+
+You receive every table of ONE dataset: its name, the kind of table the analysis \
+decided it is, its primary key, the tables it references and is referenced by, and \
+its column names with their semantic labels. You never receive a data row or a \
+sample value.
+
+For every table, write the single sentence a business analyst would use to say what \
+the table holds and what it is for — what one row of it represents, and what \
+questions it is the right table to answer. These sentences are how the system picks \
+which tables a question is even read against, so include the words someone would \
+naturally use when asking about this table.
+
+Answer with JSON only, in exactly this shape:
+{"tables": [{"name": "<table name exactly as given>", "description": "<one sentence>"}]}
+
+Rules:
+- One entry per table you were given, using the exact table name.
+- One sentence each, no bullet points, no markdown.
+- Say what a row means ("one line of one customer order"), not how it is stored.
+- Do not invent business context the evidence does not support.
+- Answer with the JSON object and nothing else."""
+
 
 def _extract_json(text: str) -> Any:
     """Pull a JSON value out of a response that may be fenced or prefixed."""
@@ -334,6 +358,50 @@ class ClaudeClient:
             description = str(entry.get("description", "") or "").strip()
             # A description for a column that does not exist is a hallucination;
             # drop it rather than store it against the wrong column.
+            if name in known and description:
+                descriptions[name] = description
+        return descriptions
+
+    def describe_tables(self, tables: list[dict[str, Any]]) -> dict[str, str] | None:
+        """One sentence per table, for the whole dataset in one call.
+
+        Per *dataset* rather than per table, because the sentences are used to
+        choose between tables: the model writes better ones when it can see
+        that ``orders`` is the one with the money in it and ``order_status`` is
+        a lookup.  It also keeps the cost at one call per enrichment run.
+
+        Returns ``{table_name: description}``, or ``None`` when unavailable —
+        the caller keeps the composed sentence, which is never absent.
+        """
+
+        if not tables:
+            return {}
+        raw = self._complete(
+            DESCRIBE_TABLES_SYSTEM_PROMPT,
+            json.dumps({"tables": tables}, ensure_ascii=False, default=str),
+            max_tokens=min(self._max_tokens, 200 * len(tables) + 500),
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("Claude table description response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        entries = parsed.get("tables")
+        if not isinstance(entries, list):
+            return None
+        known = {str(table.get("name", "")) for table in tables}
+        descriptions: dict[str, str] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).strip()
+            description = str(entry.get("description", "") or "").strip()
+            # A description for a table that was not sent is a hallucination.
             if name in known and description:
                 descriptions[name] = description
         return descriptions

@@ -20,8 +20,10 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, getToken, onSessionExpired, setToken } from './api'
 import { AccountMenu, AuthPanel } from './components/AuthPanel'
 import { EquivalencePanel } from './components/EquivalencePanel'
+import { ExportPanel, download } from './components/ExportPanel'
 import { EvidencePanel, RelationshipList } from './components/EvidencePanel'
 import { RelationshipDiagram } from './components/RelationshipDiagram'
+import { TableProfilePanel } from './components/TableProfilePanel'
 import { FieldSemanticGrid } from './components/FieldSemanticGrid'
 import { PlanBoard } from './components/PlanBoard'
 import { SourcePicker } from './components/SourcePicker'
@@ -35,6 +37,7 @@ const STAGES = [
   { key: 'semantics', label: 'Field semantics' },
   { key: 'cleaning', label: 'Co-planned cleaning' },
   { key: 'relationships', label: 'Relationships' },
+  { key: 'export', label: 'Semantic layer' },
 ]
 
 function useTheme() {
@@ -97,6 +100,8 @@ export default function App() {
   const [semantics, setSemantics] = useState(null)
   const [cleaning, setCleaning] = useState(null)
   const [relationships, setRelationships] = useState(null)
+  const [profiles, setProfiles] = useState(null)
+  const [exportState, setExportState] = useState(null)
   const [selectedEdge, setSelectedEdge] = useState(null)
   const [evidence, setEvidence] = useState(null)
   const [evidenceLoading, setEvidenceLoading] = useState(false)
@@ -126,6 +131,8 @@ export default function App() {
     setSemantics(null)
     setCleaning(null)
     setRelationships(null)
+    setProfiles(null)
+    setExportState(null)
     setSelectedEdge(null)
     setEvidence(null)
     setPreview(null)
@@ -170,21 +177,33 @@ export default function App() {
   const loadSession = useCallback(
     async (id) => {
       if (!id) return
-      const [sessionData, triageData, equivalenceData, semanticsData, cleaningData, relationshipData] =
-        await Promise.all([
-          api.getSession(id),
-          api.triage(id),
-          api.equivalences(id),
-          api.getSemantics(id),
-          api.cleaningState(id),
-          api.relationships(id),
-        ])
+      const [
+        sessionData,
+        triageData,
+        equivalenceData,
+        semanticsData,
+        cleaningData,
+        relationshipData,
+        profileData,
+        exportData,
+      ] = await Promise.all([
+        api.getSession(id),
+        api.triage(id),
+        api.equivalences(id),
+        api.getSemantics(id),
+        api.cleaningState(id),
+        api.relationships(id),
+        api.profiles(id),
+        api.exportState(id),
+      ])
       setSession(sessionData)
       setTriage(triageData)
       setEquivalences(equivalenceData.equivalences)
       setSemantics(semanticsData)
       setCleaning(cleaningData)
       setRelationships(relationshipData)
+      setProfiles(profileData)
+      setExportState(exportData)
     },
     [],
   )
@@ -351,6 +370,9 @@ export default function App() {
     run(async () => {
       const payload = await api.detectRelationships(sessionId)
       setRelationships(payload)
+      // Detection ends with table profiling; read the counts back rather than
+      // deriving them from the profiles the response inlines.
+      setProfiles(await api.profiles(sessionId))
       setStage('relationships')
       return payload
     })
@@ -379,16 +401,73 @@ export default function App() {
   const decideRelationship = (relationshipId, confirmed) =>
     run(async () => {
       await api.decideRelationship(sessionId, relationshipId, confirmed)
-      setRelationships(await api.relationships(sessionId))
+      const [next, nextProfiles] = await Promise.all([
+        api.relationships(sessionId),
+        api.profiles(sessionId),
+      ])
+      setRelationships(next)
+      setProfiles(nextProfiles)
       return true
     })
 
   const drawRelationship = (edge) =>
     run(async () => {
       const created = await api.drawRelationship(sessionId, edge)
-      setRelationships(await api.relationships(sessionId))
+      const [next, nextProfiles] = await Promise.all([
+        api.relationships(sessionId),
+        api.profiles(sessionId),
+      ])
+      setRelationships(next)
+      setProfiles(nextProfiles)
       setSelectedEdge(created.id)
       setEvidence(null)
+      return true
+    })
+
+  const runExport = () =>
+    run(async () => {
+      const payload = await api.runExport(sessionId)
+      setExportState({ exported: true, ...payload })
+      setStage('export')
+      return payload
+    })
+
+  // Every download goes through the API rather than being rebuilt here: what
+  // the user takes away has to be the export that was made, not a fresh
+  // rendering of an analysis that may have moved on since.
+  const downloadBundle = () =>
+    run(async () => {
+      const payload = await api.exportBundle(sessionId)
+      download(`${session?.name ?? 'semantic-layer'}.json`, JSON.stringify(payload, null, 2), 'application/json')
+      return true
+    })
+
+  const downloadDdl = () =>
+    run(async () => {
+      const script = await api.exportDdl(sessionId)
+      download(`${session?.name ?? 'semantic-layer'}.sql`, script, 'application/sql')
+      return true
+    })
+
+  // For most of these datasets this is the first documentation they have ever
+  // had, so it is a file the user keeps rather than a screen they close.
+  const downloadDocs = () =>
+    run(async () => {
+      const document = await api.exportDocs(sessionId)
+      download(`${session?.name ?? 'semantic-layer'}.md`, document, 'text/markdown')
+      return true
+    })
+
+  const refreshProfiles = () =>
+    run(async () => {
+      setProfiles(await api.runProfiles(sessionId))
+      return true
+    })
+
+  const correctProfile = (table, patch) =>
+    run(async () => {
+      await api.correctProfile(sessionId, table, patch)
+      setProfiles(await api.profiles(sessionId))
       return true
     })
 
@@ -413,6 +492,7 @@ export default function App() {
     semantics: Boolean(triage?.sheets?.length),
     cleaning: Boolean(triage?.sheets?.length),
     relationships: Boolean(triage?.sheets?.length),
+    export: Boolean(triage?.sheets?.length),
   }
 
   const selectedRelationship =
@@ -629,6 +709,22 @@ export default function App() {
             onSelect={selectEdge}
             onDecide={decideRelationship}
             onDraw={drawRelationship}
+            profiles={profiles}
+            tableTypes={vocabulary?.table_types ?? []}
+            onCorrectProfile={correctProfile}
+            onRefreshProfiles={refreshProfiles}
+            onExport={runExport}
+          />
+        )}
+
+        {stage === 'export' && (
+          <ExportPanel
+            state={exportState}
+            busy={busy}
+            onExport={runExport}
+            onDownloadBundle={downloadBundle}
+            onDownloadDdl={downloadDdl}
+            onDownloadDocs={downloadDocs}
           />
         )}
       </main>
@@ -647,6 +743,11 @@ function RelationshipStage({
   onSelect,
   onDecide,
   onDraw,
+  profiles,
+  tableTypes,
+  onCorrectProfile,
+  onRefreshProfiles,
+  onExport,
 }) {
   if (!relationships || !relationships.counts?.total) {
     return (
@@ -710,6 +811,21 @@ function RelationshipStage({
           onDecide={onDecide}
           onClose={() => onSelect(selectedId)}
         />
+      </div>
+
+      <TableProfilePanel
+        profiles={profiles?.profiles}
+        counts={profiles?.counts}
+        tableTypes={tableTypes}
+        busy={busy}
+        onCorrect={onCorrectProfile}
+        onRefresh={onRefreshProfiles}
+      />
+
+      <div className="flex justify-end">
+        <Button variant="primary" disabled={busy} onClick={onExport}>
+          Build the database →
+        </Button>
       </div>
     </div>
   )

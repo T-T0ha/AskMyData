@@ -18,9 +18,11 @@ from sqlalchemy.orm import Session
 from app.cleaning.store import get_store
 from app.core.config import get_settings
 from app.core.schemas import (
+    TABLE_LABELS,
     RelationshipOrigin,
     RelationshipStatus,
     RelationshipType,
+    TableType,
     TriageStatus,
 )
 from app.db.models import (
@@ -28,8 +30,14 @@ from app.db.models import (
     EquivalenceCandidateRecord,
     IngestionSession,
     RelationshipRecord,
+    SemanticLayerExport,
+    SemanticLayerVersion,
     SheetRecord,
 )
+from app.export.documentation import render_markdown
+from app.export.metadata import bundle as semantic_bundle
+from app.export.runner import drop_export, run_export
+from app.export.schema import build_plan
 from app.ingestion.equivalence import detect_equivalences
 from app.ingestion.keys import KeyAnalysis, confirm_key, decline_key, is_unique_key
 from app.ingestion.loader import load_file_source
@@ -43,12 +51,20 @@ from app.relationships.foreign_keys import (
 )
 from app.semantics.embeddings import get_embedder
 from app.semantics.pipeline import analyze_tables, statistical_summary
+from app.semantics import table_summary
+from app.semantics.table_profile import TableProfile, profile_tables as build_table_profiles
 
 logger = logging.getLogger(__name__)
 
 #: Sheets below this row count are ingested but excluded from semantic
 #: analysis — statistics over two rows are noise, not signal.
 MIN_ANALYZABLE_ROWS = 3
+
+#: Archived semantic layers kept per dataset.  Enough to compare a run against
+#: the one before it and to see a trend; bounded because each one is a JSON
+#: document of the whole schema, and an unbounded history of them is a slow
+#: leak in the control plane.
+MAX_LAYER_VERSIONS = 10
 
 
 def create_session(db: Session, name: str, owner_id: str) -> IngestionSession:
@@ -419,6 +435,11 @@ def run_field_semantics(
     db.execute(delete(ColumnSemantics).where(ColumnSemantics.session_id == record.id))
 
     semantics = analyze_tables(tables, adapted, claude=claude)
+    # What each table *is* goes into every one of its column descriptions, and
+    # those descriptions are what Phase 5 retrieves on.  A session profiled
+    # earlier already knows; one that has not reached Phase 3 yet says "data
+    # table" and is rewritten when profiling runs.
+    table_types = {name: table_type_of(db, record.id, name) for name in semantics}
     rows: list[ColumnSemantics] = []
     for table_name, table in semantics.items():
         for profile in table.columns:
@@ -448,7 +469,9 @@ def run_field_semantics(
                 sample_values=profile.sample_values,
                 distribution=profile.distribution,
             )
-            row.semantic_description = _semantic_description(row)
+            row.semantic_description = _semantic_description(
+                row, table_type=table_types.get(table_name, "data table")
+            )
             db.add(row)
             rows.append(row)
 
@@ -458,6 +481,10 @@ def run_field_semantics(
     _embed_columns(rows)
     record.status = "semantics_ready"
     db.flush()
+    # These rows were just replaced, so the key and reference roles that were
+    # projected onto the old ones went with them.  They are derived from
+    # decisions that outlive Phase 1, so they are put back rather than lost.
+    sync_key_roles(db, record.id)
     return rows
 
 
@@ -718,6 +745,9 @@ def detect_relationships(
     db.flush()
     payload = relationships_payload(db, record.id)
     payload["created"] = created
+    # SemTabla runs table profiling as Step 4, on the output of the three
+    # detection steps before it.  This is that step.
+    payload["profiles"] = profile_tables(db, record)["profiles"]
     return payload
 
 
@@ -976,6 +1006,678 @@ def relationship_evidence(db: Session, session_id: str, relationship_id: str) ->
             for item in payload[sample]["rows"]
         ]
     return {"relationship": row.to_dict(), "evidence": payload}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — table semantic profiling (SemTabla Step 4)
+# ---------------------------------------------------------------------------
+
+
+def _sheets_by_name(db: Session, session_id: str) -> dict[str, SheetRecord]:
+    return {
+        sheet.table_name: sheet
+        for sheet in db.execute(select(SheetRecord).where(SheetRecord.session_id == session_id))
+        .scalars()
+        .all()
+    }
+
+
+def profile_tables(db: Session, record: IngestionSession, claude=None) -> dict[str, Any]:
+    """Recompute every table's semantic profile and store it on its sheet.
+
+    Cheap enough to run whenever an input changes — it reads statistics the
+    earlier phases already computed, and touches the data itself only to
+    measure the interval of a time key.  That is what makes the paper's
+    behaviour possible: "the profiles of the data tables update accordingly
+    when users modify detailed semantic features".
+
+    The user's own corrections are carried across the rebuild, never
+    recomputed.
+    """
+
+    tables = analyzable_tables(db, record.id)
+    sheets = _sheets_by_name(db, record.id)
+    columns: dict[str, list[dict[str, Any]]] = {}
+    for column in (
+        db.execute(select(ColumnSemantics).where(ColumnSemantics.session_id == record.id))
+        .scalars()
+        .all()
+    ):
+        columns.setdefault(column.table_name, []).append(column.to_dict())
+
+    relationships = [
+        row.to_dict()
+        | {"status": row.status}  # to_dict omits it; the profiler reads verdicts
+        for row in db.execute(
+            select(RelationshipRecord).where(RelationshipRecord.session_id == record.id)
+        )
+        .scalars()
+        .all()
+    ]
+
+    previous = {
+        name: profile
+        for name, sheet in sheets.items()
+        if (profile := TableProfile.from_dict(sheet.semantic_profile)) is not None
+    }
+
+    profiles = build_table_profiles(
+        tables,
+        columns,
+        key_analyses={name: sheet.key_analysis or {} for name, sheet in sheets.items()},
+        relationships=relationships,
+        header_info={name: sheet.header_info or {} for name, sheet in sheets.items()},
+        previous=previous,
+    )
+
+    for name, profile in profiles.items():
+        sheet = sheets.get(name)
+        if sheet is not None:
+            sheet.semantic_profile = profile.to_dict()
+    db.flush()
+
+    # Everything downstream of "what is this table" is derived from it, so it
+    # is refreshed here rather than left for the export to discover: the key
+    # and reference roles the column semantics carry, and the one-line
+    # description Phase 5 pre-selects tables on.
+    sync_key_roles(db, record.id)
+    describe_tables(db, record, claude=claude)
+    return profiles_payload(db, record.id)
+
+
+def profiles_payload(db: Session, session_id: str) -> dict[str, Any]:
+    """Every stored profile, plus the counts the stage header shows."""
+
+    # The description is stored on the sheet rather than inside the profile —
+    # it is composed from the profile *and* the schema around it — so it is
+    # merged in here, where the panel that shows the profile can read it.
+    profiles = [
+        sheet.semantic_profile | {"description": sheet.effective_description}
+        for sheet in _sheets_by_name(db, session_id).values()
+        if sheet.semantic_profile
+    ]
+    profiles.sort(key=lambda payload: str(payload.get("table", "")))
+    by_type: dict[str, int] = {}
+    for payload in profiles:
+        by_type[str(payload.get("effective_type", TableType.UNKNOWN.value))] = (
+            by_type.get(str(payload.get("effective_type", TableType.UNKNOWN.value)), 0) + 1
+        )
+    return {
+        "profiles": profiles,
+        "counts": {
+            "total": len(profiles),
+            "unknown": by_type.get(TableType.UNKNOWN.value, 0),
+            "by_type": by_type,
+            "corrected": sum(1 for p in profiles if p.get("user_table_type")),
+        },
+    }
+
+
+def override_profile(
+    db: Session,
+    record: IngestionSession,
+    table: str,
+    table_type: str | None = None,
+    add_label: str | None = None,
+    remove_label: str | None = None,
+) -> dict[str, Any]:
+    """The paper's Table Profiling Validation: the user corrects the machine.
+
+    Corrections are held beside the detected values rather than over them, so
+    the detector's accuracy is still measurable afterwards.  Passing an empty
+    ``table_type`` withdraws an override and returns the table to whatever the
+    tree currently says.
+    """
+
+    sheet = db.execute(
+        select(SheetRecord)
+        .where(SheetRecord.session_id == record.id)
+        .where(SheetRecord.table_name == table)
+    ).scalar_one_or_none()
+    if sheet is None:
+        raise KeyError(f"session {record.id} has no table {table!r}")
+
+    profile = TableProfile.from_dict(sheet.semantic_profile)
+    if profile is None:
+        raise ValueError(f"{table} has not been profiled yet")
+
+    if table_type is not None:
+        if table_type == "":
+            profile.user_table_type = None
+        elif table_type not in {member.value for member in TableType}:
+            raise ValueError(f"{table_type!r} is not a table type")
+        else:
+            profile.user_table_type = table_type
+
+    if add_label is not None:
+        if add_label not in TABLE_LABELS:
+            raise ValueError(f"{add_label!r} is not one of the thirteen table labels")
+        profile.removed_labels = [n for n in profile.removed_labels if n != add_label]
+        if add_label not in {label.name for label in profile.labels}:
+            profile.added_labels = [*profile.added_labels, add_label]
+
+    if remove_label is not None:
+        if remove_label not in TABLE_LABELS:
+            raise ValueError(f"{remove_label!r} is not one of the thirteen table labels")
+        profile.added_labels = [n for n in profile.added_labels if n != remove_label]
+        if remove_label in {label.name for label in profile.labels}:
+            profile.removed_labels = [
+                *(n for n in profile.removed_labels if n != remove_label),
+                remove_label,
+            ]
+
+    sheet.semantic_profile = profile.to_dict()
+    db.flush()
+    # The description opens with what the table *is*, so a correction to that
+    # has to reach it — otherwise the user renames a fact table and Phase 5
+    # keeps being told it is a lookup.
+    describe_tables(db, record)
+    return sheet.semantic_profile
+
+
+def table_type_of(db: Session, session_id: str, table: str) -> str:
+    """The table type as it should read inside a semantic description.
+
+    Falls back to the neutral "data table" when profiling has not run, which
+    is what every description said before Phase 4 existed.
+    """
+
+    sheet = db.execute(
+        select(SheetRecord)
+        .where(SheetRecord.session_id == session_id)
+        .where(SheetRecord.table_name == table)
+    ).scalar_one_or_none()
+    profile = TableProfile.from_dict(sheet.semantic_profile) if sheet else None
+    if profile is None or profile.effective_type == TableType.UNKNOWN.value:
+        return "data table"
+    return profile.describe()
+
+
+def sync_key_roles(db: Session, session_id: str) -> int:
+    """Project the confirmed keys and references onto the column semantics.
+
+    ``ColumnSemantics`` is the layer Phase 5 retrieves against, and a retrieval
+    that cannot tell an identifier from a measure will join on the wrong thing.
+    The facts themselves live where they were decided — the primary key in the
+    sheet's ``key_analysis``, the references in ``relationships`` — so this
+    copies rather than decides, and can be re-run at any time.
+
+    Every row is cleared before anything is set, because a key the user
+    withdrew or a reference they rejected has to *stop* being true here; a
+    function that only ever sets flags would leave the retracted ones standing.
+
+    Returns how many columns carry a role afterwards.
+    """
+
+    rows = list(
+        db.execute(select(ColumnSemantics).where(ColumnSemantics.session_id == session_id))
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+    by_column = {(row.table_name, row.column_name): row for row in rows}
+    for row in rows:
+        row.is_primary_key = False
+        row.is_foreign_key = False
+        row.references_table = None
+        row.references_column = None
+
+    for table_name, sheet in _sheets_by_name(db, session_id).items():
+        for column_name in (sheet.key_analysis or {}).get("primary_key") or []:
+            row = by_column.get((table_name, str(column_name)))
+            if row is not None:
+                row.is_primary_key = True
+
+    for relation in (
+        db.execute(
+            select(RelationshipRecord)
+            .where(RelationshipRecord.session_id == session_id)
+            .where(RelationshipRecord.rel_type == RelationshipType.FOREIGN_KEY.value)
+            .where(RelationshipRecord.status == RelationshipStatus.CONFIRMED.value)
+        )
+        .scalars()
+        .all()
+    ):
+        row = by_column.get((relation.from_table, relation.from_column))
+        if row is not None:
+            row.is_foreign_key = True
+            row.references_table = relation.to_table
+            row.references_column = relation.to_column
+
+    db.flush()
+    return sum(1 for row in rows if row.is_primary_key or row.is_foreign_key)
+
+
+def describe_tables(db: Session, record: IngestionSession, claude=None) -> dict[str, str]:
+    """Compose (and optionally have Claude rewrite) one sentence per table.
+
+    Called from profiling, so a description exists as soon as the platform has
+    an opinion about what a table is, and is rebuilt whenever that opinion
+    changes.  When the composed sentence changes, any Claude-written one is
+    dropped: it was written about facts that no longer hold, and a stale
+    sentence is worse than a plain one because Phase 5 believes it.
+    """
+
+    sheets = _sheets_by_name(db, record.id)
+    if not sheets:
+        return {}
+
+    columns: dict[str, list[dict[str, Any]]] = {}
+    for column in (
+        db.execute(select(ColumnSemantics).where(ColumnSemantics.session_id == record.id))
+        .scalars()
+        .all()
+    ):
+        columns.setdefault(column.table_name, []).append(column.to_dict())
+
+    relationships = [
+        row.to_dict() | {"status": row.status}
+        for row in db.execute(
+            select(RelationshipRecord).where(RelationshipRecord.session_id == record.id)
+        )
+        .scalars()
+        .all()
+    ]
+
+    live = {name: sheet for name, sheet in sheets.items() if not sheet.skipped}
+    # Row counts come from the store, not from the sheet record: the sheet
+    # remembers what was ingested, and a cleaning step that removed duplicate
+    # rows would otherwise be described away.
+    measured = {meta.name: (meta.row_count, meta.column_count) for meta in get_store(record.id).meta()}
+    outgoing, incoming = table_summary.relationship_map(relationships)
+    composed = table_summary.describe_tables(
+        profiles={
+            name: profile
+            for name, sheet in live.items()
+            if (profile := TableProfile.from_dict(sheet.semantic_profile)) is not None
+        },
+        columns=columns,
+        key_analyses={name: sheet.key_analysis or {} for name, sheet in live.items()},
+        relationships=relationships,
+        counts={
+            name: measured.get(name, (sheet.row_count or 0, sheet.column_count or 0))
+            for name, sheet in live.items()
+        },
+    )
+
+    changed: list[str] = []
+    for name, sentence in composed.items():
+        sheet = live[name]
+        if sheet.table_description != sentence:
+            sheet.table_description = sentence
+            sheet.llm_table_description = None
+            changed.append(name)
+
+    _describe_tables_with_claude(
+        live,
+        composed,
+        changed,
+        columns,
+        outgoing,
+        incoming,
+        {name: rows for name, (rows, _) in measured.items()},
+        claude=claude,
+    )
+    _embed_tables(live, changed)
+    db.flush()
+    return {name: sheet.effective_description for name, sheet in live.items()}
+
+
+def _describe_tables_with_claude(
+    sheets: dict[str, SheetRecord],
+    composed: dict[str, str],
+    changed: list[str],
+    columns: dict[str, list[dict[str, Any]]],
+    outgoing: dict[str, list[tuple[str, str]]],
+    incoming: dict[str, list[str]],
+    counts: dict[str, int],
+    claude=None,
+) -> None:
+    """One call per dataset, and only for tables whose facts moved.
+
+    Profiling re-runs on every relationship decision.  Rewriting forty
+    sentences each time a user clicks "confirm" would spend money to produce
+    the sentences that are already there, so the model is asked only about the
+    tables whose composed description actually changed.
+    """
+
+    if not changed or claude is None or not getattr(claude, "available", False):
+        return
+
+    payloads = []
+    for name in changed:
+        sheet = sheets[name]
+        profile = TableProfile.from_dict(sheet.semantic_profile)
+        key_analysis = sheet.key_analysis or {}
+        payloads.append(
+            table_summary.payload_for_claude(
+                table=name,
+                profile=profile,
+                columns=columns.get(name) or [],
+                primary_key=[str(k) for k in key_analysis.get("primary_key") or []],
+                references=outgoing.get(name, []),
+                referenced_by=incoming.get(name, []),
+                row_count=counts.get(name, sheet.row_count or 0),
+            )
+        )
+
+    try:
+        written = claude.describe_tables(payloads)
+    except Exception as exc:  # pragma: no cover - defensive, network dependent
+        logger.warning("table descriptions were not rewritten: %s", exc)
+        return
+    for name, description in (written or {}).items():
+        sheet = sheets.get(name)
+        if sheet is not None and description:
+            sheet.llm_table_description = description
+
+
+def _embed_tables(sheets: dict[str, SheetRecord], changed: list[str]) -> None:
+    """Embed the descriptions that moved, plus any that were never embedded."""
+
+    pending = [
+        name
+        for name, sheet in sheets.items()
+        if name in changed or sheet.table_embedding is None
+    ]
+    if not pending:
+        return
+    vectors = table_summary.embed([sheets[name].effective_description for name in pending])
+    if vectors is None:
+        return
+    for name, vector in zip(pending, vectors, strict=False):
+        sheets[name].table_embedding = vector
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — semantic layer construction and export
+# ---------------------------------------------------------------------------
+
+
+def _export_inputs(
+    db: Session, record: IngestionSession
+) -> tuple[dict, dict, dict, list, dict, dict]:
+    """Everything the export plan reads, gathered from the earlier phases.
+
+    The tables here are *every* ingested table, not the analyzable subset the
+    other phases work on.  A four-row lookup sheet is below the floor for
+    statistics — a distribution over four values says nothing — but it is still
+    the user's data, and a database that quietly omits it is wrong in the one
+    way this project cannot afford.  What it loses is its detected types, so it
+    exports as text, and the plan says so.
+    """
+
+    sheets = _sheets_by_name(db, record.id)
+    tables = {
+        name: df
+        for name, df in get_store(record.id).tables().items()
+        if not (sheets.get(name) is not None and sheets[name].skipped)
+    }
+
+    columns: dict[str, list[dict[str, Any]]] = {}
+    for column in (
+        db.execute(select(ColumnSemantics).where(ColumnSemantics.session_id == record.id))
+        .scalars()
+        .all()
+    ):
+        columns.setdefault(column.table_name, []).append(column.to_dict())
+
+    relationships = [
+        row.to_dict() | {"status": row.status}
+        for row in db.execute(
+            select(RelationshipRecord).where(RelationshipRecord.session_id == record.id)
+        )
+        .scalars()
+        .all()
+    ]
+
+    keys = {name: sheet.key_analysis or {} for name, sheet in sheets.items()}
+    profiles = {name: sheet.semantic_profile or {} for name, sheet in sheets.items()}
+    descriptions = {name: sheet.effective_description for name, sheet in sheets.items()}
+    return tables, columns, keys, relationships, profiles, descriptions
+
+
+def export_semantic_layer(db: Session, record: IngestionSession, claude=None) -> dict[str, Any]:
+    """Build the database and its semantic layer.  Returns the report.
+
+    Everything the export asserts comes from a decision the user has already
+    made or can see: the primary keys they confirmed, the references they
+    approved, the types they corrected.  What it *cannot* assert — a reference
+    with orphan rows, a key that cleaning broke — is reported rather than
+    forced, which is why the report is part of the return value and not a log
+    line.
+    """
+
+    tables, columns, keys, relationships, profiles, descriptions = _export_inputs(db, record)
+    if not tables:
+        raise ValueError("there is nothing to export yet — upload a file first")
+
+    if not columns:
+        # The export reads types and labels off Phase 1.  Without it every
+        # column would land as TEXT, which is a worse database than the user
+        # spent the session building.
+        run_field_semantics(db, record, claude=claude)
+        _, columns, _, _, _, _ = _export_inputs(db, record)
+
+    # §4.3: the layer is *completed* here.  A user can reach the export without
+    # passing through the relationship stage, so the two things derived from
+    # the rest of the layer — the key and reference roles on the columns, and
+    # the one-line table descriptions — are brought up to date before the plan
+    # reads them, rather than exported as whatever they happened to be.
+    sync_key_roles(db, record.id)
+    descriptions = describe_tables(db, record, claude=claude) or descriptions
+
+    plan = build_plan(tables, columns, keys, relationships, profiles, descriptions)
+    plan.skipped.extend(
+        {
+            "table": sheet.table_name,
+            "reason": sheet.skip_reason or "the sheet could not be read during ingestion",
+        }
+        for sheet in _sheets_by_name(db, record.id).values()
+        if sheet.skipped
+    )
+    for spec in plan.tables:
+        if not columns.get(spec.source_name):
+            spec.notes.append(
+                "too small for semantic analysis, so every column is exported as text — "
+                "the rows are all here, their detected types are not"
+            )
+    report = run_export(record.id, plan, tables)
+    payload = report.to_dict()
+    payload["cleaning"] = _cleaning_caveat(db, record.id)
+
+    now = datetime.now(timezone.utc)
+    # Re-running enrichment produces a new version of the layer rather than an
+    # edit to the old one (FR-17).  The counter lives on the dataset because it
+    # is a fact about the dataset's meaning, not about this particular export.
+    record.semantic_version = (record.semantic_version or 0) + 1
+    record.enriched_at = now
+    record.db_schema_name = payload["target"]
+    payload["semantic_version"] = record.semantic_version
+
+    row = db.execute(
+        select(SemanticLayerExport).where(SemanticLayerExport.session_id == record.id)
+    ).scalar_one_or_none()
+    if row is None:
+        row = SemanticLayerExport(session_id=record.id)
+        db.add(row)
+    row.target = payload["target"]
+    row.dialect = payload["dialect"]
+    row.status = "ok" if not payload["warnings"] else "ok_with_warnings"
+    row.semantic_version = record.semantic_version
+    row.table_count = payload["table_count"]
+    row.row_count = payload["row_count"]
+    row.column_count = payload["metadata_rows"]
+    row.embedded_count = payload["embedded_rows"]
+    row.vector_index = payload["vector_index"]
+    row.warning_count = len(payload["warnings"])
+    row.report = payload
+    row.bundle = semantic_bundle(plan)
+    row.updated_at = now
+
+    _archive_layer(db, record, row)
+    record.status = "exported"
+    db.flush()
+    return {**row.to_dict(), "report": payload}
+
+
+def _archive_layer(
+    db: Session, record: IngestionSession, export: SemanticLayerExport
+) -> SemanticLayerVersion:
+    """Keep this build of the layer beside the ones before it.
+
+    The archive holds the JSON layer only.  An export replaces the schema it
+    writes into, so an earlier version describes tables that no longer exist —
+    what is worth keeping is what the platform *believed* about the data at
+    that point, which is what a before/after quality comparison reads.
+    """
+
+    version = SemanticLayerVersion(
+        session_id=record.id,
+        version=record.semantic_version,
+        target=export.target,
+        dialect=export.dialect,
+        table_count=export.table_count,
+        column_count=export.column_count,
+        row_count=export.row_count,
+        warning_count=export.warning_count,
+        bundle=export.bundle or {},
+    )
+    db.add(version)
+    db.flush()
+
+    stale = list(
+        db.execute(
+            select(SemanticLayerVersion)
+            .where(SemanticLayerVersion.session_id == record.id)
+            .order_by(SemanticLayerVersion.version.desc())
+            .offset(MAX_LAYER_VERSIONS)
+        )
+        .scalars()
+        .all()
+    )
+    for old_version in stale:
+        db.delete(old_version)
+    if stale:
+        db.flush()
+    return version
+
+
+def layer_versions(db: Session, session_id: str) -> list[SemanticLayerVersion]:
+    """Every archived build of a session's layer, newest first."""
+
+    return list(
+        db.execute(
+            select(SemanticLayerVersion)
+            .where(SemanticLayerVersion.session_id == session_id)
+            .order_by(SemanticLayerVersion.version.desc())
+        )
+        .scalars()
+        .all()
+    )
+
+
+def layer_bundle(db: Session, session_id: str, version: int | None = None) -> dict[str, Any] | None:
+    """The portable JSON layer — the current one, or an archived version.
+
+    Returns ``None`` when there is no such version, which the route turns into
+    a 404: asking for version 7 of a dataset exported twice is a mistake worth
+    being told about rather than answered with the newest one.
+    """
+
+    if version is None:
+        row = export_record(db, session_id)
+        return None if row is None else (row.bundle or {})
+
+    archived = db.execute(
+        select(SemanticLayerVersion)
+        .where(SemanticLayerVersion.session_id == session_id)
+        .where(SemanticLayerVersion.version == version)
+    ).scalar_one_or_none()
+    return None if archived is None else (archived.bundle or {})
+
+
+def layer_documentation(
+    db: Session, record: IngestionSession, version: int | None = None
+) -> str | None:
+    """The semantic layer as Markdown documentation (FR-18).
+
+    Rendered from the stored bundle, so documenting an earlier version is the
+    same operation as documenting the current one — and neither re-analyses
+    anything.
+    """
+
+    bundle = layer_bundle(db, record.id, version)
+    if bundle is None:
+        return None
+    export = export_record(db, record.id)
+    archived = None
+    if version is not None:
+        archived = next(
+            (row for row in layer_versions(db, record.id) if row.version == version), None
+        )
+    stamp = archived.created_at if archived is not None else (
+        export.updated_at if export is not None else None
+    )
+    return render_markdown(
+        bundle,
+        dataset=record.name,
+        target=(archived.target if archived is not None else (export.target if export else "")),
+        dialect=(archived.dialect if archived is not None else (export.dialect if export else "")),
+        version=(
+            archived.version
+            if archived is not None
+            else (export.semantic_version if export else 0)
+        ),
+        exported_at=stamp.strftime("%Y-%m-%d %H:%M UTC") if stamp else "",
+    )
+
+
+def _cleaning_caveat(db: Session, session_id: str) -> dict[str, Any]:
+    """Whether the export is of a dataset whose cleaning plan is still open.
+
+    Not an error — a user may export at any point, and the export always
+    reflects the tables as they are now.  But "you exported halfway through
+    your own cleaning plan" is something they should be told rather than left
+    to notice.
+    """
+
+    from app.db.models import CleaningRun  # local import: avoids a cycle
+
+    run = db.execute(
+        select(CleaningRun).where(CleaningRun.session_id == session_id)
+    ).scalar_one_or_none()
+    if run is None:
+        return {"status": "not_started", "complete": True}
+    complete = run.status in {"completed", "cancelled", "aborted", "not_started"}
+    return {
+        "status": run.status,
+        "complete": complete,
+        "completed_steps": run.completed_steps,
+        "step_count": run.step_count,
+    }
+
+
+def export_record(db: Session, session_id: str) -> SemanticLayerExport | None:
+    return db.execute(
+        select(SemanticLayerExport).where(SemanticLayerExport.session_id == session_id)
+    ).scalar_one_or_none()
+
+
+def export_payload(db: Session, session_id: str) -> dict[str, Any]:
+    """The last export, or an explicit "not yet"."""
+
+    row = export_record(db, session_id)
+    if row is None:
+        return {"exported": False, "report": None}
+    return {"exported": True, **row.to_dict()}
+
+
+def forget_export(session_id: str) -> None:
+    """Drop a session's exported database.  Called when the session is deleted."""
+
+    drop_export(session_id)
 
 
 def backend_status() -> dict[str, Any]:

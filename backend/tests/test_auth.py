@@ -298,6 +298,8 @@ def test_another_users_dataset_is_reported_as_missing_not_forbidden(client, othe
         ("get", f"/api/sessions/{mine}/equivalences"),
         ("get", f"/api/sessions/{mine}/cleaning/state"),
         ("get", f"/api/sessions/{mine}/tables/customers/preview"),
+        ("get", f"/api/sessions/{mine}/export/versions"),
+        ("get", f"/api/sessions/{mine}/export/documentation"),
         ("post", f"/api/sessions/{mine}/semantics"),
         ("post", f"/api/sessions/{mine}/cleaning/start"),
         ("delete", f"/api/sessions/{mine}"),

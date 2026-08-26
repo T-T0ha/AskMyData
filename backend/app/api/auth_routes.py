@@ -13,6 +13,7 @@ from app.auth import passwords, service
 from app.auth.deps import current_user, request_token
 from app.cleaning.store import drop_store
 from app.core.config import get_settings
+from app.export.runner import drop_export
 from app.db.base import session_scope
 from app.db.models import User
 
@@ -199,10 +200,14 @@ def delete_account(
 ) -> dict[str, Any]:
     """FR-15: remove the account and every dataset it owns.
 
-    The database cascade takes the metadata; the working tables and uploaded
-    files live outside it and are removed here, before the row goes, so that a
-    failure halfway leaves an account that can be deleted again rather than
-    orphaned files nothing points to.
+    The database cascade takes the metadata; the working tables, the uploaded
+    files and each dataset's materialized schema live outside it and are removed
+    here, before the row goes, so that a failure halfway leaves an account that
+    can be deleted again rather than orphaned data nothing points to.
+
+    The materialized schema matters most of the three: it holds the rows
+    themselves, in a database that stays running, and a ``ds_…`` left behind by
+    a deleted account is readable by anything that can reach the server.
     """
 
     # Verified directly rather than through ``authenticate``: this is a
@@ -214,6 +219,7 @@ def delete_account(
     dataset_ids = [record.id for record in user.sessions]
     for dataset_id in dataset_ids:
         drop_store(dataset_id)
+        drop_export(dataset_id)
     db.delete(user)
     db.flush()
     logger.info("deleted account %s and %d dataset(s)", user.email, len(dataset_ids))

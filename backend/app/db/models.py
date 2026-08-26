@@ -196,6 +196,22 @@ class IngestionSession(Base):
     )
     stats: Mapped[dict] = mapped_column(JSON, default=dict)
 
+    #: Where this dataset's cleaned tables physically live once it has been
+    #: exported: the schema name on PostgreSQL, the file name in local
+    #: development.  Empty until the first export.  Recorded rather than
+    #: recomputed so that a reader of the control plane can find the data
+    #: plane without knowing how the name is derived.
+    db_schema_name: Mapped[str] = mapped_column(String(100), default="")
+    #: How many times the semantic layer has been built.  0 = never.  Every
+    #: export increments it and archives that build, so a later layer can be
+    #: compared against an earlier one (FR-17).
+    semantic_version: Mapped[int] = mapped_column(Integer, default=0)
+    #: When the layer was last built.  Distinct from ``updated_at``, which any
+    #: edit moves; this one moves only when the semantics were rebuilt.
+    enriched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     user: Mapped[User | None] = relationship(back_populates="sessions")
     sheets: Mapped[list["SheetRecord"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
@@ -209,6 +225,16 @@ class IngestionSession(Base):
     relationships: Mapped[list["RelationshipRecord"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
+    #: Declared so that deleting a dataset takes its export record and its
+    #: archived layers with it on every dialect.  The database-level cascade
+    #: does the same on PostgreSQL, but SQLite only enforces foreign keys when
+    #: asked to, and an orphaned semantic layer is still the user's data.
+    export: Mapped["SemanticLayerExport | None"] = relationship(
+        cascade="all, delete-orphan", uselist=False
+    )
+    layer_versions: Mapped[list["SemanticLayerVersion"]] = relationship(
+        cascade="all, delete-orphan"
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -220,6 +246,9 @@ class IngestionSession(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "stats": self.stats or {},
+            "db_schema_name": self.db_schema_name or "",
+            "semantic_version": self.semantic_version or 0,
+            "enriched_at": self.enriched_at.isoformat() if self.enriched_at else None,
         }
 
 
@@ -252,6 +281,26 @@ class SheetRecord(Base):
     #: This is what Phase 4 writes as ``PRIMARY KEY`` and what Phase 3's
     #: foreign-key detection aims at.
     key_analysis: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: What the table *is* — SemTabla's thirteen table-level labels, the table
+    #: type the decision tree read off them, and the user's corrections to
+    #: both.  Recomputed from the other phases rather than measured, which is
+    #: why it can be rebuilt whenever any of them changes.
+    semantic_profile: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: One sentence saying what the table is for, composed from the profile
+    #: above and the keys and references around it.  Phase 5's intent step
+    #: sends the model table names and these sentences and nothing else, so
+    #: this is what decides which tables a question is even read against.
+    table_description: Mapped[str] = mapped_column(Text, default="")
+    #: Claude's version of the same sentence, when a key is configured.  Held
+    #: beside the composed one rather than over it — the same split the rest of
+    #: the layer makes between what was derived and what was written — and
+    #: dropped whenever the facts underneath it change.
+    llm_table_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: The description embedded, for intent-based table pre-selection.  The ER
+    #: diagram calls this ``TableSemantics.embedding``.
+    table_embedding: Mapped[list | None] = mapped_column(
+        EmbeddingVector(get_settings().embedding_dim), nullable=True
+    )
     triage: Mapped[str] = mapped_column(String(40), default="clean")
     row_count: Mapped[int] = mapped_column(Integer, default=0)
     column_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -263,7 +312,15 @@ class SheetRecord(Base):
 
     session: Mapped[IngestionSession] = relationship(back_populates="sheets")
 
+    @property
+    def effective_description(self) -> str:
+        """What a reader — or Phase 5 — should be shown."""
+
+        return self.llm_table_description or self.table_description or ""
+
     def to_dict(self) -> dict[str, Any]:
+        # ``table_embedding`` is deliberately absent: 384 floats per sheet in
+        # every session payload, for a value no client can use.
         return {
             "id": self.id,
             "table_name": self.table_name,
@@ -272,6 +329,9 @@ class SheetRecord(Base):
             "source_kind": self.source_kind,
             "native_schema": self.native_schema or {},
             "key_analysis": self.key_analysis or {},
+            "semantic_profile": self.semantic_profile or {},
+            "table_description": self.effective_description,
+            "description_source": "claude" if self.llm_table_description else "composed",
             "triage": self.triage,
             "row_count": self.row_count,
             "column_count": self.column_count,
@@ -312,6 +372,19 @@ class ColumnSemantics(Base):
     user_column_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
     user_taxonomy_label: Mapped[str | None] = mapped_column(String(60), nullable=True)
     validated: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    #: The column's role in the schema, projected here from the key analysis
+    #: and the relationships the user confirmed.  It is derived rather than
+    #: measured — which is why it is refreshed whenever either changes — but it
+    #: is stored, because this table is what Phase 5 retrieves against, and a
+    #: retrieval that cannot tell an identifier from a measure joins wrongly.
+    is_primary_key: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_foreign_key: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: The column this one points at, in the source table's own names.  Set
+    #: only for a reference a person confirmed; a reference the export could
+    #: not enforce still lives here, because it is still true.
+    references_table: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    references_column: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     nullable: Mapped[bool] = mapped_column(Boolean, default=True)
     null_ratio: Mapped[float] = mapped_column(Float, default=0.0)
@@ -355,6 +428,10 @@ class ColumnSemantics(Base):
             "effective_type": self.effective_type,
             "effective_label": self.effective_label,
             "validated": self.validated,
+            "is_primary_key": self.is_primary_key,
+            "is_foreign_key": self.is_foreign_key,
+            "references_table": self.references_table,
+            "references_column": self.references_column,
             "nullable": self.nullable,
             "null_ratio": self.null_ratio,
             "unique_count": self.unique_count,
@@ -487,6 +564,120 @@ class RelationshipRecord(Base):
             "llm_explanation": self.llm_explanation,
             "decided_at": self.decided_at.isoformat() if self.decided_at else None,
         }
+
+
+class SemanticLayerExport(Base):
+    """The last Phase 4 export of one session: where it went and what it did.
+
+    One row per session, replaced on every export, because an export replaces
+    the schema it writes into — keeping a history here would describe databases
+    that no longer exist.  ``report`` holds the full account the user reads
+    (including the DDL); ``bundle`` holds the portable JSON as it was at that
+    moment, so downloading it later gives what was exported rather than what
+    the analysis has drifted to since.
+    """
+
+    __tablename__ = "semantic_layer_exports"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("ingestion_sessions.id", ondelete="CASCADE"), index=True, unique=True
+    )
+    #: The schema name on PostgreSQL, the file name on SQLite.  Never a URL:
+    #: a connection string would carry the database password into every API
+    #: response that mentions the export.
+    target: Mapped[str] = mapped_column(String(128), default="")
+    dialect: Mapped[str] = mapped_column(String(20), default="")
+    status: Mapped[str] = mapped_column(String(20), default="ok")
+    #: Which build of the layer this is — the session's ``semantic_version`` at
+    #: the moment it was written, and the key into ``semantic_layer_versions``.
+    semantic_version: Mapped[int] = mapped_column(Integer, default=0)
+    table_count: Mapped[int] = mapped_column(Integer, default=0)
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    column_count: Mapped[int] = mapped_column(Integer, default=0)
+    embedded_count: Mapped[int] = mapped_column(Integer, default=0)
+    vector_index: Mapped[bool] = mapped_column(Boolean, default=False)
+    warning_count: Mapped[int] = mapped_column(Integer, default=0)
+    report: Mapped[dict] = mapped_column(JSON, default=dict)
+    bundle: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    def to_dict(self, include_report: bool = True) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "id": self.id,
+            "session_id": self.session_id,
+            "target": self.target,
+            "dialect": self.dialect,
+            "status": self.status,
+            "semantic_version": self.semantic_version,
+            "table_count": self.table_count,
+            "row_count": self.row_count,
+            "column_count": self.column_count,
+            "embedded_count": self.embedded_count,
+            "vector_index": self.vector_index,
+            "warning_count": self.warning_count,
+            "exported_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_report:
+            payload["report"] = self.report or {}
+        return payload
+
+
+class SemanticLayerVersion(Base):
+    """An earlier build of one session's semantic layer, kept for comparison.
+
+    ``SemanticLayerExport`` describes the export that *exists*; this describes
+    every export that has existed.  Re-running enrichment increments the
+    session's ``semantic_version`` and appends a row here, which is what makes
+    "the layer is versioned" (FR-17) a fact about the database rather than a
+    statement in a document: a before/after quality report can read two of
+    these and diff them.
+
+    Only the bundle is archived, never the data.  An export replaces the schema
+    it writes into, so an older version describes tables that no longer exist —
+    it is a record of what the platform *believed*, which is exactly the thing
+    worth comparing, and it costs a few kilobytes instead of a second copy of
+    the dataset.
+    """
+
+    __tablename__ = "semantic_layer_versions"
+    __table_args__ = (
+        UniqueConstraint("session_id", "version", name="uq_layer_version_per_session"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("ingestion_sessions.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    target: Mapped[str] = mapped_column(String(128), default="")
+    dialect: Mapped[str] = mapped_column(String(20), default="")
+    table_count: Mapped[int] = mapped_column(Integer, default=0)
+    column_count: Mapped[int] = mapped_column(Integer, default=0)
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    warning_count: Mapped[int] = mapped_column(Integer, default=0)
+    #: The portable JSON layer as it was at this version.  No vectors and no
+    #: rows of data — the same document the user can download.
+    bundle: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    def to_dict(self, include_bundle: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "version": self.version,
+            "target": self.target,
+            "dialect": self.dialect,
+            "table_count": self.table_count,
+            "column_count": self.column_count,
+            "row_count": self.row_count,
+            "warning_count": self.warning_count,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+        if include_bundle:
+            payload["bundle"] = self.bundle or {}
+        return payload
 
 
 class CleaningRun(Base):
