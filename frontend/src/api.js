@@ -161,6 +161,27 @@ export const api = {
     ),
   exportVersions: (id) => request(`/sessions/${id}/export/versions`),
 
+  askQuestion: (id, question) =>
+    request(`/sessions/${id}/query`, { method: 'POST', body: JSON.stringify({ question }) }),
+  queryHistory: (id) => request(`/sessions/${id}/query/history`),
+
+  pinCard: (id, card) =>
+    request(`/sessions/${id}/dashboard/cards`, { method: 'POST', body: JSON.stringify(card) }),
+  dashboardCards: (id, { start, end } = {}) => {
+    const params = new URLSearchParams()
+    if (start) params.set('start', start)
+    if (end) params.set('end', end)
+    const query = params.toString()
+    return request(`/sessions/${id}/dashboard/cards${query ? `?${query}` : ''}`)
+  },
+  updateCard: (id, cardId, patch) =>
+    request(`/sessions/${id}/dashboard/cards/${cardId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  unpinCard: (id, cardId) =>
+    request(`/sessions/${id}/dashboard/cards/${cardId}`, { method: 'DELETE' }),
+
   startCleaning: (id) => request(`/sessions/${id}/cleaning/start`, { method: 'POST' }),
   cleaningState: (id) => request(`/sessions/${id}/cleaning/state`),
   submitPlan: (id, action, plan) =>

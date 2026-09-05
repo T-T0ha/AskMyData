@@ -59,6 +59,31 @@ class Settings(BaseSettings):
     plan_sample_values: int = 5
     validation_preview_rows: int = 10
 
+    # ---- Phase 5 : natural language query ------------------------------
+    #: Tables sent to the SQL prompt, at most.  A written-down bound rather than
+    #: "all of them" so a wide database cannot blow the prompt budget; a
+    #: business dataset's table count rarely reaches it.
+    query_max_tables: int = 8
+    #: Non-key columns kept by embedding similarity, at most — SemTabla's "top
+    #: 15 most relevant column metadata records".  Key columns are never
+    #: subject to this cap; see app.query.retrieval.
+    query_max_ranked_columns: int = 15
+    #: generate → validate → EXPLAIN attempts before giving up and reporting
+    #: the last error to the user instead of a fifth guess.
+    query_max_attempts: int = 3
+    #: Rows returned to the browser, at most, regardless of what the query
+    #: itself asked for — a forgotten LIMIT must not pull a 200k-row table into
+    #: one HTTP response.
+    query_row_cap: int = 1000
+    #: PostgreSQL only: aborts a runaway query (a bad join, an expensive scan)
+    #: instead of holding the connection for the request's full timeout.
+    query_statement_timeout_seconds: int = 20
+
+    # ---- Phase 6 : dashboard --------------------------------------------
+    #: Questions kept per session for the history sidebar, newest first —
+    #: claude.md's "last 20 questions, clickable to re-run".
+    query_history_limit: int = 20
+
     # ---- Claude --------------------------------------------------------
     anthropic_api_key: str | None = None
     claude_model: str = "claude-opus-5"

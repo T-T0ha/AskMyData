@@ -5,11 +5,18 @@
 /*
  * Design tokens.
  *
- * Chart colours come from the validated reference palette: a single
- * categorical hue (blue) for every distribution mark — all of them are
- * single-series, so no categorical palette is in play — and the fixed status
- * palette for triage and confidence, which always ships with a text label so
- * colour never carries meaning alone.
+ * Chart colours come from the validated reference palette. Most marks in this
+ * app are single-series (blue, --series-1) — the query panel's multi-line and
+ * category-breakdown charts are the exception, and are the reason
+ * --series-2..6 exist at all. That six-slot order is the one the palette
+ * validator (the dataviz skill's scripts/validate_palette.js) passes on the
+ * *adjacent* pairlist in both modes — the case a line or bar chart's
+ * neighbouring series actually are. A pie chart's slices are effectively
+ * all-pairs (any two can sit next to each other once sorted by value), where
+ * only the first three slots clear the validator in light mode — see
+ * QueryPanel's pie cap. The fixed status palette (below) is for triage and
+ * confidence, and always ships with a text label so colour never carries
+ * meaning alone.
  *
  * Dark mode is *selected*, not flipped: each token has its own dark step
  * chosen against the dark surface. The media query covers the OS setting and
@@ -30,9 +37,14 @@
   --baseline: #c3c2b7;
   --border: rgba(11, 11, 11, 0.1);
 
-  /* single categorical slot — every chart here plots one series */
+  /* categorical order — validated, adjacent-pairlist, do not reorder */
   --series-1: #2a78d6;
   --series-1-wash: rgba(42, 120, 214, 0.12);
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
 
   /* sequential blue, light -> dark (magnitude) */
   --seq-100: #cde2fb;
@@ -67,6 +79,11 @@
 
     --series-1: #3987e5;
     --series-1-wash: rgba(57, 135, 229, 0.18);
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
 
     --seq-100: #0d366b;
     --seq-250: #184f95;
@@ -178,4 +195,20 @@ input[type='number'] {
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* Dashboard "Export to PDF" (`window.print()`) — hides the app chrome and the
+   question-history sidebar, which are of the app, not of the dashboard being
+   exported; everything else prints as it renders, cards included. */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff;
+  }
+  main {
+    max-width: 100% !important;
+    padding: 0 !important;
+  }
 }

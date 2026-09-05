@@ -235,6 +235,12 @@ class IngestionSession(Base):
     layer_versions: Mapped[list["SemanticLayerVersion"]] = relationship(
         cascade="all, delete-orphan"
     )
+    dashboard_cards: Mapped[list["DashboardCard"]] = relationship(
+        cascade="all, delete-orphan"
+    )
+    query_history: Mapped[list["QueryHistoryRecord"]] = relationship(
+        cascade="all, delete-orphan"
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -709,4 +715,97 @@ class CleaningRun(Base):
             "step_count": self.step_count,
             "completed_steps": self.completed_steps,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class DashboardCard(Base):
+    """One pinned question, saved as its question, its SQL and its chart choice.
+
+    Phase 5 already produces everything a card needs to re-render itself
+    (:func:`app.api.services.answer_question`'s return shape); pinning just
+    keeps that shape.  What is deliberately *not* stored is the result — a
+    card re-executes ``sql`` against the live export on every dashboard load
+    (§Phase 6: "results always current, not snapshots"), so the rows here
+    would only ever be a stale copy no read path uses.
+    """
+
+    __tablename__ = "dashboard_cards"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("ingestion_sessions.id", ondelete="CASCADE"), index=True
+    )
+    #: Editable by the user; starts as the question that produced the card.
+    title: Mapped[str] = mapped_column(String(255), default="")
+    question: Mapped[str] = mapped_column(Text, default="")
+    sql: Mapped[str] = mapped_column(Text)
+    dialect: Mapped[str] = mapped_column(String(20), default="")
+    explanation: Mapped[str] = mapped_column(Text, default="")
+    tables_used: Mapped[list] = mapped_column(JSON, default=list)
+    #: The shape decided at ask-time (`chart`, `column_kinds`, ...).  Reused
+    #: as-is on refresh rather than reclassified, so a chart a person chose to
+    #: pin does not silently change form because a later row happened to tip
+    #: the classifier a different way.
+    visualization: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: Grid position for react-grid-layout: {x, y, w, h}.  Empty until the
+    #: user first drags or resizes the card, at which point the frontend
+    #: assigns one; the grid lays out anything still empty on its own.
+    layout: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: Insertion order, for a stable default layout before any drag/resize.
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title or self.question,
+            "question": self.question,
+            "sql": self.sql,
+            "dialect": self.dialect,
+            "explanation": self.explanation,
+            "tables_used": self.tables_used or [],
+            "visualization": self.visualization or {},
+            "layout": self.layout or {},
+            "position": self.position,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class QueryHistoryRecord(Base):
+    """One question asked of a session, kept for the dashboard's history sidebar.
+
+    Written for every question — a failed one included, with its error rather
+    than SQL — because "what did I already try and why did it not work" is as
+    much a part of the history as a successful answer.  Only the last
+    :attr:`~app.core.config.Settings.query_history_limit` rows per session are
+    kept; :func:`app.api.services.answer_question` trims older ones on write,
+    so this never grows past what the sidebar ever shows.
+    """
+
+    __tablename__ = "query_history"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("ingestion_sessions.id", ondelete="CASCADE"), index=True
+    )
+    question: Mapped[str] = mapped_column(Text, default="")
+    ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    sql: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    chart: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "question": self.question,
+            "ok": self.ok,
+            "sql": self.sql,
+            "error": self.error,
+            "chart": self.chart,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }

@@ -179,6 +179,22 @@ def reset_target(target: ExportTarget) -> None:
         target.path.unlink(missing_ok=True)
 
 
+def _set_search_path(connection: Any, target: ExportTarget) -> None:
+    """Make the export's bare table names resolve, on PostgreSQL only.
+
+    The exported tables live in ``ds_<session>``, never in ``public`` — a
+    session's database connection has no reason to see any other schema, so
+    setting ``search_path`` to exactly this one is a security boundary as much
+    as a convenience: a query that named a table outside the export cannot
+    silently resolve into the application's own tables, because they are no
+    longer on the path to be found on.  SQLite has no schema concept — one
+    session's export is a whole separate file — so there is nothing to set.
+    """
+
+    if target.schema is not None:
+        connection.execute(text(f'SET search_path TO "{target.schema}"'))
+
+
 def drop_export(session_id: str) -> None:
     """Remove a session's exported database — used when the session is deleted."""
 
@@ -319,18 +335,78 @@ def run_export(
 def read_back(session_id: str, statement: str, parameters: Mapping[str, Any] | None = None):
     """Run one read against a session's exported database.
 
-    Used by the tests and, later, by Phase 5.  It takes a whole statement
-    because the caller composes it; every identifier in it comes from the
-    export plan, never from a request.
+    Used by the tests and by Phase 5's ``EXPLAIN`` step.  It takes a whole
+    statement because the caller composes it; every identifier in it comes
+    from the export plan or from :mod:`app.query.guard`'s validated output,
+    never from a request unchecked.
     """
 
     target = resolve_target(session_id)
     try:
         with target.engine.connect() as connection:
+            _set_search_path(connection, target)
             result = connection.execute(text(statement), dict(parameters or {}))
             return [dict(row) for row in result.mappings()]
     finally:
         target.dispose()
+
+
+def explain(session_id: str, statement: str) -> None:
+    """Confirm ``statement`` resolves against the export, without running it.
+
+    ``EXPLAIN`` — PostgreSQL's plain form, SQLite's ``EXPLAIN QUERY PLAN``, the
+    one that does not execute the plan it prints — fails for exactly the
+    reasons the real query would: an unknown column, a type mismatch, a bad
+    join.  Running it first is what turns a hallucinated column name into a
+    caught, retryable error in :func:`app.api.services.answer_question`
+    instead of a stack trace the user sees.
+    """
+
+    target = resolve_target(session_id)
+    try:
+        with target.engine.connect() as connection:
+            _set_search_path(connection, target)
+            prefix = "EXPLAIN QUERY PLAN " if target.dialect == "sqlite" else "EXPLAIN "
+            connection.execute(text(prefix + statement))
+    finally:
+        target.dispose()
+
+
+def run_readonly(
+    session_id: str, statement: str, row_cap: int
+) -> tuple[list[str], list[dict[str, Any]], bool]:
+    """Execute one already-validated SELECT and bound how much of it comes back.
+
+    ``statement`` is wrapped in an outer ``LIMIT`` regardless of whether it
+    carries one of its own, so a question that translates into an unbounded
+    scan cannot pull an entire table into one HTTP response — the wrapping
+    only ever *tightens* the row count, and preserves the inner statement's
+    own column names because ``SELECT *`` over a subquery does.  ``row_cap + 1``
+    rows are fetched so the caller can tell "exactly the cap" from "more
+    existed and were cut", without a separate ``COUNT(*)`` query.
+
+    On PostgreSQL the statement also runs under a bounded
+    ``statement_timeout`` (:attr:`~app.core.config.Settings.query_statement_timeout_seconds`),
+    so a query that is syntactically fine but pathologically expensive — a
+    Cartesian join the guard has no way to see coming — is aborted rather than
+    holding the connection for the life of the request.
+    """
+
+    target = resolve_target(session_id)
+    bounded = f"SELECT * FROM ({statement}) AS _bounded LIMIT {int(row_cap) + 1}"
+    try:
+        with target.engine.connect() as connection:
+            _set_search_path(connection, target)
+            if target.dialect == "postgresql":
+                timeout_ms = get_settings().query_statement_timeout_seconds * 1000
+                connection.execute(text(f"SET statement_timeout = {timeout_ms}"))
+            result = connection.execute(text(bounded))
+            columns = list(result.keys())
+            rows = [dict(row) for row in result.mappings()]
+    finally:
+        target.dispose()
+    truncated = len(rows) > row_cap
+    return columns, rows[:row_cap], truncated
 
 
 def read_semantic_layer(session_id: str) -> list[dict[str, Any]]:

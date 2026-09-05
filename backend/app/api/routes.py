@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -132,6 +133,39 @@ class ManualRelationship(BaseModel):
     from_column: str = Field(min_length=1, max_length=255)
     to_table: str = Field(min_length=1, max_length=255)
     to_column: str = Field(min_length=1, max_length=255)
+
+
+class QuestionRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+
+
+class DashboardCardLayout(BaseModel):
+    x: int = 0
+    y: int = 0
+    w: int = 4
+    h: int = 4
+
+
+class DashboardCardCreate(BaseModel):
+    """A pin request — echoes back what ``/query`` already answered.
+
+    ``sql`` is re-validated server-side (:func:`app.api.services.pin_dashboard_card`);
+    everything else here is display metadata the frontend already has in hand
+    from the answer it is pinning, so pinning needs no second round trip to
+    Claude or to the database.
+    """
+
+    question: str = Field(min_length=1, max_length=2000)
+    sql: str = Field(min_length=1)
+    title: str | None = Field(default=None, max_length=255)
+    explanation: str = ""
+    tables_used: list[str] = Field(default_factory=list)
+    visualization: dict[str, Any] = Field(default_factory=dict)
+
+
+class DashboardCardUpdate(BaseModel):
+    title: str | None = Field(default=None, max_length=255)
+    layout: DashboardCardLayout | None = None
 
 
 class SourceConnection(BaseModel):
@@ -773,6 +807,102 @@ def get_semantic_ddl(session_id: str, db: Session = Depends(session_scope)) -> s
     if row is None:
         raise HTTPException(status_code=404, detail="this dataset has not been exported yet")
     return (row.report or {}).get("ddl", "")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — natural language query
+# ---------------------------------------------------------------------------
+
+
+@router.post("/sessions/{session_id}/query")
+def ask_question(
+    body: QuestionRequest,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    """Ask one question of the exported semantic layer.
+
+    A question the model could not turn into a usable query is still a 200:
+    ``ok: false`` with the attempts and the last error, so the UI can show the
+    user what was tried rather than a generic failure.  Only "there is nothing
+    to query yet" is an error status — that is a precondition the user can act
+    on (export first), not an outcome of the question itself.
+    """
+
+    try:
+        return services.answer_question(db, record, body.question, claude=get_claude_client())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/sessions/{session_id}/query/history", dependencies=[Depends(require_session)])
+def query_history(
+    session_id: str,
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    return {"history": services.question_history(db, session_id)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — dashboard
+# ---------------------------------------------------------------------------
+
+
+@router.post("/sessions/{session_id}/dashboard/cards", status_code=201)
+def pin_dashboard_card(
+    body: DashboardCardCreate,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    try:
+        card = services.pin_dashboard_card(db, record, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return card.to_dict()
+
+
+@router.get("/sessions/{session_id}/dashboard/cards")
+def list_dashboard_cards(
+    start: date | None = None,
+    end: date | None = None,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    """Every pinned card, re-executed against the live export just now.
+
+    ``start``/``end`` inject the global date-range picker's ``WHERE`` clause
+    into every card whose own shape names exactly one date column; a card
+    without one runs unfiltered rather than being silently skipped.
+    """
+
+    return {"cards": services.list_dashboard_cards(db, record, start=start, end=end)}
+
+
+@router.patch("/sessions/{session_id}/dashboard/cards/{card_id}")
+def update_dashboard_card(
+    card_id: str,
+    body: DashboardCardUpdate,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    patch = {
+        "title": body.title,
+        "layout": body.layout.model_dump() if body.layout is not None else None,
+    }
+    try:
+        card = services.update_dashboard_card(db, record, card_id, patch)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return card.to_dict()
+
+
+@router.delete("/sessions/{session_id}/dashboard/cards/{card_id}", status_code=204)
+def unpin_dashboard_card(
+    card_id: str,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> None:
+    services.delete_dashboard_card(db, record, card_id)
 
 
 # ---------------------------------------------------------------------------

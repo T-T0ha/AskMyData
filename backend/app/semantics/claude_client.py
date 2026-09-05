@@ -163,6 +163,53 @@ Rules:
 - Answer with the JSON object and nothing else."""
 
 
+SQL_SYSTEM_PROMPT = """You translate a business question into one read-only SQL query.
+
+You are given the question, the SQL dialect ("postgresql" or "sqlite"), and the schema of \
+the tables that matter for it — grouped by table, with each column's name, SQL type, \
+semantic label, whether it is a primary or foreign key (and what it references), whether \
+it is additive (safe to SUM or AVG), its null ratio, and up to five example values. You may \
+also be given a previous attempt and the error it produced; fix that specific error rather \
+than starting over from a different query.
+
+Answer with JSON only, in exactly this shape:
+{"sql": "<one SELECT statement>", "explanation": "<one short plain-English sentence saying what it computes>"}
+
+Rules:
+- Exactly one statement, and it must be a SELECT (a WITH ... SELECT is allowed; a bare \
+UNION/INTERSECT/EXCEPT of two SELECTs is allowed). Never a semicolon followed by anything else.
+- Never INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, GRANT, or any other statement that is \
+not a read.
+- Reference only the tables and columns you were given, by the exact names given. Never \
+invent one, and never qualify a name with a schema or database ("public.orders" is wrong — \
+write "orders").
+- Only SUM or AVG a column marked additive. A non-additive numeric column (an id, a year, a \
+rating, a percentage) may be selected, grouped or filtered on, never summed or averaged.
+- Join only through the primary/foreign key pairs you were given.
+- If nothing in the schema can answer the question, still return your closest reasonable \
+interpretation as SQL, and say in "explanation" what you actually answered instead.
+- No comments, no markdown fencing, no prose outside the JSON object."""
+
+
+FOLLOWUP_SYSTEM_PROMPT = """You suggest follow-up questions after a business question was \
+answered against a database.
+
+You are given the original question, the SQL that answered it, the columns of \
+the result, and the tables it read — never any row of the result.
+
+Answer with JSON only, in exactly this shape:
+{"questions": ["<question 1>", "<question 2>", "<question 3>"]}
+
+Rules:
+- Exactly three questions.
+- Each must be a natural next thing to ask — drill into a category, compare a \
+period, or ask for a trend — answerable from the same tables.
+- Short: under twelve words, phrased the way a person would type them, no \
+question mark required.
+- Never repeat the original question or trivially reword it.
+- No markdown, no numbering, no prose outside the JSON object."""
+
+
 def _extract_json(text: str) -> Any:
     """Pull a JSON value out of a response that may be fenced or prefixed."""
 
@@ -437,6 +484,89 @@ class ClaudeClient:
         # A paragraph, not an essay: this sits inside an evidence panel next to
         # the rows themselves.
         return text[:600]
+
+    # -- Phase 5 -----------------------------------------------------------
+    def generate_sql(
+        self,
+        question: str,
+        dialect: str,
+        schema: list[dict[str, Any]],
+        prior_sql: str | None = None,
+        prior_error: str | None = None,
+    ) -> dict[str, str] | None:
+        """One SQL attempt for ``question`` against ``schema`` — never the data itself.
+
+        ``schema`` is the retrieval step's output
+        (:func:`app.query.retrieval.schema_context`): table and column names,
+        types and roles, at most five example values per column.  No row of
+        the actual table is ever part of this call, the same boundary every
+        other Claude call in this platform holds.
+
+        Passing ``prior_sql``/``prior_error`` is what makes this a *retry*
+        rather than a second independent guess — the model sees exactly what
+        it wrote and exactly what was wrong with it.
+        """
+
+        payload: dict[str, Any] = {
+            "question": question,
+            "dialect": dialect,
+            "tables": schema,
+        }
+        if prior_sql is not None:
+            payload["previous_attempt"] = {"sql": prior_sql, "error": prior_error}
+        raw = self._complete(
+            SQL_SYSTEM_PROMPT,
+            json.dumps(payload, ensure_ascii=False, default=str),
+            max_tokens=min(self._max_tokens, 4096),
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("Claude SQL response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        sql = str(parsed.get("sql", "") or "").strip()
+        if not sql:
+            return None
+        return {"sql": sql, "explanation": str(parsed.get("explanation", "") or "").strip()}
+
+    # -- Phase 6 -----------------------------------------------------------
+    def suggest_followups(
+        self,
+        question: str,
+        sql: str,
+        columns: list[str],
+        tables: list[str],
+    ) -> list[str] | None:
+        """Three short next questions, or ``None`` when unavailable.
+
+        A dashboard nicety, not a load-bearing part of the answer — a caller
+        that gets ``None`` back shows no suggestions rather than failing the
+        question that already succeeded.
+        """
+
+        payload = {"question": question, "sql": sql, "columns": columns, "tables": tables}
+        raw = self._complete(
+            FOLLOWUP_SYSTEM_PROMPT,
+            json.dumps(payload, ensure_ascii=False, default=str),
+            max_tokens=min(self._max_tokens, 1024),
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("Claude follow-up response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        entries = parsed.get("questions")
+        if not isinstance(entries, list):
+            return None
+        return [str(item).strip() for item in entries if str(item).strip()][:3]
 
     def propose_cleaning_plan(self, summary: dict[str, Any]) -> list[dict[str, Any]] | None:
         """Ask for an ordered cleaning plan from statistical summaries only."""

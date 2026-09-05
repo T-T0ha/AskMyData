@@ -3,13 +3,16 @@
  *  Everything sits behind a sign-in: datasets belong to accounts, and the
  *  backend will not answer for one without knowing whose it is.
  *
- *  Five stages, in the order the pipeline runs them:
+ *  Eight stages, in the order the pipeline runs them:
  *
  *    Add data          → ingestion and structural repair (files or a database)
  *    Triage            → data quality buckets + cross-sheet equivalences
  *    Field semantics   → the editable field semantic view
  *    Co-planned cleaning → the agent's plan, approved step by step
  *    Relationships     → keys, references and dependencies, with evidence
+ *    Semantic layer    → the exported database and its sem_metadata
+ *    Ask questions     → natural language in, SQL and a chart out
+ *    Dashboard         → pinned questions, re-run live, arranged on a grid
  *
  *  The stage names are the user's vocabulary, not the pipeline's: the internal
  *  phase numbers are a fact about the implementation and appear only in the
@@ -25,7 +28,9 @@ import { EvidencePanel, RelationshipList } from './components/EvidencePanel'
 import { RelationshipDiagram } from './components/RelationshipDiagram'
 import { TableProfilePanel } from './components/TableProfilePanel'
 import { FieldSemanticGrid } from './components/FieldSemanticGrid'
+import { DashboardPanel } from './components/DashboardPanel'
 import { PlanBoard } from './components/PlanBoard'
+import { QueryPanel } from './components/QueryPanel'
 import { SourcePicker } from './components/SourcePicker'
 import { CleaningProgress, CleaningSummary, StepValidation } from './components/StepValidation'
 import { TriageBoard } from './components/TriageBoard'
@@ -38,6 +43,8 @@ const STAGES = [
   { key: 'cleaning', label: 'Co-planned cleaning' },
   { key: 'relationships', label: 'Relationships' },
   { key: 'export', label: 'Semantic layer' },
+  { key: 'query', label: 'Ask questions' },
+  { key: 'dashboard', label: 'Dashboard' },
 ]
 
 function useTheme() {
@@ -102,6 +109,13 @@ export default function App() {
   const [relationships, setRelationships] = useState(null)
   const [profiles, setProfiles] = useState(null)
   const [exportState, setExportState] = useState(null)
+  //: Every question asked this session, newest first — a scrollback, not a
+  //: persisted history: nothing here survives a reload. The server keeps its
+  //: own copy (`queryHistory` below) for the dashboard's history sidebar,
+  //: which does survive one.
+  const [queryEntries, setQueryEntries] = useState([])
+  const [dashboardCards, setDashboardCards] = useState([])
+  const [queryHistory, setQueryHistory] = useState([])
   const [selectedEdge, setSelectedEdge] = useState(null)
   const [evidence, setEvidence] = useState(null)
   const [evidenceLoading, setEvidenceLoading] = useState(false)
@@ -133,6 +147,9 @@ export default function App() {
     setRelationships(null)
     setProfiles(null)
     setExportState(null)
+    setQueryEntries([])
+    setDashboardCards([])
+    setQueryHistory([])
     setSelectedEdge(null)
     setEvidence(null)
     setPreview(null)
@@ -240,6 +257,9 @@ export default function App() {
       setEquivalences([])
       setSemantics(null)
       setCleaning(null)
+      setQueryEntries([])
+      setDashboardCards([])
+      setQueryHistory([])
       setStage('upload')
       return created
     })
@@ -464,6 +484,78 @@ export default function App() {
       return true
     })
 
+  // A question the model could not answer is a normal result (`ok: false`),
+  // not a thrown error — it is appended to the scrollback exactly like a
+  // successful one, so `run()`'s shared error banner stays for genuine
+  // failures (no export yet, the network is down).
+  const askQuestion = (question) =>
+    run(async () => {
+      const result = await api.askQuestion(sessionId, question)
+      setQueryEntries((entries) => [
+        { id: `${Date.now()}-${entries.length}`, question, result },
+        ...entries,
+      ])
+      return result
+    })
+
+  // A pin is echoed straight back from the answer already on screen — no
+  // second round trip to Claude or to the database is needed to know what a
+  // card should show; the backend re-validates the SQL independently before
+  // storing it (§Phase 6). `run()`'s shared error banner covers a rejection
+  // (e.g. the export changed shape since the answer was given).
+  const pinCard = (entry) =>
+    run(async () => {
+      await api.pinCard(sessionId, {
+        question: entry.question,
+        sql: entry.result.sql,
+        title: entry.question,
+        explanation: entry.result.explanation,
+        tables_used: entry.result.tables_used,
+        visualization: entry.result.visualization,
+      })
+      return true
+    })
+
+  const refreshDashboard = ({ start, end } = {}) =>
+    run(async () => {
+      const [cardsPayload, historyPayload] = await Promise.all([
+        api.dashboardCards(sessionId, { start, end }),
+        api.queryHistory(sessionId),
+      ])
+      setDashboardCards(cardsPayload.cards)
+      setQueryHistory(historyPayload.history)
+      return true
+    })
+
+  const renameCard = (cardId, title) =>
+    run(async () => {
+      await api.updateCard(sessionId, cardId, { title })
+      setDashboardCards((cards) => cards.map((c) => (c.id === cardId ? { ...c, title } : c)))
+      return true
+    })
+
+  const moveCard = (cardId, layout) =>
+    run(async () => {
+      await api.updateCard(sessionId, cardId, { layout })
+      setDashboardCards((cards) => cards.map((c) => (c.id === cardId ? { ...c, layout } : c)))
+      return true
+    })
+
+  const unpinCard = (cardId) =>
+    run(async () => {
+      await api.unpinCard(sessionId, cardId)
+      setDashboardCards((cards) => cards.filter((c) => c.id !== cardId))
+      return true
+    })
+
+  // A history entry is re-asked exactly like a fresh question — the data may
+  // have changed since, so replaying stored SQL would be a smaller-scoped
+  // (and quietly stale) thing to call "re-run" than actually asking again.
+  const rerunFromHistory = (question) => {
+    setStage('query')
+    askQuestion(question)
+  }
+
   const correctProfile = (table, patch) =>
     run(async () => {
       await api.correctProfile(sessionId, table, patch)
@@ -493,6 +585,8 @@ export default function App() {
     cleaning: Boolean(triage?.sheets?.length),
     relationships: Boolean(triage?.sheets?.length),
     export: Boolean(triage?.sheets?.length),
+    query: Boolean(triage?.sheets?.length),
+    dashboard: Boolean(triage?.sheets?.length),
   }
 
   const selectedRelationship =
@@ -532,7 +626,7 @@ export default function App() {
       {/* z-30 clears the z-20 chart tooltips in the main column, which would
           otherwise draw over a header the page can now be scrolled under. */}
       <header
-        className="sticky top-0 z-30 border-b"
+        className="no-print sticky top-0 z-30 border-b"
         style={{ borderColor: 'var(--border)', background: 'var(--surface-1)' }}
       >
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-x-4 gap-y-2 px-6 py-3">
@@ -725,6 +819,30 @@ export default function App() {
             onDownloadBundle={downloadBundle}
             onDownloadDdl={downloadDdl}
             onDownloadDocs={downloadDocs}
+          />
+        )}
+
+        {stage === 'query' && (
+          <QueryPanel
+            exported={Boolean(exportState?.exported)}
+            entries={queryEntries}
+            busy={busy}
+            onAsk={askQuestion}
+            onPin={pinCard}
+          />
+        )}
+
+        {stage === 'dashboard' && (
+          <DashboardPanel
+            exported={Boolean(exportState?.exported)}
+            cards={dashboardCards}
+            history={queryHistory}
+            busy={busy}
+            onRefresh={refreshDashboard}
+            onRename={renameCard}
+            onUnpin={unpinCard}
+            onLayoutChange={moveCard}
+            onRerun={rerunFromHistory}
           />
         )}
       </main>

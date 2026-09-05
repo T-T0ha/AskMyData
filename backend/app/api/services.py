@@ -7,12 +7,13 @@ here, and serialises the result.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.cleaning.store import get_store
@@ -27,8 +28,10 @@ from app.core.schemas import (
 )
 from app.db.models import (
     ColumnSemantics,
+    DashboardCard,
     EquivalenceCandidateRecord,
     IngestionSession,
+    QueryHistoryRecord,
     RelationshipRecord,
     SemanticLayerExport,
     SemanticLayerVersion,
@@ -36,13 +39,22 @@ from app.db.models import (
 )
 from app.export.documentation import render_markdown
 from app.export.metadata import bundle as semantic_bundle
-from app.export.runner import drop_export, run_export
+from app.export.runner import drop_export, explain, read_semantic_layer, run_export, run_readonly
 from app.export.schema import build_plan
 from app.ingestion.equivalence import detect_equivalences
 from app.ingestion.keys import KeyAnalysis, confirm_key, decline_key, is_unique_key
 from app.ingestion.loader import load_file_source
 from app.ingestion.relational import display_url, load_relational_tables
 from app.ingestion.triage import classify_issues
+from app.query.guard import QueryRejected, validate_select_only
+from app.query.retrieval import (
+    expand_by_references,
+    rank_tables,
+    schema_context,
+    select_columns,
+    select_tables,
+)
+from app.query.shape import classify as classify_query_shape
 from app.relationships.dependencies import detect_all_dependencies
 from app.relationships.evidence import build_evidence
 from app.relationships.foreign_keys import (
@@ -1678,6 +1690,371 @@ def forget_export(session_id: str) -> None:
     """Drop a session's exported database.  Called when the session is deleted."""
 
     drop_export(session_id)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — natural language query
+# ---------------------------------------------------------------------------
+
+
+def _record_history(db: Session, session_id: str, question: str, result: dict[str, Any]) -> None:
+    """Append one question-history row, then trim to the configured limit.
+
+    Written for a failed question too — the sidebar's "last N questions" is a
+    log of what was asked, not only of what worked.  Trimming here rather than
+    at read time keeps the table itself bounded, since nothing else deletes
+    from it.
+    """
+
+    db.add(
+        QueryHistoryRecord(
+            session_id=session_id,
+            question=question,
+            ok=bool(result.get("ok")),
+            sql=result.get("sql"),
+            error=result.get("error"),
+            chart=(result.get("visualization") or {}).get("chart"),
+        )
+    )
+    db.flush()
+    limit = get_settings().query_history_limit
+    stale = (
+        db.execute(
+            select(QueryHistoryRecord.id)
+            .where(QueryHistoryRecord.session_id == session_id)
+            .order_by(QueryHistoryRecord.created_at.desc())
+            .offset(limit)
+        )
+        .scalars()
+        .all()
+    )
+    if stale:
+        db.execute(delete(QueryHistoryRecord).where(QueryHistoryRecord.id.in_(stale)))
+
+
+def question_history(db: Session, session_id: str) -> list[dict[str, Any]]:
+    """The last :attr:`~app.core.config.Settings.query_history_limit` questions, newest first."""
+
+    rows = (
+        db.execute(
+            select(QueryHistoryRecord)
+            .where(QueryHistoryRecord.session_id == session_id)
+            .order_by(QueryHistoryRecord.created_at.desc())
+            .limit(get_settings().query_history_limit)
+        )
+        .scalars()
+        .all()
+    )
+    return [row.to_dict() for row in rows]
+
+
+def answer_question(
+    db: Session, record: IngestionSession, question: str, claude=None
+) -> dict[str, Any]:
+    """Turn one natural-language question into SQL, run it once, and shape the result.
+
+    Retrieval (:mod:`app.query.retrieval`) never touches a data row — it
+    compares the question's embedding against table sentences and column
+    descriptions Phase 4 already wrote.  Generation asks Claude for SQL over
+    that retrieved schema alone, never over the tables themselves.  Only the
+    one statement that survives :func:`~app.query.guard.validate_select_only`
+    and an ``EXPLAIN`` (§Phase 5's self-correction loop) ever reaches the
+    exported database, and it runs exactly once, row-capped, at the very end.
+
+    Unlike taxonomy labelling or plan generation, there is no rule-based
+    fallback for "turn English into SQL" — so with no model available this
+    reports that plainly (``ok: False``) rather than guessing.  Any other
+    failure to produce a usable query (the guard rejects every attempt, the
+    database itself rejects the SQL) is reported the same way: a real result
+    for the user to read, not a 500.
+    """
+
+    question = question.strip()
+    if not question:
+        raise ValueError("ask a question first")
+
+    export = export_record(db, record.id)
+    if export is None:
+        raise ValueError("export the semantic layer before asking questions")
+
+    rows = read_semantic_layer(record.id)
+    if not rows:
+        raise ValueError("the semantic layer has no columns to query yet")
+
+    settings = get_settings()
+    question_vector = get_embedder().encode([question])[0]
+
+    sheets = _sheets_by_name(db, record.id)
+    exported_tables = sorted({str(row.get("table_name")) for row in rows})
+    table_vectors = {
+        name: (sheets[name].table_embedding if name in sheets else None)
+        for name in exported_tables
+    }
+
+    scored = rank_tables(question_vector, table_vectors)
+    selected = select_tables(scored, settings.query_max_tables)
+    selected = expand_by_references(selected, rows)
+    selected_columns = select_columns(
+        question_vector, rows, selected, settings.query_max_ranked_columns
+    )
+    context = schema_context(selected_columns)
+    allowed_tables = {name.lower() for name in selected}
+    dialect = export.dialect
+
+    attempts: list[dict[str, Any]] = []
+    sql: str | None = None
+    explanation = ""
+    last_error: str | None = None
+    prior_sql: str | None = None
+
+    if claude is None or not claude.available:
+        result = {
+            "ok": False,
+            "question": question,
+            "tables_considered": selected,
+            "attempts": [],
+            "error": (
+                (claude.last_error if claude is not None else None)
+                or "no language model is configured, so this question could not be "
+                "turned into SQL"
+            ),
+        }
+        _record_history(db, record.id, question, result)
+        return result
+
+    for attempt_no in range(1, settings.query_max_attempts + 1):
+        generated = claude.generate_sql(
+            question, dialect, context, prior_sql=prior_sql, prior_error=last_error
+        )
+        if generated is None:
+            last_error = claude.last_error or "the language model returned no usable answer"
+            attempts.append({"attempt": attempt_no, "sql": None, "error": last_error})
+            break
+
+        prior_sql = generated["sql"]
+        try:
+            validated = validate_select_only(generated["sql"], allowed_tables, dialect)
+        except QueryRejected as exc:
+            last_error = str(exc)
+            attempts.append({"attempt": attempt_no, "sql": generated["sql"], "error": last_error})
+            continue
+
+        try:
+            explain(record.id, validated)
+        except Exception as exc:  # the driver's own exception type, dialect-dependent
+            last_error = str(exc)
+            attempts.append({"attempt": attempt_no, "sql": validated, "error": last_error})
+            continue
+
+        sql = validated
+        explanation = generated["explanation"]
+        attempts.append({"attempt": attempt_no, "sql": validated, "error": None})
+        break
+
+    if sql is None:
+        result = {
+            "ok": False,
+            "question": question,
+            "tables_considered": selected,
+            "attempts": attempts,
+            "error": last_error or "the model could not produce a usable query for this question",
+        }
+        _record_history(db, record.id, question, result)
+        return result
+
+    columns, result_rows, truncated = run_readonly(record.id, sql, settings.query_row_cap)
+    visualization = classify_query_shape(columns, result_rows)
+    # A dashboard nicety, not part of the answer itself: a fake standing in for
+    # Claude in a test need not implement it, and an unavailable/degraded model
+    # simply yields no suggestions rather than breaking the question that just
+    # succeeded.
+    suggest = getattr(claude, "suggest_followups", None)
+    suggestions = (suggest(question, sql, columns, selected) if suggest else None) or []
+
+    result = {
+        "ok": True,
+        "question": question,
+        "sql": sql,
+        "explanation": explanation,
+        "dialect": dialect,
+        "columns": columns,
+        "rows": result_rows,
+        "row_count": len(result_rows),
+        "truncated": truncated,
+        "tables_used": selected,
+        "attempts": attempts,
+        "visualization": visualization,
+        "suggestions": suggestions,
+    }
+    _record_history(db, record.id, question, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — dashboard
+# ---------------------------------------------------------------------------
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def pin_dashboard_card(
+    db: Session, record: IngestionSession, payload: dict[str, Any]
+) -> DashboardCard:
+    """Save one answered question as a dashboard card.
+
+    The SQL is re-validated here, independently of whatever validated it when
+    the question was first answered: a pin request is client-supplied input
+    like any other, and this is the write path that turns a stored statement
+    into something that runs, unattended, on every future dashboard load.
+    Re-checked against every exported table rather than only the ones that
+    question's retrieval step picked — a card outlives the request that made
+    it, so the wider, still-honest bound is the one worth keeping.
+    """
+
+    question = str(payload.get("question") or "").strip()
+    sql = str(payload.get("sql") or "").strip()
+    if not question or not sql:
+        raise ValueError("a card needs both a question and its SQL")
+
+    export = export_record(db, record.id)
+    if export is None:
+        raise ValueError("export the semantic layer before pinning a card")
+
+    rows = read_semantic_layer(record.id)
+    exported_tables = {str(row.get("table_name")).lower() for row in rows}
+    try:
+        validated_sql = validate_select_only(sql, exported_tables, export.dialect)
+    except QueryRejected as exc:
+        raise ValueError(f"this query can no longer be pinned: {exc}") from exc
+
+    position = db.execute(
+        select(func.count())
+        .select_from(DashboardCard)
+        .where(DashboardCard.session_id == record.id)
+    ).scalar_one()
+
+    card = DashboardCard(
+        session_id=record.id,
+        title=str(payload.get("title") or "").strip() or question,
+        question=question,
+        sql=validated_sql,
+        dialect=export.dialect,
+        explanation=str(payload.get("explanation") or ""),
+        tables_used=list(payload.get("tables_used") or []),
+        visualization=dict(payload.get("visualization") or {}),
+        position=position,
+    )
+    db.add(card)
+    db.flush()
+    return card
+
+
+def _quote_identifier(name: str) -> str | None:
+    if not _IDENTIFIER_RE.match(name or ""):
+        return None
+    return f'"{name}"'
+
+
+def _date_filtered_sql(card: DashboardCard, start: date | None, end: date | None) -> tuple[str, bool]:
+    """Wrap a card's SQL in a date-range ``WHERE``, when it unambiguously can be.
+
+    Only applies when the card's own shape names exactly one date column —
+    for anything else there is no column a *global* filter could mean, so the
+    card runs unfiltered rather than guessing one.  ``start``/``end`` arrive as
+    parsed :class:`datetime.date` objects (the route's own parameter type), so
+    interpolating their ``isoformat()`` never carries anything but digits and
+    hyphens into the statement.
+    """
+
+    if start is None and end is None:
+        return card.sql, False
+    date_columns = (card.visualization or {}).get("date_columns") or []
+    if len(date_columns) != 1:
+        return card.sql, False
+    column = _quote_identifier(date_columns[0])
+    if column is None:
+        return card.sql, False
+
+    clauses = []
+    if start is not None:
+        clauses.append(f"{column} >= '{start.isoformat()}'")
+    if end is not None:
+        clauses.append(f"{column} < '{end.isoformat()}'")
+    where = " AND ".join(clauses)
+    return f"SELECT * FROM ({card.sql}) AS _dashboard_filtered WHERE {where}", True
+
+
+def list_dashboard_cards(
+    db: Session, record: IngestionSession, start: date | None = None, end: date | None = None
+) -> list[dict[str, Any]]:
+    """Every pinned card, re-executed against the live export.
+
+    "Results always current, not snapshots" (§Phase 6) means the stored row is
+    never trusted for data — even a card whose SQL now fails (a column renamed
+    by a later re-export) is reported per-card as ``ok: False``, rather than
+    one bad card taking the whole dashboard down.
+    """
+
+    cards = (
+        db.execute(
+            select(DashboardCard)
+            .where(DashboardCard.session_id == record.id)
+            .order_by(DashboardCard.position)
+        )
+        .scalars()
+        .all()
+    )
+    settings = get_settings()
+    refreshed_at = datetime.now(timezone.utc).isoformat()
+    payload: list[dict[str, Any]] = []
+    for card in cards:
+        item = card.to_dict()
+        statement, filtered = _date_filtered_sql(card, start, end)
+        try:
+            columns, rows, truncated = run_readonly(record.id, statement, settings.query_row_cap)
+            item.update(
+                ok=True,
+                columns=columns,
+                rows=rows,
+                row_count=len(rows),
+                truncated=truncated,
+                error=None,
+            )
+        except Exception as exc:  # the driver's own exception type, dialect-dependent
+            item.update(ok=False, columns=[], rows=[], row_count=0, truncated=False, error=str(exc))
+        item["date_filtered"] = filtered
+        item["refreshed_at"] = refreshed_at
+        payload.append(item)
+    return payload
+
+
+def update_dashboard_card(
+    db: Session, record: IngestionSession, card_id: str, patch: dict[str, Any]
+) -> DashboardCard:
+    """Rename a card or move/resize it.  Never touches its question or SQL —
+    re-pin to change what a card answers."""
+
+    card = db.execute(
+        select(DashboardCard).where(
+            DashboardCard.id == card_id, DashboardCard.session_id == record.id
+        )
+    ).scalar_one_or_none()
+    if card is None:
+        raise KeyError(f"dashboard card {card_id} not found")
+    if patch.get("title") is not None:
+        card.title = str(patch["title"]).strip() or card.question
+    if patch.get("layout") is not None:
+        card.layout = dict(patch["layout"])
+    db.flush()
+    return card
+
+
+def delete_dashboard_card(db: Session, record: IngestionSession, card_id: str) -> None:
+    db.execute(
+        delete(DashboardCard).where(
+            DashboardCard.id == card_id, DashboardCard.session_id == record.id
+        )
+    )
 
 
 def backend_status() -> dict[str, Any]:
