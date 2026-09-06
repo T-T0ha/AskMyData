@@ -28,6 +28,7 @@ def test_health_and_status(client):
     assert "claude" in status and "embeddings" in status
     assert status["embeddings"]["dim"] == 384
     assert status["checkpointer"]
+    assert status["durable"] is True  # the suite runs on a real SQLite checkpointer
 
 
 def test_vocabulary_lists_nine_types_and_ten_steps(client):
@@ -68,6 +69,25 @@ def test_upload_runs_phase0(client, messy_workbook):
         (e["left_column"], e["right_column"]) for e in payload["equivalences"]
     }
     assert ("order_info_cust_id", "customer_id") in pairs
+
+    # The column-name embeddings behind the score are stored, not discarded
+    # the moment a scalar score is derived from them (M-4).
+    from app.core.config import get_settings
+    from app.db.base import get_session_factory
+    from app.db.models import EquivalenceCandidateRecord
+
+    db = get_session_factory()()
+    try:
+        row = (
+            db.query(EquivalenceCandidateRecord)
+            .filter_by(session_id=session_id, left_column="order_info_cust_id")
+            .one()
+        )
+        dim = get_settings().embedding_dim
+        assert row.left_embedding is not None and len(row.left_embedding) == dim
+        assert row.right_embedding is not None and len(row.right_embedding) == dim
+    finally:
+        db.close()
 
 
 def test_uploading_a_sqlite_database_ingests_its_tables(client, tmp_path):

@@ -333,6 +333,8 @@ def detect_and_store_equivalences(
             type_compatible=payload["type_compatible"],
             explanation=payload["explanation"],
             confirmed=None,
+            left_embedding=payload.get("left_embedding"),
+            right_embedding=payload.get("right_embedding"),
         )
         db.add(row)
         rows.append(row)
@@ -2058,7 +2060,7 @@ def delete_dashboard_card(db: Session, record: IngestionSession, card_id: str) -
 
 
 def backend_status() -> dict[str, Any]:
-    from app.cleaning.checkpointing import checkpointer_backend
+    from app.cleaning.checkpointing import checkpointer_backend, checkpointer_is_durable
     from app.semantics.claude_client import get_claude_client
 
     settings = get_settings()
@@ -2071,6 +2073,7 @@ def backend_status() -> dict[str, Any]:
             "semantic": embedder.is_semantic,
         },
         "checkpointer": checkpointer_backend(),
+        "durable": checkpointer_is_durable(),
         "thresholds": {
             "equivalence": settings.equivalence_threshold,
             "numeric_convert": settings.numeric_convert_threshold,

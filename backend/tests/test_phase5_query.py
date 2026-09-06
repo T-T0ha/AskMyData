@@ -102,6 +102,30 @@ def test_a_cte_alias_is_not_mistaken_for_an_unknown_table():
     validate_select_only(sql, {"orders"}, "postgresql")
 
 
+def test_a_cte_cannot_smuggle_in_a_same_named_real_table():
+    """A non-RECURSIVE CTE cannot see its own name inside its own body — that
+    occurrence can only resolve to a real table, so it must still be offered."""
+
+    sql = (
+        "WITH employees_salary AS (SELECT * FROM employees_salary) "
+        "SELECT * FROM employees_salary"
+    )
+    with pytest.raises(QueryRejected, match="outside the tables offered"):
+        validate_select_only(sql, ALLOWED, "postgresql")
+
+    # The same query succeeds when the colliding real table genuinely was offered.
+    validate_select_only(sql, {"employees_salary"}, "postgresql")
+
+
+def test_with_recursive_is_refused_outright():
+    sql = (
+        "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5) "
+        "SELECT * FROM t"
+    )
+    with pytest.raises(QueryRejected, match="RECURSIVE"):
+        validate_select_only(sql, ALLOWED, "postgresql")
+
+
 def test_the_validated_sql_is_returned_re_rendered():
     out = validate_select_only("select * from orders", ALLOWED, "postgresql")
     assert out.strip().upper().startswith("SELECT")

@@ -69,6 +69,7 @@ export function AuthPanel({ config, backendReachable, busy, onSignIn, onRegister
       <div className="mb-6 text-center">
         <h1 className="text-xl font-semibold tracking-tight">AskMyData</h1>
         <p className="mt-1.5 text-xs" style={{ color: 'var(--text-muted)' }}>
+          Upload a spreadsheet, clean it with a human in the loop, and ask it questions in plain English.
         </p>
       </div>
 

@@ -57,6 +57,12 @@ class EquivalenceCandidate:
     right_dtype: str
     value_overlap: float | None = None
     confirmed: bool | None = None
+    #: The two column-name embeddings ``embedding_similarity`` was computed
+    #: from — carried alongside the scalar score so the caller can persist
+    #: them (see ``app.db.models.EquivalenceCandidateRecord``) instead of
+    #: discarding the prior the moment a score is derived from it.
+    left_embedding: list[float] | None = None
+    right_embedding: list[float] | None = None
 
     def explanation(self) -> str:
         parts = [
@@ -86,6 +92,8 @@ class EquivalenceCandidate:
             "right_dtype": self.right_dtype,
             "confirmed": self.confirmed,
             "explanation": self.explanation(),
+            "left_embedding": self.left_embedding,
+            "right_embedding": self.right_embedding,
         }
 
 
@@ -187,6 +195,8 @@ def detect_equivalences(
                 type_compatible=compatible,
                 left_dtype=str(left_series.dtype),
                 right_dtype=str(right_series.dtype),
+                left_embedding=[float(v) for v in vectors[i]],
+                right_embedding=[float(v) for v in vectors[j]],
                 value_overlap=overlap,
             )
         )

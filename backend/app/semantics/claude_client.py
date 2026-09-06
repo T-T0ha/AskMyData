@@ -99,7 +99,13 @@ Rules:
 - Only reference tables and columns that appear in the summaries.
 - Order matters: structural fixes (rename, type_cast, split) before row-level \
 fixes (deduplicate), and merge_sheets last.
-- Only propose merge_sheets on a column pair the summary lists as a CONFIRMED equivalence.
+- Only propose merge_sheets when two tables hold the same columns and are really \
+one table split across sheets — never to join two different entities (an orders \
+table and a customers table, say) just because they share a key column; that \
+relationship is what a foreign key is for, and joining on it would denormalise \
+the very structure this platform exists to recover. A CONFIRMED equivalence on \
+the shared key is what tells you the split-sheet case is real, not a license to \
+merge on it in every case.
 - Do not propose a step that the summary shows is unnecessary.
 - NEVER propose filling, imputing, interpolating or otherwise replacing a \
 missing value, with any strategy, for any column, no matter how high its \

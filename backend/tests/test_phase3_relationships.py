@@ -12,12 +12,15 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from app.core.schemas import RelationshipOrigin
 from app.ingestion.keys import KeyAnalysis, discover_keys
+from app.relationships import foreign_keys as fk
 from app.relationships.dependencies import detect_dependencies
 from app.relationships.evidence import build_evidence, foreign_key_evidence
 from app.relationships.foreign_keys import (
     DISTINCT_WEIGHT,
     OVERLAP_WEIGHT,
+    _fuzzy_recovered,
     declared_foreign_keys,
     detect_foreign_keys,
     score_pair,
@@ -64,6 +67,53 @@ def test_overlap_and_distinct_answer_different_questions():
 
     assert overlap == 1.0, "every value is a real key"
     assert distinct == pytest.approx(0.01), "but it touches one key in a hundred"
+
+
+def test_fuzzy_recovered_matches_a_one_character_typo():
+    recovered, examples = _fuzzy_recovered(
+        ["PRODUCT-0011x"], {"PRODUCT-0011", "PRODUCT-0012"}
+    )
+    assert recovered == 1
+    assert examples == ["'PRODUCT-0011x' ~ 'PRODUCT-0011'"]
+
+
+def test_fuzzy_recovered_ignores_a_genuinely_different_value():
+    recovered, examples = _fuzzy_recovered(
+        ["totally-unrelated"], {"PRODUCT-0011", "PRODUCT-0012"}
+    )
+    assert recovered == 0
+    assert examples == []
+
+
+def test_a_fuzzy_candidate_cites_what_rapidfuzz_recovered(monkeypatch):
+    """The FUZZY band is supposed to be a genuine rapidfuzz fallback — a
+    reference messy data has degraded by a handful of typo'd/reformatted ids —
+    not just a lower score band on the same overlap/distinct arithmetic (M-2).
+    Name-embedding similarity is pinned to zero so the score lands in the
+    fuzzy band on the overlap/distinct arithmetic alone, regardless of
+    whatever embedder is loaded."""
+
+    monkeypatch.setattr(fk, "_name_similarity", lambda pairs: [0.0] * len(pairs))
+
+    # 50 real ids; the source column matches the first 12 exactly (overlap
+    # 12/20 = 0.60, clearing MIN_OVERLAP) but reaches little of the 50-value
+    # key (distinct 12/50 = 0.24) — base score 0.7*0.6 + 0.3*0.24 = 0.492,
+    # squarely in the fuzzy band. The other 8 source rows are one-character
+    # typos of real ids 13-20, individually recoverable by rapidfuzz.
+    real_ids = [f"PRODUCT-{i:04d}" for i in range(1, 51)]
+    source_values = real_ids[:12] + [pid + "x" for pid in real_ids[12:20]]
+    tables = {
+        "targets": pd.DataFrame({"code": real_ids}),
+        "sources": pd.DataFrame({"target_code": source_values}),
+    }
+
+    candidates = detect_foreign_keys(tables, _keys(tables))
+    candidate = next(c for c in candidates if c.from_table == "sources")
+
+    assert candidate.origin is RelationshipOrigin.FUZZY
+    assert candidate.score == pytest.approx(0.492)
+    notes = " ".join(candidate.notes)
+    assert "rapidfuzz recovered 8 of 8" in notes
 
 
 def test_finds_the_references_in_a_real_workbook(relational_tables):

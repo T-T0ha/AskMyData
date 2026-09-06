@@ -80,6 +80,11 @@ function DegradedNotice({ status }) {
       'Semantic embeddings are unavailable, so column-name matching falls back to string comparison and will miss synonyms.',
     )
   }
+  if (status.durable === false) {
+    reasons.push(
+      'Cleaning progress is not being saved durably (no PostgreSQL or SQLite checkpoint store is reachable) — a server restart will lose any in-progress cleaning session.',
+    )
+  }
   if (!reasons.length) return null
   return (
     <StatusBadge status="warning" title={reasons.join(' ')}>

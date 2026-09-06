@@ -358,6 +358,82 @@ def _same_shape(left: pd.DataFrame, right: pd.DataFrame) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# reference validation — shared by an LLM's proposal and the user's edits
+# ---------------------------------------------------------------------------
+
+
+def _validate_references(
+    step_type: StepType, table: str, params: Mapping[str, Any], tables: Mapping[str, pd.DataFrame]
+) -> str | None:
+    """``None`` if every table/column ``step_type``'s ``params`` names on
+    ``table`` actually exists and the step is otherwise structurally sound;
+    the human-readable reason it is not, otherwise.
+
+    Shared between validating an LLM's own proposal
+    (:func:`normalize_claude_plan`) and re-validating a plan the user edited or
+    added to by hand (:func:`validate_plan_references`) — a step is a step
+    regardless of who wrote it, and neither producer gets to skip the check.
+    """
+
+    if table not in tables:
+        return f"unknown table {table!r}"
+
+    columns = {str(c) for c in tables[table].columns}
+    column = params.get("column")
+    if column is not None and str(column) not in columns:
+        return f"{table} has no column {str(column)!r}"
+
+    if step_type is StepType.MERGE_SHEETS:
+        right_table = str(params.get("right_table", ""))
+        if right_table not in tables:
+            return f"unknown table {right_table!r}"
+        left_key = str(params.get("left_key", ""))
+        right_key = str(params.get("right_key", ""))
+        if left_key not in columns:
+            return f"{table} has no column {left_key!r}"
+        right_columns = {str(c) for c in tables[right_table].columns}
+        if right_key not in right_columns:
+            return f"{right_table} has no column {right_key!r}"
+        if not _same_shape(tables[table], tables[right_table]):
+            return (
+                f"{table} and {right_table} do not share the same columns — "
+                "merge_sheets only joins a table split across sheets, not two "
+                "different entities that merely share a key"
+            )
+
+    if step_type is StepType.SPLIT_COLUMN:
+        into = params.get("into")
+        if not isinstance(into, list) or len(into) < 2:
+            return "'into' must list two or more names"
+
+    return None
+
+
+def validate_plan_references(
+    steps: Iterable[CleaningStep], tables: Mapping[str, pd.DataFrame]
+) -> tuple[list[CleaningStep], list[str]]:
+    """Re-check a plan the user edited, reordered or added to by hand.
+
+    ``normalize_claude_plan`` is the only gate an LLM's own proposal passes
+    through before the user ever sees it; nothing then re-checked what the
+    user did to it afterward.  A step the user adds or edits draws from the
+    same vocabulary and names the same kind of references, so it is held to
+    the same standard here — dropped with a reason before it runs, rather than
+    surfacing only as a soft "step failed" interrupt once execution reaches it.
+    """
+
+    accepted: list[CleaningStep] = []
+    rejected: list[str] = []
+    for step in steps:
+        reason = _validate_references(step.type, step.table, step.params, tables)
+        if reason:
+            rejected.append(f"step {step.id} ({step.type.value}) on {step.table}: {reason}")
+            continue
+        accepted.append(step)
+    return accepted, rejected
+
+
+# ---------------------------------------------------------------------------
 # LLM plan validation
 # ---------------------------------------------------------------------------
 
@@ -397,39 +473,10 @@ def normalize_claude_plan(
                 rejected.append(f"{label}: unknown step type {step_type!r}")
             continue
 
-        if table not in tables:
-            rejected.append(f"{label} ({step_type}): unknown table {table!r}")
+        reason = _validate_references(parsed_type, table, params, tables)
+        if reason:
+            rejected.append(f"{label} ({step_type}): {reason}")
             continue
-
-        columns = {str(c) for c in tables[table].columns}
-        column = params.get("column")
-        if column is not None and str(column) not in columns:
-            rejected.append(
-                f"{label} ({step_type}): {table} has no column {str(column)!r}"
-            )
-            continue
-
-        if parsed_type is StepType.MERGE_SHEETS:
-            right_table = str(params.get("right_table", ""))
-            if right_table not in tables:
-                rejected.append(f"{label} (merge_sheets): unknown table {right_table!r}")
-                continue
-            left_key = str(params.get("left_key", ""))
-            right_key = str(params.get("right_key", ""))
-            if left_key not in columns:
-                rejected.append(f"{label} (merge_sheets): {table} has no column {left_key!r}")
-                continue
-            if right_key not in {str(c) for c in tables[right_table].columns}:
-                rejected.append(
-                    f"{label} (merge_sheets): {right_table} has no column {right_key!r}"
-                )
-                continue
-
-        if parsed_type is StepType.SPLIT_COLUMN:
-            into = params.get("into")
-            if not isinstance(into, list) or len(into) < 2:
-                rejected.append(f"{label} (split_column): 'into' must list two or more names")
-                continue
 
         accepted.append(
             CleaningStep(

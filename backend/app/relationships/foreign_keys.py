@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import pandas as pd
+from rapidfuzz import fuzz, process
 
 from app.core.schemas import RelationshipOrigin, RelationshipType
 from app.ingestion.keys import KeyAnalysis
@@ -73,6 +74,12 @@ MIN_ROWS = 20
 #: Distinct values above which the value set is sampled.  Set intersection is
 #: linear, so this is generous.
 MAX_VALUES = 200_000
+
+#: rapidfuzz similarity (0-100) above which an unmatched source value is
+#: treated as an approximate match of a real target key value — a likely
+#: typo or format drift (a dropped leading zero, a hyphen swapped for an
+#: underscore) rather than a genuinely different identifier.
+FUZZY_MATCH_SCORE = 90.0
 
 
 @dataclass(slots=True)
@@ -315,6 +322,30 @@ def score_pair(source: pd.Series, target: pd.Series) -> tuple[float, float, floa
     )
 
 
+def _fuzzy_recovered(orphans: Sequence[str], target_values: set[str]) -> tuple[int, list[str]]:
+    """How many ``orphans`` are approximate matches of a real target value.
+
+    This is the rapidfuzz fallback the proposal describes: a reference that
+    messy data has degraded by a handful of typo'd or reformatted ids is still
+    recognisable as one, rather than being scored as if those rows referenced
+    nothing.  Only called for a candidate already in the fuzzy band — it adds
+    evidence to the label, it does not change who gets proposed.
+    """
+
+    if not orphans or not target_values:
+        return 0, []
+    pool = list(target_values)
+    recovered = 0
+    examples: list[str] = []
+    for value in orphans:
+        match = process.extractOne(value, pool, scorer=fuzz.ratio, score_cutoff=FUZZY_MATCH_SCORE)
+        if match is not None:
+            recovered += 1
+            if len(examples) < 3:
+                examples.append(f"{value!r} ~ {match[0]!r}")
+    return recovered, examples
+
+
 def _name_similarity(pairs: Sequence[tuple[str, str]]) -> list[float]:
     """Cosine similarity of every ``(source column, target column)`` name pair.
 
@@ -419,6 +450,14 @@ def detect_foreign_keys(
                 f"{source_n - matched:,} of {source_n:,} distinct values have no matching "
                 f"{target_table}.{target_column} — referential integrity is not complete"
             )
+        if origin is RelationshipOrigin.FUZZY:
+            full_orphans = sorted(_key_values(source_series) - _key_values(target_series))
+            recovered, examples = _fuzzy_recovered(full_orphans, _key_values(target_series))
+            if recovered:
+                candidate.notes.append(
+                    f"rapidfuzz recovered {recovered} of {len(full_orphans)} unmatched "
+                    f"value(s) as likely typos or format drift: {'; '.join(examples)}"
+                )
 
         key = (source_table, column)
         if key not in best or candidate.score > best[key].score:

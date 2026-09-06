@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     # ---- storage -------------------------------------------------------
     database_url: str = "postgresql+psycopg://semantic:semantic@localhost:5433/semanticlayer"
     upload_dir: Path = BACKEND_ROOT / "var" / "uploads"
+    #: The credential Phase 5's query execution connects with — a role that
+    #: physically cannot write or drop anything, so a generated SELECT that
+    #: somehow got past the application-level guard (app/query/guard.py)
+    #: still fails at the database, not merely at the application. ``None``
+    #: (the default) falls back to ``database_url``, matching every backend
+    #: that has no such role — SQLite, and a PostgreSQL instance nobody has
+    #: provisioned one on yet.
+    readonly_database_url: str | None = None
+    #: The role name ``app/export/runner.py`` grants per-dataset SELECT to
+    #: whenever a session's schema is (re)built. Provisioned once by
+    #: ``ops/init-readonly-role.sql``, not by the application at request time.
+    readonly_role_name: str = "semantic_readonly"
 
     # ---- Phase 0 : ingestion -------------------------------------------
     header_scan_rows: int = 5

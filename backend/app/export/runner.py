@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 #: 65535-parameter limit for any realistic column count.
 CHUNK_ROWS = 1000
 
+_readonly_engine: Engine | None = None
+_warned_no_readonly_engine = False
+
 
 @dataclass(slots=True)
 class ExportTarget:
@@ -124,18 +127,58 @@ def export_root() -> Path:
     return root
 
 
-def resolve_target(session_id: str) -> ExportTarget:
+def _get_readonly_engine() -> Engine | None:
+    """The cached engine behind the read-only role, or ``None`` if unconfigured.
+
+    A second engine rather than a second connection off the admin one: the
+    whole point is that these queries run under different, weaker
+    credentials, not just a different session on the same login.
+    """
+
+    global _readonly_engine, _warned_no_readonly_engine
+    settings = get_settings()
+    if not settings.is_postgres or not settings.readonly_database_url:
+        if settings.is_postgres and not _warned_no_readonly_engine:
+            logger.warning(
+                "no readonly_database_url is configured; Phase 5 query execution "
+                "is falling back to the same credentials writes use — see "
+                "ops/init-readonly-role.sql to provision one"
+            )
+            _warned_no_readonly_engine = True
+        return None
+    if _readonly_engine is None:
+        _readonly_engine = create_engine(
+            settings.readonly_database_url, pool_pre_ping=True, future=True
+        )
+    return _readonly_engine
+
+
+def resolve_target(session_id: str, *, for_query: bool = False) -> ExportTarget:
     """The namespace this session's export owns.
 
     ``schema_name`` is what makes this safe: it rebuilds the name from the
     session id, keeping only hex characters, so no request can steer it at
     ``public`` or at a path outside ``var/exports``.
+
+    ``for_query=True`` is for the two callers that execute guard-validated,
+    model-generated SQL (:func:`run_readonly`, :func:`explain`) — when a
+    read-only role is configured, they connect through it instead of the
+    admin engine every write already uses, so a guard bypass still cannot
+    write or drop anything.  Every other caller (writes, and internal reads
+    like :func:`read_back`) is unaffected.
     """
 
     name = schema_name(session_id)
     settings = get_settings()
 
     if settings.is_postgres:
+        if for_query:
+            readonly_engine = _get_readonly_engine()
+            if readonly_engine is not None:
+                return ExportTarget(
+                    engine=readonly_engine, schema=name, label=name, dialect="postgresql"
+                )
+
         from app.db.base import get_engine  # local import: avoids a cycle
 
         return ExportTarget(
@@ -223,6 +266,45 @@ def drop_export(session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _grant_readonly(target: ExportTarget) -> None:
+    """Let the read-only role see this export, and nothing else about it.
+
+    A no-op unless PostgreSQL and a role name are configured — the role
+    itself is provisioned once by ``ops/init-readonly-role.sql``, not created
+    here. ``ALTER DEFAULT PRIVILEGES`` is what makes this survive a
+    re-export: every table this session creates in its own schema from now on
+    is covered, not just the ones that existed the moment this ran.
+    """
+
+    if target.schema is None:
+        return
+    settings = get_settings()
+    if not settings.is_postgres or not settings.readonly_role_name:
+        return
+    role = settings.readonly_role_name
+    schema = target.schema
+    try:
+        with target.engine.begin() as connection:
+            connection.execute(text(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"'))
+            connection.execute(
+                text(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{role}"')
+            )
+            connection.execute(
+                text(
+                    f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" '
+                    f'GRANT SELECT ON TABLES TO "{role}"'
+                )
+            )
+    except Exception as exc:  # pragma: no cover - depends on the server/role existing
+        logger.warning(
+            "could not grant %s read access to schema %s: %s — is "
+            "ops/init-readonly-role.sql applied?",
+            role,
+            schema,
+            exc,
+        )
+
+
 def prepare_frame(spec: TableSpec, df: pd.DataFrame) -> pd.DataFrame:
     """The table as its exported columns: renamed, retyped, blanks intact."""
 
@@ -297,6 +379,7 @@ def run_export(
             report.metadata_rows = len(semantic_rows)
             report.embedded_rows = semantic_metadata.embed_rows(semantic_rows)
         metadata.create_all(bind=target.engine)
+        _grant_readonly(target)
 
         with target.engine.begin() as connection:
             for spec in plan.tables:
@@ -335,10 +418,13 @@ def run_export(
 def read_back(session_id: str, statement: str, parameters: Mapping[str, Any] | None = None):
     """Run one read against a session's exported database.
 
-    Used by the tests and by Phase 5's ``EXPLAIN`` step.  It takes a whole
-    statement because the caller composes it; every identifier in it comes
-    from the export plan or from :mod:`app.query.guard`'s validated output,
-    never from a request unchecked.
+    Used by the tests and by internal callers that already trust their own
+    SQL (export verification, documentation rendering) — never by the
+    guard-checked NL2SQL path, which runs under the read-only role instead
+    (see :func:`explain`, :func:`run_readonly`).  It takes a whole statement
+    because the caller composes it; every identifier in it comes from the
+    export plan or from :mod:`app.query.guard`'s validated output, never from
+    a request unchecked.
     """
 
     target = resolve_target(session_id)
@@ -362,7 +448,7 @@ def explain(session_id: str, statement: str) -> None:
     instead of a stack trace the user sees.
     """
 
-    target = resolve_target(session_id)
+    target = resolve_target(session_id, for_query=True)
     try:
         with target.engine.connect() as connection:
             _set_search_path(connection, target)
@@ -392,7 +478,7 @@ def run_readonly(
     holding the connection for the life of the request.
     """
 
-    target = resolve_target(session_id)
+    target = resolve_target(session_id, for_query=True)
     bounded = f"SELECT * FROM ({statement}) AS _bounded LIMIT {int(row_cap) + 1}"
     try:
         with target.engine.connect() as connection:

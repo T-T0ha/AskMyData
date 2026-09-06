@@ -16,7 +16,13 @@ Three checks, each closing a different door:
 * **No table outside ``allowed_tables``.** The retrieval step decided which
   tables the question needs; a name the model invents, or a name it read
   correctly but was never offered, is refused rather than guessed at. A CTE's
-  own alias is not a table and is excluded from this check.
+  own alias is not a table and is excluded from this check — except where the
+  CTE's *own body* references that same name: ordinary (non-``RECURSIVE``)
+  SQL cannot see a CTE's name inside its own definition, so that particular
+  occurrence can only resolve to a real table if one exists, and is checked
+  accordingly. ``WITH RECURSIVE`` is refused outright rather than reasoned
+  about, since a legitimate self-reference would otherwise need a real
+  recursion check this platform has no use for.
 * **No schema or database qualification at all** (``public.orders``,
   ``other_db.orders``). The exported tables are reached by bare name once
   ``search_path`` is restricted to the export's own schema
@@ -107,9 +113,34 @@ def validate_select_only(
                 "reference tables by their bare name"
             )
 
-    cte_names = {cte.alias_or_name.lower() for cte in statement.find_all(exp.CTE)}
-    referenced = {table.name.lower() for table in statement.find_all(exp.Table)}
-    unknown = referenced - cte_names - set(allowed_tables)
+    for with_clause in statement.find_all(exp.With):
+        if with_clause.args.get("recursive"):
+            raise QueryRejected("WITH RECURSIVE is not allowed")
+
+    ctes = list(statement.find_all(exp.CTE))
+    cte_names = {cte.alias_or_name.lower() for cte in ctes}
+    # A CTE cannot see its own name inside its own (non-recursive) body — a
+    # reference there can only resolve to a real table, so those specific
+    # occurrences are checked against ``allowed_tables`` rather than waved
+    # through as "just the CTE" the way every other occurrence of the name is.
+    self_referencing = {
+        id(table)
+        for cte in ctes
+        for table in cte.this.find_all(exp.Table)
+        if table.name.lower() == cte.alias_or_name.lower()
+    }
+
+    unknown: set[str] = set()
+    for table in statement.find_all(exp.Table):
+        name = table.name.lower()
+        if id(table) in self_referencing:
+            if name not in allowed_tables:
+                unknown.add(name)
+            continue
+        if name in cte_names or name in allowed_tables:
+            continue
+        unknown.add(name)
+
     if unknown:
         raise QueryRejected(
             "references table(s) outside the tables offered for this question: "

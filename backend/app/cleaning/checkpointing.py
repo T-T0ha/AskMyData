@@ -72,6 +72,13 @@ def checkpointer_backend() -> str:
     return type(get_checkpointer()).__name__
 
 
+def checkpointer_is_durable() -> bool:
+    """False only for the in-memory fallback — the one backend a process
+    restart empties.  Both PostgresSaver and SqliteSaver persist to disk."""
+
+    return checkpointer_backend() != "InMemorySaver"
+
+
 def reset_checkpointer() -> None:
     """Test hook — closes the saver and forces re-creation."""
 

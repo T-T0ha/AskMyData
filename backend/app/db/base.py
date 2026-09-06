@@ -173,6 +173,13 @@ _ADDED_COLUMNS: dict[str, dict[str, "str | Callable[[], str]"]] = {
         "semantic_version": "INTEGER DEFAULT 0",
         "enriched_at": _timestamp_ddl,
     },
+    # The column-name embeddings a cross-sheet equivalence score was computed
+    # from, added so the prior is inspectable rather than discarded the
+    # moment a scalar score is derived from it.
+    "equivalence_candidates": {
+        "left_embedding": _embedding_ddl,
+        "right_embedding": _embedding_ddl,
+    },
 }
 
 

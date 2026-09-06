@@ -462,6 +462,27 @@ def test_a_keyed_descriptive_table_others_point_at_is_a_dimension():
     assert profile.table_type is TableType.DIMENSION
 
 
+def test_a_keyed_descriptive_table_nothing_points_at_yet_is_still_a_dimension():
+    """Same shape as the case above, minus an incoming reference: the decision
+    tree's lower-confidence DIMENSION branch (0.6) used to be dead code —
+    unreachably nested under a measures-only FACT check — so this table fell
+    through to UNKNOWN instead."""
+
+    df = pd.DataFrame({"product_id": range(100), "description": [f"d{i}" for i in range(100)]})
+    profile = profile_table(
+        "products",
+        df,
+        [
+            _column("product_id", "identifier", "identifier"),
+            _column("description", "text", "description"),
+        ],
+        key_analysis={"primary_key": ["product_id"], "source": "detected"},
+    )
+
+    assert profile.table_type is TableType.DIMENSION
+    assert profile.type_confidence == 0.6
+
+
 def test_a_measured_series_on_a_periodic_key_is_a_time_series():
     df = pd.DataFrame(
         {

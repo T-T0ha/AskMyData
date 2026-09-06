@@ -6,11 +6,23 @@ import pandas as pd
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
+from app.cleaning import checkpointing
 from app.cleaning.graph import build_graph, interrupt_payload, resume, thread_config
 from app.cleaning.planner import heuristic_plan, normalize_claude_plan, sort_plan
 from app.cleaning.steps import StepError, execute_step
 from app.cleaning.store import TableStore, drop_store, get_store
 from app.core.schemas import CleaningStep, StepType
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "expected"),
+    [("PostgresSaver", True), ("SqliteSaver", True), ("InMemorySaver", False)],
+)
+def test_only_the_in_memory_checkpointer_is_reported_non_durable(
+    monkeypatch, backend_name, expected
+):
+    monkeypatch.setattr(checkpointing, "checkpointer_backend", lambda: backend_name)
+    assert checkpointing.checkpointer_is_durable() is expected
 
 
 @pytest.fixture
@@ -371,6 +383,32 @@ def test_merge_step_requires_both_sides_to_exist(store):
     assert "nope" in rejected[0]
 
 
+def test_merge_sheets_is_refused_between_two_different_entities_that_merely_share_a_key(store):
+    """``orders`` and ``customers`` are different entities that happen to share
+    a key column — that is a foreign key, not two halves of one table split
+    across sheets, and a CONFIRMED equivalence on the shared key must not be
+    read as a license to join them (H-2)."""
+
+    accepted, rejected = normalize_claude_plan(
+        [
+            {
+                "type": "merge_sheets",
+                "table": "orders",
+                "params": {
+                    "right_table": "customers",
+                    "left_key": "customer",
+                    "right_key": "customer_id",
+                    "how": "left",
+                    "result_table": "orders_with_customers",
+                },
+            }
+        ],
+        store.tables(),
+    )
+    assert accepted == []
+    assert "same columns" in rejected[0]
+
+
 # ---------------------------------------------------------------------------
 # graph
 # ---------------------------------------------------------------------------
@@ -524,7 +562,11 @@ def test_cancelling_the_plan_changes_nothing(graph_session):
     assert {name: len(df) for name, df in get_store(session_id).tables().items()} == before
 
 
-def test_failed_step_is_reported_not_raised(graph_session):
+def test_a_step_with_a_bad_reference_is_dropped_before_it_runs(graph_session):
+    """A user-added step naming a column that doesn't exist is rejected at
+    review time, the same way an LLM-proposed one already was — it must never
+    reach execution, and the reason is recorded rather than silently dropped."""
+
     session_id, _, graph = graph_session
     _start(graph, session_id)
     broken = [
@@ -540,9 +582,35 @@ def test_failed_step_is_reported_not_raised(graph_session):
     ]
 
     result = resume(graph, session_id, {"action": "confirm", "plan": broken})
+    assert interrupt_payload(result) is None
+    assert result["status"] == "completed"
+    assert any("does_not_exist" in reason for reason in result["plan_rejections"])
+
+
+def test_failed_step_is_reported_not_raised(graph_session):
+    """A step that passes reference validation (a real column, on a real
+    table) can still fail only once execution actually tries it — that must
+    still be reported, not raised."""
+
+    session_id, store, graph = graph_session
+    _start(graph, session_id)
+    columns = list(store.get("sales_data").columns)
+    broken = [
+        {
+            "id": "x1",
+            "type": "rename_column",
+            "table": "sales_data",
+            "description": "rename a column to a name that already exists",
+            "params": {"column": columns[0], "new_name": columns[1]},
+            "origin": "user",
+            "status": "pending",
+        }
+    ]
+
+    result = resume(graph, session_id, {"action": "confirm", "plan": broken})
     pending = interrupt_payload(result)
     assert pending["kind"] == "step_failed"
-    assert "does_not_exist" in pending["error"]
+    assert columns[1] in pending["error"]
 
     result = resume(graph, session_id, {"action": "skip"})
     assert result["status"] == "completed"

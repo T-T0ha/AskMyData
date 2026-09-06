@@ -474,11 +474,23 @@ class EquivalenceCandidateRecord(Base):
     explanation: Mapped[str] = mapped_column(Text, default="")
     #: ``None`` = undecided, ``True`` = confirmed, ``False`` = rejected.
     confirmed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    #: The two column-name embeddings ``embedding_similarity`` was computed
+    #: from — a real ``vector(n)`` column on PostgreSQL (JSON elsewhere), the
+    #: same dialect-aware type as ``ColumnSemantics.embedding``.  Scoring
+    #: itself never reads these back; they exist so the prior that produced a
+    #: cross-sheet equivalence is inspectable and reusable, not thrown away
+    #: the moment a scalar score is derived from it.
+    left_embedding: Mapped[list | None] = mapped_column(
+        EmbeddingVector(get_settings().embedding_dim), nullable=True
+    )
+    right_embedding: Mapped[list | None] = mapped_column(
+        EmbeddingVector(get_settings().embedding_dim), nullable=True
+    )
 
     session: Mapped[IngestionSession] = relationship(back_populates="equivalences")
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, include_embedding: bool = False) -> dict[str, Any]:
+        payload = {
             "id": self.id,
             "left_table": self.left_table,
             "left_column": self.left_column,
@@ -492,6 +504,10 @@ class EquivalenceCandidateRecord(Base):
             "explanation": self.explanation,
             "confirmed": self.confirmed,
         }
+        if include_embedding:
+            payload["left_embedding"] = self.left_embedding
+            payload["right_embedding"] = self.right_embedding
+        return payload
 
 
 class RelationshipRecord(Base):

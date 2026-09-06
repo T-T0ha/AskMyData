@@ -31,6 +31,7 @@ from app.cleaning.planner import (
     heuristic_plan,
     merge_plans,
     normalize_claude_plan,
+    validate_plan_references,
 )
 from app.cleaning.steps import StepError, execute_step
 from app.cleaning.store import TableStore, get_store
@@ -187,14 +188,37 @@ def review_node(state: CleaningState) -> Command[Literal["execute", "finalize"]]
     if plan is None:
         plan = state.get("plan", [])
     # The user's ordering is authoritative — it is not re-sorted.
-    plan = [CleaningStep.from_dict(step).to_dict() for step in plan]
+    steps = [CleaningStep.from_dict(step) for step in plan]
+
+    # normalize_claude_plan only ever checked Claude's own proposal; a step the
+    # user then added or edited was never re-checked, and a bad reference in it
+    # would otherwise surface only as a soft "step failed" interrupt once
+    # execution reached it. Hold it to the same standard here instead.
+    tables = get_store(state["session_id"]).tables()
+    valid, new_rejections = validate_plan_references(steps, tables)
+    if new_rejections:
+        logger.warning(
+            "dropped %d user-submitted step(s) with a bad reference: %s",
+            len(new_rejections),
+            "; ".join(new_rejections),
+        )
+    plan = [s.to_dict() for s in valid]
+    rejections = [*state.get("plan_rejections", []), *new_rejections]
 
     if not plan:
-        return Command(goto="finalize", update={"status": "completed", "plan": []})
+        return Command(
+            goto="finalize",
+            update={"status": "completed", "plan": [], "plan_rejections": rejections},
+        )
 
     return Command(
         goto="execute",
-        update={"plan": plan, "cursor": 0, "status": "executing"},
+        update={
+            "plan": plan,
+            "cursor": 0,
+            "status": "executing",
+            "plan_rejections": rejections,
+        },
     )
 
 

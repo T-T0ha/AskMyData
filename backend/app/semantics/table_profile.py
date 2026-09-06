@@ -769,6 +769,7 @@ def _classify(
             ),
         )
 
+    if primary_key:
         return (
             TableType.DIMENSION,
             0.6,

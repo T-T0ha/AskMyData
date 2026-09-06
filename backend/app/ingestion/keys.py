@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any, Iterable, Sequence
 
+import numpy as np
 import pandas as pd
 
 #: Deepest composite key searched.  Three columns is already an unusual
@@ -42,6 +43,13 @@ MAX_KEY_DEPTH = 3
 
 #: Rows above which candidate discovery runs on a sample first.
 SAMPLE_ROWS = 10_000
+
+#: Contiguous row-position bands the sample is drawn from, proportionally.  A
+#: workbook's shape often changes partway through — a batch appended later
+#: with reused ids, a header repeated mid-file — so a sample confined to one
+#: region of the file could miss exactly the collision that matters; cutting
+#: it into bands and drawing from each guards against that.
+SAMPLE_STRATA = 20
 
 #: Columns considered for composite keys, most selective first.  A key needs
 #: cardinality, so the least selective columns are the least useful to try.
@@ -245,11 +253,27 @@ def _rank(df: pd.DataFrame, candidate: KeyCandidate) -> tuple[int, int]:
 
 
 def _sample(df: pd.DataFrame, sample_rows: int) -> tuple[pd.DataFrame, bool]:
+    """A stratified sample: the table is cut into equal contiguous row-position
+    bands (:data:`SAMPLE_STRATA` of them) and each contributes its
+    proportional share, drawn at random within the band.  A table exported in
+    key order — or one where a later batch reused ids — cannot dominate or be
+    invisible to the sample the way a single unconstrained draw could.
+
+    Final correctness never rests on this: every candidate that survives the
+    sample is re-verified against the *whole* table before being reported
+    (see :func:`discover_keys`), so this only changes which candidates get
+    that expensive check, never which ones are accepted.
+    """
+
     if len(df) <= sample_rows:
         return df, False
-    # Random rather than head: a table exported in key order has a head that is
-    # unrepresentative in exactly the way that matters here.
-    return df.sample(n=sample_rows, random_state=_SAMPLE_SEED), True
+    rng = np.random.RandomState(_SAMPLE_SEED)
+    bands = np.array_split(np.arange(len(df)), min(SAMPLE_STRATA, len(df), sample_rows))
+    per_band = max(1, sample_rows // len(bands))
+    chosen = np.concatenate(
+        [rng.choice(band, size=min(per_band, len(band)), replace=False) for band in bands if len(band)]
+    )
+    return df.iloc[np.sort(chosen)], True
 
 
 # ---------------------------------------------------------------------------

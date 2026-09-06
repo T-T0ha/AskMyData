@@ -298,8 +298,8 @@ export function PlanBoard({ plan, planSource, rejections, tables, stepTypes, onS
       title="Review the cleaning plan"
       subtitle={
         planSource === 'claude'
-          ? ''
-          : ''
+          ? 'Proposed by Claude from the statistics below, then checked against your data before you see it.'
+          : "Built directly from your data's statistics — no AI involved."
       }
       actions={
         <div className="flex gap-2">

@@ -16,7 +16,9 @@ import pytest
 
 from app.ingestion.keys import (
     MAX_KEY_DEPTH,
+    SAMPLE_STRATA,
     KeyAnalysis,
+    _sample,
     confirm_key,
     discover_keys,
     is_unique_key,
@@ -164,6 +166,20 @@ def test_sampling_a_large_table_still_finds_and_verifies_the_key():
     assert analysis.sampled is True
     assert analysis.candidates[0].columns == ["order_id", "line_no"]
     assert is_unique_key(frame, ["order_id", "line_no"])
+
+
+def test_the_sample_is_stratified_across_the_whole_table_not_one_region():
+    """A plain uniform draw already covers the table on average — the
+    documented claim is stratification, so this checks the sample structurally
+    cannot come from one contiguous region, not merely that it happens not to."""
+
+    frame = pd.DataFrame({"x": np.arange(100_000)})
+    sample, sampled = _sample(frame, 2_000)
+
+    assert sampled is True
+    band_width = len(frame) // SAMPLE_STRATA
+    bands_hit = {int(position // band_width) for position in sample.index.to_numpy()}
+    assert len(bands_hit) == SAMPLE_STRATA
 
 
 # ---------------------------------------------------------------------------
