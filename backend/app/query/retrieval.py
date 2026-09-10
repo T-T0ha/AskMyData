@@ -200,3 +200,54 @@ def schema_context(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return [tables[name] for name in order]
+
+
+#: Ceiling on retrieved business rules. See ``Settings.query_max_business_rules``.
+DEFAULT_MAX_BUSINESS_RULES = 5
+
+#: Ceiling on retrieved verified examples. See ``Settings.query_max_examples``.
+DEFAULT_MAX_EXAMPLES = 3
+
+
+def retrieve_business_rules(
+    question_vector: Sequence[float],
+    rules: Sequence[Mapping[str, Any]],
+    max_rules: int = DEFAULT_MAX_BUSINESS_RULES,
+) -> list[str]:
+    """The user's own recorded rules, ranked by relevance to the question.
+
+    The third retrieval index alongside table and column embeddings (§Phase 5)
+    — a rule with no embedding yet (written before the embedder was available)
+    scores 0.0 rather than being dropped, since a business rule is short enough
+    that sending it costs little even when it cannot be ranked.
+    """
+
+    scored = sorted(
+        rules,
+        key=lambda row: _cosine(question_vector, row.get("embedding")),
+        reverse=True,
+    )
+    return [str(row.get("rule_text")) for row in scored[:max_rules] if row.get("rule_text")]
+
+
+def retrieve_examples(
+    question_vector: Sequence[float],
+    examples: Sequence[Mapping[str, Any]],
+    max_examples: int = DEFAULT_MAX_EXAMPLES,
+) -> list[dict[str, str]]:
+    """Verified question/SQL pairs for this dataset, ranked by similarity.
+
+    Only ever called with already-``verified`` rows — an unverified guess has
+    no business sitting beside real evidence in the same prompt.
+    """
+
+    scored = sorted(
+        examples,
+        key=lambda row: _cosine(question_vector, row.get("embedding")),
+        reverse=True,
+    )
+    return [
+        {"question": str(row.get("question")), "sql": str(row.get("sql"))}
+        for row in scored[:max_examples]
+        if row.get("question") and row.get("sql")
+    ]

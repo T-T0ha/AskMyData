@@ -30,6 +30,7 @@ import { TableProfilePanel } from './components/TableProfilePanel'
 import { FieldSemanticGrid } from './components/FieldSemanticGrid'
 import { DashboardPanel } from './components/DashboardPanel'
 import { PlanBoard } from './components/PlanBoard'
+import { QualityReportPanel } from './components/QualityReportPanel'
 import { QueryPanel } from './components/QueryPanel'
 import { SourcePicker } from './components/SourcePicker'
 import { CleaningProgress, CleaningSummary, StepValidation } from './components/StepValidation'
@@ -45,6 +46,7 @@ const STAGES = [
   { key: 'export', label: 'Semantic layer' },
   { key: 'query', label: 'Ask questions' },
   { key: 'dashboard', label: 'Dashboard' },
+  { key: 'quality', label: 'Data quality' },
 ]
 
 function useTheme() {
@@ -121,6 +123,9 @@ export default function App() {
   const [queryEntries, setQueryEntries] = useState([])
   const [dashboardCards, setDashboardCards] = useState([])
   const [queryHistory, setQueryHistory] = useState([])
+  const [businessRules, setBusinessRules] = useState([])
+  const [suggestedQuestions, setSuggestedQuestions] = useState([])
+  const [qualityReport, setQualityReport] = useState(null)
   const [selectedEdge, setSelectedEdge] = useState(null)
   const [evidence, setEvidence] = useState(null)
   const [evidenceLoading, setEvidenceLoading] = useState(false)
@@ -532,6 +537,48 @@ export default function App() {
       return true
     })
 
+  // Business rules and proactive suggestions load together — both are read
+  // once when the "Ask questions" panel opens, not on every keystroke.
+  const loadQueryExtras = () =>
+    run(async () => {
+      const [rulesPayload, suggestionsPayload] = await Promise.all([
+        api.businessRules(sessionId),
+        api.suggestedQuestions(sessionId),
+      ])
+      setBusinessRules(rulesPayload.rules)
+      setSuggestedQuestions(suggestionsPayload.questions)
+      return true
+    })
+
+  const addRule = (ruleText) =>
+    run(async () => {
+      const rule = await api.addBusinessRule(sessionId, ruleText)
+      setBusinessRules((rules) => [rule, ...rules])
+      return true
+    })
+
+  const deleteRule = (ruleId) =>
+    run(async () => {
+      await api.deleteBusinessRule(sessionId, ruleId)
+      setBusinessRules((rules) => rules.filter((rule) => rule.id !== ruleId))
+      return true
+    })
+
+  // Saving an example re-validates the SQL server-side (§Phase 5's third
+  // retrieval index) — there is nothing to reflect back into query state,
+  // only a confirmation that the next relevant question will see it.
+  const saveExample = (entry) =>
+    run(async () => {
+      await api.saveExample(sessionId, entry.question, entry.result.sql)
+      return true
+    })
+
+  const refreshQualityReport = () =>
+    run(async () => {
+      setQualityReport(await api.qualityReport(sessionId))
+      return true
+    })
+
   const renameCard = (cardId, title) =>
     run(async () => {
       await api.updateCard(sessionId, cardId, { title })
@@ -592,6 +639,7 @@ export default function App() {
     export: Boolean(triage?.sheets?.length),
     query: Boolean(triage?.sheets?.length),
     dashboard: Boolean(triage?.sheets?.length),
+    quality: Boolean(triage?.sheets?.length),
   }
 
   const selectedRelationship =
@@ -834,6 +882,12 @@ export default function App() {
             busy={busy}
             onAsk={askQuestion}
             onPin={pinCard}
+            rules={businessRules}
+            suggestions={suggestedQuestions}
+            onLoadExtras={loadQueryExtras}
+            onAddRule={addRule}
+            onDeleteRule={deleteRule}
+            onSaveExample={saveExample}
           />
         )}
 
@@ -848,6 +902,15 @@ export default function App() {
             onUnpin={unpinCard}
             onLayoutChange={moveCard}
             onRerun={rerunFromHistory}
+          />
+        )}
+
+        {stage === 'quality' && (
+          <QualityReportPanel
+            exported={Boolean(exportState?.exported)}
+            report={qualityReport}
+            busy={busy}
+            onRefresh={refreshQualityReport}
           />
         )}
       </main>

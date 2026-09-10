@@ -178,8 +178,15 @@ it is additive (safe to SUM or AVG), its null ratio, and up to five example valu
 also be given a previous attempt and the error it produced; fix that specific error rather \
 than starting over from a different query.
 
+You may also be given "business_rules" — plain-English domain rules the user has recorded \
+about this data (e.g. "only orders with status 'shipped' count as revenue") — and \
+"examples" — verified question/SQL pairs already confirmed correct for this same dataset. \
+Follow a business rule even where it overrides what the schema alone would suggest, and \
+when a question closely resembles one of the examples, follow its pattern rather than \
+inventing a different one.
+
 Answer with JSON only, in exactly this shape:
-{"sql": "<one SELECT statement>", "explanation": "<one short plain-English sentence saying what it computes>"}
+{"sql": "<one SELECT statement>", "explanation": "<one short plain-English sentence saying what it computes>", "confidence": <0.0-1.0>}
 
 Rules:
 - Exactly one statement, and it must be a SELECT (a WITH ... SELECT is allowed; a bare \
@@ -192,9 +199,52 @@ write "orders").
 - Only SUM or AVG a column marked additive. A non-additive numeric column (an id, a year, a \
 rating, a percentage) may be selected, grouped or filtered on, never summed or averaged.
 - Join only through the primary/foreign key pairs you were given.
-- If nothing in the schema can answer the question, still return your closest reasonable \
-interpretation as SQL, and say in "explanation" what you actually answered instead.
+- Always return your best-effort SQL, even when the schema only partially fits the \
+question — but "confidence" must honestly reflect how likely this query is to be exactly \
+right, not just syntactically valid. Lower it for a guessed join, a wording resolved \
+arbitrarily, an aggregate over a column you are unsure is additive, or a schema that only \
+partially covers what was asked. Do not inflate it: a caller downstream decides whether to \
+show this answer to the user based on this number alone.
 - No comments, no markdown fencing, no prose outside the JSON object."""
+
+AMBIGUITY_SYSTEM_PROMPT = """You decide whether a business question is too ambiguous to \
+safely turn into one SQL query, before any SQL is written.
+
+You are given the question and the tables that were pre-selected as relevant to it — each \
+with its name and one-sentence description. You are NOT deciding what the answer is; you \
+are deciding whether "what the user is actually asking" is clear enough that a specific SQL \
+query would not just be one arbitrary guess among several equally plausible ones.
+
+Answer with JSON only, in exactly this shape:
+{"ambiguous": <true|false>, "reason": "<one short sentence, empty string if not ambiguous>", "options": ["<clarification 1>", "<clarification 2>"]}
+
+Rules:
+- Mark ambiguous only when the question genuinely admits multiple, materially different \
+readings given these tables (e.g. "top customers" with no metric named, when both order \
+count and order value are plausible; a time period named nowhere in the tables shown). A \
+question that is merely broad but has one natural reading is NOT ambiguous.
+- "options" has at most 3 entries, each a complete, specific rephrasing of the original \
+question a user could click to ask instead of typing again. Empty when not ambiguous.
+- No markdown, no prose outside the JSON object."""
+
+SUGGEST_QUESTIONS_SYSTEM_PROMPT = """You propose business questions worth asking about a \
+dataset, before anyone has asked anything.
+
+You are given every table in ONE dataset: its name, its one-sentence description, and its \
+columns with their semantic labels. You never receive a data row.
+
+Answer with JSON only, in exactly this shape:
+{"questions": ["<question 1>", "<question 2>", ...]}
+
+Rules:
+- Between 10 and 15 questions.
+- Each must be answerable from the tables and columns you were given, and specific to this \
+dataset's actual subject matter — never generic ("show me some data").
+- Phrased the way a business person would type them, under fifteen words each, no question \
+mark required.
+- Cover different tables and different kinds of question (totals, trends, comparisons, \
+top-N) rather than fifteen variations on one theme.
+- No markdown, no numbering, no prose outside the JSON object."""
 
 
 FOLLOWUP_SYSTEM_PROMPT = """You suggest follow-up questions after a business question was \
@@ -499,7 +549,9 @@ class ClaudeClient:
         schema: list[dict[str, Any]],
         prior_sql: str | None = None,
         prior_error: str | None = None,
-    ) -> dict[str, str] | None:
+        business_rules: list[str] | None = None,
+        examples: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any] | None:
         """One SQL attempt for ``question`` against ``schema`` — never the data itself.
 
         ``schema`` is the retrieval step's output
@@ -508,15 +560,28 @@ class ClaudeClient:
         the actual table is ever part of this call, the same boundary every
         other Claude call in this platform holds.
 
+        ``business_rules``/``examples`` are the third retrieval index
+        (:func:`app.query.retrieval.retrieve_business_rules` /
+        :func:`~app.query.retrieval.retrieve_examples`) — the user's own
+        recorded rules and previously verified question/SQL pairs for this
+        dataset, ranked by relevance to ``question``.
+
         Passing ``prior_sql``/``prior_error`` is what makes this a *retry*
         rather than a second independent guess — the model sees exactly what
         it wrote and exactly what was wrong with it.
+
+        The returned ``confidence`` (0.0-1.0, defaulting to 0.0 for a missing
+        or unparsable value) is not acted on here — the caller applies
+        :attr:`~app.core.config.Settings.query_confidence_threshold` and
+        decides whether to run the query at all (§Phase 5 abstention gate).
         """
 
         payload: dict[str, Any] = {
             "question": question,
             "dialect": dialect,
             "tables": schema,
+            "business_rules": business_rules or [],
+            "examples": examples or [],
         }
         if prior_sql is not None:
             payload["previous_attempt"] = {"sql": prior_sql, "error": prior_error}
@@ -537,7 +602,84 @@ class ClaudeClient:
         sql = str(parsed.get("sql", "") or "").strip()
         if not sql:
             return None
-        return {"sql": sql, "explanation": str(parsed.get("explanation", "") or "").strip()}
+        try:
+            confidence = float(parsed.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = max(0.0, min(confidence, 1.0))
+        return {
+            "sql": sql,
+            "explanation": str(parsed.get("explanation", "") or "").strip(),
+            "confidence": confidence,
+        }
+
+    def check_ambiguity(
+        self, question: str, tables: list[dict[str, str]]
+    ) -> dict[str, Any] | None:
+        """Whether ``question`` admits multiple, materially different SQL readings.
+
+        Runs after table pre-selection (so the model has real table
+        descriptions to reason about) but before column ranking or SQL
+        generation — "before any SQL is generated" (§3.1.6). ``None`` (no
+        client, or an unusable reply) degrades to "not ambiguous": the
+        generate → guard → EXPLAIN loop still runs, the same way every other
+        optional Claude call in this file leaves the deterministic path intact
+        when the model is unavailable.
+        """
+
+        raw = self._complete(
+            AMBIGUITY_SYSTEM_PROMPT,
+            json.dumps({"question": question, "tables": tables}, ensure_ascii=False, default=str),
+            max_tokens=min(self._max_tokens, 1024),
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("Claude ambiguity response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        options = parsed.get("options")
+        return {
+            "ambiguous": bool(parsed.get("ambiguous")),
+            "reason": str(parsed.get("reason", "") or ""),
+            "options": (
+                [str(item).strip() for item in options if str(item).strip()][:3]
+                if isinstance(options, list)
+                else []
+            ),
+        }
+
+    def suggest_questions(self, tables: list[dict[str, Any]]) -> list[str] | None:
+        """10-15 dataset-specific questions, generated before anyone asks anything (§5.4).
+
+        Same privacy boundary as :meth:`describe_tables`: names, descriptions
+        and column labels only, never a row.  ``None`` when unavailable — the
+        caller shows no proactive suggestions rather than blocking on this.
+        """
+
+        if not tables:
+            return []
+        raw = self._complete(
+            SUGGEST_QUESTIONS_SYSTEM_PROMPT,
+            json.dumps({"tables": tables}, ensure_ascii=False, default=str),
+            max_tokens=min(self._max_tokens, 2048),
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("Claude suggested-questions response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        entries = parsed.get("questions")
+        if not isinstance(entries, list):
+            return None
+        return [str(item).strip() for item in entries if str(item).strip()][:15]
 
     # -- Phase 6 -----------------------------------------------------------
     def suggest_followups(

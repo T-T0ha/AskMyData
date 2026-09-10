@@ -222,6 +222,12 @@ class IngestionSession(Base):
     equivalences: Mapped[list["EquivalenceCandidateRecord"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
+    business_rules: Mapped[list["BusinessRule"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan"
+    )
+    query_examples: Mapped[list["QueryExample"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan"
+    )
     relationships: Mapped[list["RelationshipRecord"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
@@ -510,6 +516,71 @@ class EquivalenceCandidateRecord(Base):
         return payload
 
 
+class BusinessRule(Base):
+    """A plain-English domain rule the user recorded — the third retrieval index (§Phase 5).
+
+    No algorithm can infer "we only count orders with status 'shipped' as
+    revenue" from the data itself; the user states it once here, and it is
+    embedded and retrieved alongside the schema at query time, the same way a
+    table or column description is.
+    """
+
+    __tablename__ = "business_rules"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("ingestion_sessions.id", ondelete="CASCADE"), index=True
+    )
+    rule_text: Mapped[str] = mapped_column(Text, default="")
+    embedding: Mapped[list | None] = mapped_column(
+        EmbeddingVector(get_settings().embedding_dim), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    session: Mapped[IngestionSession] = relationship(back_populates="business_rules")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "rule_text": self.rule_text,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class QueryExample(Base):
+    """A verified question→SQL pair, kept as a few-shot example for this dataset.
+
+    Created only when the user explicitly saves a successful answer — that
+    action *is* the verification, so every row here is trustworthy retrieval
+    context rather than an unreviewed guess sitting beside real evidence.
+    """
+
+    __tablename__ = "query_examples"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("ingestion_sessions.id", ondelete="CASCADE"), index=True
+    )
+    question: Mapped[str] = mapped_column(Text, default="")
+    sql: Mapped[str] = mapped_column(Text, default="")
+    embedding: Mapped[list | None] = mapped_column(
+        EmbeddingVector(get_settings().embedding_dim), nullable=True
+    )
+    verified: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    session: Mapped[IngestionSession] = relationship(back_populates="query_examples")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "question": self.question,
+            "sql": self.sql,
+            "verified": self.verified,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class RelationshipRecord(Base):
     """Phase 3 output: one detected or drawn relationship, and its verdict.
 
@@ -622,6 +693,10 @@ class SemanticLayerExport(Base):
     warning_count: Mapped[int] = mapped_column(Integer, default=0)
     report: Mapped[dict] = mapped_column(JSON, default=dict)
     bundle: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: Proactive query suggestions (§5.4), cached because generating them is a
+    #: Claude call — computed once per export and cleared on the next one
+    #: rather than recomputed on every dashboard/query page load.
+    suggested_questions: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -813,6 +888,16 @@ class QueryHistoryRecord(Base):
     sql: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     chart: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    #: How certain the model was in the SQL it produced, 0.0-1.0 — ``None``
+    #: when no attempt reached generation (e.g. an ambiguous question).
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: "answered" (executed, shown to the user), "abstained" (ambiguous
+    #: question or confidence below threshold — a candidate existed but was
+    #: withheld), or "rejected" (every generate/guard/EXPLAIN attempt failed).
+    #: ``ok`` is kept, unchanged, as the boolean shorthand every existing
+    #: caller already reads (``ok == (outcome == "answered")``); ``outcome`` is
+    #: what tells abstention and rejection apart, which ``ok`` alone cannot.
+    outcome: Mapped[str] = mapped_column(String(20), default="rejected")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     def to_dict(self) -> dict[str, Any]:
@@ -823,5 +908,7 @@ class QueryHistoryRecord(Base):
             "sql": self.sql,
             "error": self.error,
             "chart": self.chart,
+            "confidence": self.confidence,
+            "outcome": self.outcome,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

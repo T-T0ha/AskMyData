@@ -27,10 +27,12 @@ from app.core.schemas import (
     TriageStatus,
 )
 from app.db.models import (
+    BusinessRule,
     ColumnSemantics,
     DashboardCard,
     EquivalenceCandidateRecord,
     IngestionSession,
+    QueryExample,
     QueryHistoryRecord,
     RelationshipRecord,
     SemanticLayerExport,
@@ -39,6 +41,7 @@ from app.db.models import (
 )
 from app.export.documentation import render_markdown
 from app.export.metadata import bundle as semantic_bundle
+from app.export.quality import build_quality_report
 from app.export.runner import drop_export, explain, read_semantic_layer, run_export, run_readonly
 from app.export.schema import build_plan
 from app.ingestion.equivalence import detect_equivalences
@@ -50,6 +53,8 @@ from app.query.guard import QueryRejected, validate_select_only
 from app.query.retrieval import (
     expand_by_references,
     rank_tables,
+    retrieve_business_rules,
+    retrieve_examples,
     schema_context,
     select_columns,
     select_tables,
@@ -1528,6 +1533,10 @@ def export_semantic_layer(db: Session, record: IngestionSession, claude=None) ->
     row.warning_count = len(payload["warnings"])
     row.report = payload
     row.bundle = semantic_bundle(plan)
+    # Proactive suggestions (§5.4) are cheap to regenerate but not free — clear
+    # the cache so the next request builds them from this build of the layer
+    # rather than serving suggestions for a schema that no longer exists.
+    row.suggested_questions = []
     row.updated_at = now
 
     _archive_layer(db, record, row)
@@ -1610,6 +1619,76 @@ def layer_bundle(db: Session, session_id: str, version: int | None = None) -> di
         .where(SemanticLayerVersion.version == version)
     ).scalar_one_or_none()
     return None if archived is None else (archived.bundle or {})
+
+
+def get_quality_report(db: Session, session_id: str) -> dict[str, Any]:
+    """The automated data-quality report (§5.4) — a read of live enrichment state.
+
+    Included whenever a prior export exists: a before/after against the build
+    immediately before this one (see :mod:`app.export.quality` for exactly
+    which dimensions an archived build can honestly support).
+    """
+
+    rows = (
+        db.execute(select(ColumnSemantics).where(ColumnSemantics.session_id == session_id))
+        .scalars()
+        .all()
+    )
+    by_table: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_table.setdefault(row.table_name, []).append(row.to_dict())
+    current_tables = [{"name": name, "columns": cols} for name, cols in by_table.items()]
+
+    previous_tables = None
+    versions = layer_versions(db, session_id)
+    if len(versions) >= 2:
+        previous_tables = (versions[1].bundle or {}).get("tables", [])
+
+    return build_quality_report(current_tables, previous_tables)
+
+
+def get_suggested_questions(
+    db: Session, session_id: str, claude=None
+) -> dict[str, Any]:
+    """Proactive query suggestions (§5.4) — cached on the export, not recomputed per view.
+
+    The cache is cleared on every new export (:func:`export_semantic_layer`)
+    and regenerated here on first request after that; ``available=False``
+    (never cached) when no Claude client is configured, so the next request
+    tries again rather than freezing on an empty list forever.
+    """
+
+    export = db.execute(
+        select(SemanticLayerExport).where(SemanticLayerExport.session_id == session_id)
+    ).scalar_one_or_none()
+    if export is None:
+        return {"questions": [], "available": False}
+    if export.suggested_questions:
+        return {"questions": export.suggested_questions, "available": True}
+    if claude is None or not claude.available:
+        return {"questions": [], "available": False}
+
+    sheets = _sheets_by_name(db, session_id)
+    layer_rows = read_semantic_layer(session_id)
+    columns_by_table: dict[str, list[dict[str, Any]]] = {}
+    for layer_row in layer_rows:
+        columns_by_table.setdefault(str(layer_row.get("table_name")), []).append(
+            {"name": layer_row.get("column_name"), "taxonomy": layer_row.get("taxonomy_label")}
+        )
+    tables = [
+        {
+            "name": name,
+            "description": sheets[name].effective_description if name in sheets else "",
+            "columns": cols,
+        }
+        for name, cols in columns_by_table.items()
+    ]
+    questions = claude.suggest_questions(tables)
+    if not questions:
+        return {"questions": [], "available": False}
+    export.suggested_questions = questions
+    db.flush()
+    return {"questions": questions, "available": True}
 
 
 def layer_documentation(
@@ -1716,6 +1795,8 @@ def _record_history(db: Session, session_id: str, question: str, result: dict[st
             sql=result.get("sql"),
             error=result.get("error"),
             chart=(result.get("visualization") or {}).get("chart"),
+            confidence=result.get("confidence"),
+            outcome=result.get("outcome") or ("answered" if result.get("ok") else "rejected"),
         )
     )
     db.flush()
@@ -1748,6 +1829,110 @@ def question_history(db: Session, session_id: str) -> list[dict[str, Any]]:
         .all()
     )
     return [row.to_dict() for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — the third retrieval index: business rules + verified examples
+# ---------------------------------------------------------------------------
+
+
+def list_business_rules(db: Session, session_id: str) -> list[BusinessRule]:
+    """Every business rule recorded for this dataset, newest first."""
+
+    return list(
+        db.execute(
+            select(BusinessRule)
+            .where(BusinessRule.session_id == session_id)
+            .order_by(BusinessRule.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+
+
+def add_business_rule(db: Session, record: IngestionSession, rule_text: str) -> BusinessRule:
+    """Record one plain-English domain rule, embedded for retrieval at query time."""
+
+    rule_text = (rule_text or "").strip()
+    if not rule_text:
+        raise ValueError("a business rule needs some text")
+    vector = get_embedder().encode([rule_text])[0]
+    rule = BusinessRule(session_id=record.id, rule_text=rule_text, embedding=vector)
+    db.add(rule)
+    db.flush()
+    return rule
+
+
+def delete_business_rule(db: Session, record: IngestionSession, rule_id: str) -> None:
+    rule = db.execute(
+        select(BusinessRule).where(
+            BusinessRule.session_id == record.id, BusinessRule.id == rule_id
+        )
+    ).scalar_one_or_none()
+    if rule is None:
+        raise KeyError(f"no business rule {rule_id!r}")
+    db.delete(rule)
+    db.flush()
+
+
+def list_query_examples(
+    db: Session, session_id: str, verified_only: bool = False
+) -> list[QueryExample]:
+    """Verified question/SQL pairs kept as few-shot examples for this dataset."""
+
+    query = select(QueryExample).where(QueryExample.session_id == session_id)
+    if verified_only:
+        query = query.where(QueryExample.verified.is_(True))
+    return list(db.execute(query.order_by(QueryExample.created_at.desc())).scalars().all())
+
+
+def save_query_example(
+    db: Session, record: IngestionSession, question: str, sql: str
+) -> QueryExample:
+    """Save one successful answer as a verified example — the click itself is the verification.
+
+    The SQL is re-validated here, independently of whatever validated it when
+    the question was first answered, for the same reason
+    :func:`pin_dashboard_card` re-validates: a save request is client-supplied
+    input, and this is the write path that turns a stored statement into
+    context every future question is judged against.
+    """
+
+    question = (question or "").strip()
+    sql = (sql or "").strip()
+    if not question or not sql:
+        raise ValueError("an example needs both a question and its SQL")
+
+    export = export_record(db, record.id)
+    if export is None:
+        raise ValueError("export the semantic layer before saving an example")
+
+    rows = read_semantic_layer(record.id)
+    exported_tables = {str(row.get("table_name")).lower() for row in rows}
+    try:
+        validated_sql = validate_select_only(sql, exported_tables, export.dialect)
+    except QueryRejected as exc:
+        raise ValueError(f"this query can no longer be saved as an example: {exc}") from exc
+
+    vector = get_embedder().encode([question])[0]
+    example = QueryExample(
+        session_id=record.id, question=question, sql=validated_sql, embedding=vector, verified=True
+    )
+    db.add(example)
+    db.flush()
+    return example
+
+
+def delete_query_example(db: Session, record: IngestionSession, example_id: str) -> None:
+    example = db.execute(
+        select(QueryExample).where(
+            QueryExample.session_id == record.id, QueryExample.id == example_id
+        )
+    ).scalar_one_or_none()
+    if example is None:
+        raise KeyError(f"no query example {example_id!r}")
+    db.delete(example)
+    db.flush()
 
 
 def answer_question(
@@ -1796,22 +1981,12 @@ def answer_question(
     scored = rank_tables(question_vector, table_vectors)
     selected = select_tables(scored, settings.query_max_tables)
     selected = expand_by_references(selected, rows)
-    selected_columns = select_columns(
-        question_vector, rows, selected, settings.query_max_ranked_columns
-    )
-    context = schema_context(selected_columns)
-    allowed_tables = {name.lower() for name in selected}
     dialect = export.dialect
-
-    attempts: list[dict[str, Any]] = []
-    sql: str | None = None
-    explanation = ""
-    last_error: str | None = None
-    prior_sql: str | None = None
 
     if claude is None or not claude.available:
         result = {
             "ok": False,
+            "outcome": "rejected",
             "question": question,
             "tables_considered": selected,
             "attempts": [],
@@ -1824,9 +1999,68 @@ def answer_question(
         _record_history(db, record.id, question, result)
         return result
 
+    # Ambiguity resolution (§3.1.6) — a discrete call on the pre-selected
+    # tables, before column ranking or SQL generation. Degrades to "not
+    # ambiguous" with no client, same as every other optional Claude call.
+    check_ambiguity = getattr(claude, "check_ambiguity", None)
+    ambiguity_tables = [
+        {"name": name, "description": sheets[name].effective_description if name in sheets else ""}
+        for name in selected
+    ]
+    ambiguity = check_ambiguity(question, ambiguity_tables) if check_ambiguity else None
+    if ambiguity and ambiguity.get("ambiguous"):
+        result = {
+            "ok": False,
+            "outcome": "abstained",
+            "ambiguous": True,
+            "question": question,
+            "tables_considered": selected,
+            "attempts": [],
+            "clarification_options": ambiguity.get("options", []),
+            "error": ambiguity.get("reason")
+            or "this question is ambiguous — pick a specific interpretation",
+        }
+        _record_history(db, record.id, question, result)
+        return result
+
+    selected_columns = select_columns(
+        question_vector, rows, selected, settings.query_max_ranked_columns
+    )
+    context = schema_context(selected_columns)
+    allowed_tables = {name.lower() for name in selected}
+
+    # The third retrieval index (§4.2): the user's own recorded rules and
+    # previously verified question/SQL pairs for this dataset, ranked by
+    # relevance to this question exactly like tables and columns are.
+    rule_records = list_business_rules(db, record.id)
+    retrieved_rules = retrieve_business_rules(
+        question_vector,
+        [{"rule_text": r.rule_text, "embedding": r.embedding} for r in rule_records],
+        settings.query_max_business_rules,
+    )
+    example_records = list_query_examples(db, record.id, verified_only=True)
+    retrieved_examples = retrieve_examples(
+        question_vector,
+        [{"question": e.question, "sql": e.sql, "embedding": e.embedding} for e in example_records],
+        settings.query_max_examples,
+    )
+
+    attempts: list[dict[str, Any]] = []
+    sql: str | None = None
+    explanation = ""
+    confidence = 0.0
+    last_error: str | None = None
+    prior_sql: str | None = None
+
     for attempt_no in range(1, settings.query_max_attempts + 1):
         generated = claude.generate_sql(
-            question, dialect, context, prior_sql=prior_sql, prior_error=last_error
+            question,
+            dialect,
+            context,
+            prior_sql=prior_sql,
+            prior_error=last_error,
+            business_rules=retrieved_rules,
+            examples=retrieved_examples,
         )
         if generated is None:
             last_error = claude.last_error or "the language model returned no usable answer"
@@ -1850,16 +2084,42 @@ def answer_question(
 
         sql = validated
         explanation = generated["explanation"]
+        # A fake standing in for Claude in a test need not implement
+        # confidence — treated as fully confident, so existing "this succeeds"
+        # tests keep succeeding rather than starting to abstain.
+        confidence = generated.get("confidence", 1.0)
         attempts.append({"attempt": attempt_no, "sql": validated, "error": None})
         break
 
     if sql is None:
         result = {
             "ok": False,
+            "outcome": "rejected",
             "question": question,
             "tables_considered": selected,
             "attempts": attempts,
             "error": last_error or "the model could not produce a usable query for this question",
+        }
+        _record_history(db, record.id, question, result)
+        return result
+
+    # Confidence-based abstention gate (§5.5): a candidate query exists, but
+    # is withheld — never executed, never rendered — when the model itself
+    # was not confident it answers the question correctly.
+    if confidence < settings.query_confidence_threshold:
+        result = {
+            "ok": False,
+            "outcome": "abstained",
+            "question": question,
+            "sql": sql,
+            "confidence": confidence,
+            "tables_considered": selected,
+            "attempts": attempts,
+            "error": (
+                f"low confidence ({confidence:.2f}) that this query answers the question "
+                f"correctly — {explanation}" if explanation else
+                f"low confidence ({confidence:.2f}) that this query answers the question correctly"
+            ),
         }
         _record_history(db, record.id, question, result)
         return result
@@ -1875,9 +2135,11 @@ def answer_question(
 
     result = {
         "ok": True,
+        "outcome": "answered",
         "question": question,
         "sql": sql,
         "explanation": explanation,
+        "confidence": confidence,
         "dialect": dialect,
         "columns": columns,
         "rows": result_rows,

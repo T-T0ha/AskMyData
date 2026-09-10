@@ -90,6 +90,17 @@ class Settings(BaseSettings):
     #: PostgreSQL only: aborts a runaway query (a bad join, an expensive scan)
     #: instead of holding the connection for the request's full timeout.
     query_statement_timeout_seconds: int = 20
+    #: Business rules retrieved into the SQL prompt, at most, ranked by
+    #: similarity to the question — the third retrieval index alongside tables
+    #: and columns.
+    query_max_business_rules: int = 5
+    #: Verified question/SQL examples retrieved into the SQL prompt, at most.
+    query_max_examples: int = 3
+    #: Below this, a generated query is withheld rather than shown — an
+    #: abstention, not an answer.  Same shape as the taxonomy classifier's own
+    #: confidence floor (0.5): a written-down number a caller can reason about,
+    #: not a magic threshold buried in an if-statement.
+    query_confidence_threshold: float = 0.45
 
     # ---- Phase 6 : dashboard --------------------------------------------
     #: Questions kept per session for the history sidebar, newest first —

@@ -60,7 +60,16 @@ class _ScriptedClaude:
         self.calls: list[dict] = []
         self.last_error = "the model declined"
 
-    def generate_sql(self, question, dialect, schema, prior_sql=None, prior_error=None):
+    def generate_sql(
+        self,
+        question,
+        dialect,
+        schema,
+        prior_sql=None,
+        prior_error=None,
+        business_rules=None,
+        examples=None,
+    ):
         self.calls.append({"question": question})
         if not self._answers:
             return None
@@ -577,3 +586,112 @@ def test_the_query_route_reports_no_suggestions_with_no_model_configured(
 
     assert response.status_code == 200
     assert response.json().get("suggestions") in (None, [])
+
+
+# ---------------------------------------------------------------------------
+# the data-quality report (C-3)
+# ---------------------------------------------------------------------------
+
+
+def test_the_quality_report_route_scores_every_exported_table(client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+
+    response = client.get(f"/api/sessions/{session_id}/quality-report")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["tables"]
+    for table in payload["tables"]:
+        assert 0.0 <= table["overall"] <= 100.0
+        assert "previous" not in table  # only one export has ever run
+
+
+def test_the_quality_report_route_belongs_to_its_owner(client, other_client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+
+    response = other_client.get(f"/api/sessions/{session_id}/quality-report")
+
+    assert response.status_code == 404
+
+
+def test_a_second_export_attaches_a_before_after_comparison(client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+    second = client.post(f"/api/sessions/{session_id}/export")
+    assert second.status_code == 200, second.text
+
+    response = client.get(f"/api/sessions/{session_id}/quality-report")
+
+    payload = response.json()
+    assert any("previous" in table for table in payload["tables"])
+
+
+# ---------------------------------------------------------------------------
+# proactive query suggestions (C-3)
+# ---------------------------------------------------------------------------
+
+
+class _SuggestingClaude:
+    available = True
+
+    def __init__(self, questions):
+        self._questions = questions
+        self.calls = 0
+
+    def suggest_questions(self, tables):
+        self.calls += 1
+        return list(self._questions)
+
+
+def test_suggested_questions_are_generated_and_then_cached(client, relational_workbook):
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    fake = _SuggestingClaude(["which city has the most customers?", "total revenue by month"])
+
+    with _db() as db:
+        first = services.get_suggested_questions(db, session_id, claude=fake)
+        db.commit()
+    assert first["available"] is True
+    assert first["questions"] == [
+        "which city has the most customers?",
+        "total revenue by month",
+    ]
+    assert fake.calls == 1
+
+    # A second call is served from the cache on the export row, not a second
+    # model call — proactive suggestions are computed once per export.
+    with _db() as db:
+        second = services.get_suggested_questions(db, session_id, claude=fake)
+    assert second["questions"] == first["questions"]
+    assert fake.calls == 1
+
+
+def test_re_exporting_clears_the_suggested_questions_cache(client, relational_workbook):
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    fake = _SuggestingClaude(["first build's question"])
+    with _db() as db:
+        services.get_suggested_questions(db, session_id, claude=fake)
+        db.commit()
+
+    second_export = client.post(f"/api/sessions/{session_id}/export")
+    assert second_export.status_code == 200, second_export.text
+
+    response = client.get(f"/api/sessions/{session_id}/suggested-questions")
+    assert response.status_code == 200
+    # No API key in this test process's own client (conftest) — regeneration
+    # degrades to an empty, not-available list rather than serving stale
+    # questions from a schema that export just replaced.
+    assert response.json() == {"questions": [], "available": False}
+
+
+def test_the_suggested_questions_route_degrades_cleanly_with_no_model_configured(
+    client, relational_workbook
+):
+    session_id = _exported(client, relational_workbook)
+
+    response = client.get(f"/api/sessions/{session_id}/suggested-questions")
+
+    assert response.status_code == 200
+    assert response.json() == {"questions": [], "available": False}

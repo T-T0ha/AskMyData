@@ -139,6 +139,21 @@ class QuestionRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
 
 
+class BusinessRuleCreate(BaseModel):
+    rule_text: str = Field(min_length=1, max_length=2000)
+
+
+class QueryExampleCreate(BaseModel):
+    """Save one successful answer as a verified few-shot example.
+
+    ``sql`` is re-validated server-side (:func:`app.api.services.save_query_example`),
+    the same way a dashboard pin is.
+    """
+
+    question: str = Field(min_length=1, max_length=2000)
+    sql: str = Field(min_length=1)
+
+
 class DashboardCardLayout(BaseModel):
     x: int = 0
     y: int = 0
@@ -841,6 +856,86 @@ def query_history(
     db: Session = Depends(session_scope),
 ) -> dict[str, Any]:
     return {"history": services.question_history(db, session_id)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — business rules + verified examples (the third retrieval index)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/sessions/{session_id}/business-rules", status_code=201)
+def add_business_rule(
+    body: BusinessRuleCreate,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    try:
+        rule = services.add_business_rule(db, record, body.rule_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return rule.to_dict()
+
+
+@router.get("/sessions/{session_id}/business-rules", dependencies=[Depends(require_session)])
+def list_business_rules(session_id: str, db: Session = Depends(session_scope)) -> dict[str, Any]:
+    return {"rules": [rule.to_dict() for rule in services.list_business_rules(db, session_id)]}
+
+
+@router.delete("/sessions/{session_id}/business-rules/{rule_id}", status_code=204)
+def delete_business_rule(
+    rule_id: str,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> None:
+    try:
+        services.delete_business_rule(db, record, rule_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/sessions/{session_id}/examples", status_code=201)
+def save_query_example(
+    body: QueryExampleCreate,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> dict[str, Any]:
+    try:
+        example = services.save_query_example(db, record, body.question, body.sql)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return example.to_dict()
+
+
+@router.get("/sessions/{session_id}/examples", dependencies=[Depends(require_session)])
+def list_query_examples(session_id: str, db: Session = Depends(session_scope)) -> dict[str, Any]:
+    return {
+        "examples": [
+            example.to_dict()
+            for example in services.list_query_examples(db, session_id)
+        ]
+    }
+
+
+@router.delete("/sessions/{session_id}/examples/{example_id}", status_code=204)
+def delete_query_example(
+    example_id: str,
+    record: IngestionSession = Depends(require_session),
+    db: Session = Depends(session_scope),
+) -> None:
+    try:
+        services.delete_query_example(db, record, example_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/sessions/{session_id}/quality-report", dependencies=[Depends(require_session)])
+def quality_report(session_id: str, db: Session = Depends(session_scope)) -> dict[str, Any]:
+    return services.get_quality_report(db, session_id)
+
+
+@router.get("/sessions/{session_id}/suggested-questions", dependencies=[Depends(require_session)])
+def suggested_questions(session_id: str, db: Session = Depends(session_scope)) -> dict[str, Any]:
+    return services.get_suggested_questions(db, session_id, claude=get_claude_client())
 
 
 # ---------------------------------------------------------------------------

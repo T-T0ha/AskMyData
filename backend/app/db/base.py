@@ -160,6 +160,8 @@ _ADDED_COLUMNS: dict[str, dict[str, "str | Callable[[], str]"]] = {
     },
     "semantic_layer_exports": {
         "semantic_version": "INTEGER DEFAULT 0",
+        # Cached proactive query suggestions (C-3), generated once per export.
+        "suggested_questions": "JSON",
     },
     # Ownership, added when authentication landed.  Declared without the
     # REFERENCES clause on purpose: SQLite cannot add a foreign key to an
@@ -179,6 +181,12 @@ _ADDED_COLUMNS: dict[str, dict[str, "str | Callable[[], str]"]] = {
     "equivalence_candidates": {
         "left_embedding": _embedding_ddl,
         "right_embedding": _embedding_ddl,
+    },
+    # Confidence-based abstention (C-2): a three-way outcome and the model's
+    # own confidence, alongside the original boolean `ok`.
+    "query_history": {
+        "confidence": "FLOAT",
+        "outcome": "VARCHAR(20) DEFAULT 'rejected'",
     },
 }
 

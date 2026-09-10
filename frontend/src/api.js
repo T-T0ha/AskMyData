@@ -165,6 +165,24 @@ export const api = {
     request(`/sessions/${id}/query`, { method: 'POST', body: JSON.stringify({ question }) }),
   queryHistory: (id) => request(`/sessions/${id}/query/history`),
 
+  businessRules: (id) => request(`/sessions/${id}/business-rules`),
+  addBusinessRule: (id, ruleText) =>
+    request(`/sessions/${id}/business-rules`, {
+      method: 'POST',
+      body: JSON.stringify({ rule_text: ruleText }),
+    }),
+  deleteBusinessRule: (id, ruleId) =>
+    request(`/sessions/${id}/business-rules/${ruleId}`, { method: 'DELETE' }),
+
+  examples: (id) => request(`/sessions/${id}/examples`),
+  saveExample: (id, question, sql) =>
+    request(`/sessions/${id}/examples`, { method: 'POST', body: JSON.stringify({ question, sql }) }),
+  deleteExample: (id, exampleId) =>
+    request(`/sessions/${id}/examples/${exampleId}`, { method: 'DELETE' }),
+
+  qualityReport: (id) => request(`/sessions/${id}/quality-report`),
+  suggestedQuestions: (id) => request(`/sessions/${id}/suggested-questions`),
+
   pinCard: (id, card) =>
     request(`/sessions/${id}/dashboard/cards`, { method: 'POST', body: JSON.stringify(card) }),
   dashboardCards: (id, { start, end } = {}) => {

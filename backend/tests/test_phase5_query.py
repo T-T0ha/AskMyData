@@ -25,6 +25,8 @@ from app.query.retrieval import (
     TableScore,
     expand_by_references,
     rank_tables,
+    retrieve_business_rules,
+    retrieve_examples,
     schema_context,
     select_columns,
     select_tables,
@@ -325,6 +327,48 @@ def test_a_bare_four_digit_string_is_not_assumed_to_be_a_year():
 
 
 # ---------------------------------------------------------------------------
+# the third retrieval index — business rules + verified examples
+# ---------------------------------------------------------------------------
+
+
+def test_business_rules_are_ranked_by_relevance_to_the_question():
+    rules = [
+        {"rule_text": "irrelevant rule", "embedding": [0.0, 1.0]},
+        {"rule_text": "relevant rule", "embedding": [1.0, 0.0]},
+    ]
+    assert retrieve_business_rules([1.0, 0.0], rules) == ["relevant rule", "irrelevant rule"]
+
+
+def test_business_rules_are_capped_at_max_rules():
+    rules = [{"rule_text": f"rule {i}", "embedding": [1.0, 0.0]} for i in range(10)]
+    assert len(retrieve_business_rules([1.0, 0.0], rules, max_rules=3)) == 3
+
+
+def test_a_rule_with_no_embedding_yet_still_comes_back_scored_last():
+    rules = [
+        {"rule_text": "no embedding yet", "embedding": None},
+        {"rule_text": "scored rule", "embedding": [1.0, 0.0]},
+    ]
+    assert retrieve_business_rules([1.0, 0.0], rules) == ["scored rule", "no embedding yet"]
+
+
+def test_examples_are_ranked_by_relevance_and_shaped_as_question_sql_pairs():
+    examples = [
+        {"question": "irrelevant", "sql": "SELECT 1", "embedding": [0.0, 1.0]},
+        {"question": "relevant", "sql": "SELECT 2", "embedding": [1.0, 0.0]},
+    ]
+    result = retrieve_examples([1.0, 0.0], examples)
+    assert result == [{"question": "relevant", "sql": "SELECT 2"}, {"question": "irrelevant", "sql": "SELECT 1"}]
+
+
+def test_examples_are_capped_at_max_examples():
+    examples = [
+        {"question": f"q{i}", "sql": "SELECT 1", "embedding": [1.0, 0.0]} for i in range(10)
+    ]
+    assert len(retrieve_examples([1.0, 0.0], examples, max_examples=2)) == 2
+
+
+# ---------------------------------------------------------------------------
 # service orchestration, against the real relational fixture
 # ---------------------------------------------------------------------------
 
@@ -365,7 +409,16 @@ class _ScriptedClaude:
         self.calls: list[dict] = []
         self.last_error = "the model declined"
 
-    def generate_sql(self, question, dialect, schema, prior_sql=None, prior_error=None):
+    def generate_sql(
+        self,
+        question,
+        dialect,
+        schema,
+        prior_sql=None,
+        prior_error=None,
+        business_rules=None,
+        examples=None,
+    ):
         self.calls.append(
             {
                 "question": question,
@@ -373,6 +426,8 @@ class _ScriptedClaude:
                 "schema": schema,
                 "prior_sql": prior_sql,
                 "prior_error": prior_error,
+                "business_rules": business_rules,
+                "examples": examples,
             }
         )
         if not self._answers:
@@ -614,3 +669,210 @@ def test_a_blank_question_is_rejected_by_validation(client, relational_workbook)
     response = client.post(f"/api/sessions/{session_id}/query", json={"question": ""})
 
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# confidence-based abstention and ambiguity resolution (C-2)
+# ---------------------------------------------------------------------------
+
+
+class _AmbiguousClaude(_ScriptedClaude):
+    """Also flags every question as ambiguous — proves the short-circuit never
+    reaches ``generate_sql`` at all."""
+
+    def __init__(self, answers, options):
+        super().__init__(answers)
+        self._options = options
+
+    def check_ambiguity(self, question, tables):
+        return {"ambiguous": True, "reason": "could mean several things", "options": self._options}
+
+
+def test_a_low_confidence_answer_is_abstained_not_executed(client, relational_workbook):
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    fake = _ScriptedClaude(
+        [
+            {
+                "sql": "SELECT COUNT(*) AS n FROM orders",
+                "explanation": "a guess",
+                "confidence": 0.1,
+            }
+        ]
+    )
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        result = services.answer_question(db, record, "how many orders, roughly?", claude=fake)
+
+    assert result["ok"] is False
+    assert result["outcome"] == "abstained"
+    assert result["confidence"] == pytest.approx(0.1)
+    assert "rows" not in result
+
+
+def test_a_high_confidence_answer_is_executed_and_recorded_as_answered(
+    client, relational_workbook
+):
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    fake = _ScriptedClaude(
+        [
+            {
+                "sql": "SELECT COUNT(*) AS n FROM orders",
+                "explanation": "counts orders",
+                "confidence": 0.9,
+            }
+        ]
+    )
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        result = services.answer_question(db, record, "how many orders?", claude=fake)
+
+    assert result["ok"] is True
+    assert result["outcome"] == "answered"
+    assert result["confidence"] == pytest.approx(0.9)
+
+
+def test_an_ambiguous_question_is_abstained_before_any_sql_is_attempted(
+    client, relational_workbook
+):
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    fake = _AmbiguousClaude([], ["how many orders by status?", "how many orders by city?"])
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        result = services.answer_question(db, record, "how many orders?", claude=fake)
+
+    assert result["ok"] is False
+    assert result["outcome"] == "abstained"
+    assert result["ambiguous"] is True
+    assert result["clarification_options"] == [
+        "how many orders by status?",
+        "how many orders by city?",
+    ]
+    # The ambiguity check ran instead of, not before, generation.
+    assert fake.calls == []
+
+
+def test_a_fake_with_no_confidence_or_ambiguity_support_still_answers(
+    client, relational_workbook
+):
+    """A test double that predates C-2 (no ``confidence`` key, no
+    ``check_ambiguity`` method) must keep answering exactly as it always did —
+    the same graceful-degradation contract ``suggest_followups`` already has."""
+
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    fake = _ScriptedClaude(
+        [{"sql": "SELECT COUNT(*) AS n FROM orders", "explanation": "counts orders"}]
+    )
+    assert not hasattr(fake, "check_ambiguity")
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        result = services.answer_question(db, record, "how many orders?", claude=fake)
+
+    assert result["ok"] is True
+    assert result["outcome"] == "answered"
+
+
+# ---------------------------------------------------------------------------
+# the third retrieval index, wired end to end (C-1)
+# ---------------------------------------------------------------------------
+
+
+def test_a_business_rule_is_retrieved_into_generation(client, relational_workbook):
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        services.add_business_rule(db, record, "only orders with status 'shipped' count as revenue")
+        db.commit()
+
+    fake = _ScriptedClaude(
+        [{"sql": "SELECT COUNT(*) AS n FROM orders", "explanation": "counts orders"}]
+    )
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        services.answer_question(db, record, "how many orders count as revenue?", claude=fake)
+
+    assert fake.calls[0]["business_rules"] == [
+        "only orders with status 'shipped' count as revenue"
+    ]
+
+
+def test_a_saved_example_is_retrieved_into_a_later_generation(client, relational_workbook):
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        services.save_query_example(
+            db, record, "how many orders are there?", "SELECT COUNT(*) AS n FROM orders"
+        )
+        db.commit()
+
+    fake = _ScriptedClaude(
+        [{"sql": "SELECT COUNT(*) AS n FROM orders", "explanation": "counts orders"}]
+    )
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        services.answer_question(db, record, "how many orders total?", claude=fake)
+
+    assert fake.calls[0]["examples"] == [
+        {"question": "how many orders are there?", "sql": "SELECT COUNT(*) AS n FROM orders"}
+    ]
+
+
+def test_business_rule_and_example_routes_round_trip(client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+
+    created = client.post(
+        f"/api/sessions/{session_id}/business-rules",
+        json={"rule_text": "returns are never counted as revenue"},
+    )
+    assert created.status_code == 201, created.text
+    rule_id = created.json()["id"]
+
+    listed = client.get(f"/api/sessions/{session_id}/business-rules")
+    assert [r["rule_text"] for r in listed.json()["rules"]] == [
+        "returns are never counted as revenue"
+    ]
+
+    deleted = client.delete(f"/api/sessions/{session_id}/business-rules/{rule_id}")
+    assert deleted.status_code == 204
+    assert client.get(f"/api/sessions/{session_id}/business-rules").json()["rules"] == []
+
+    saved = client.post(
+        f"/api/sessions/{session_id}/examples",
+        json={"question": "how many orders?", "sql": "SELECT COUNT(*) AS n FROM orders"},
+    )
+    assert saved.status_code == 201, saved.text
+    example_id = saved.json()["id"]
+    assert saved.json()["verified"] is True
+
+    examples = client.get(f"/api/sessions/{session_id}/examples")
+    assert len(examples.json()["examples"]) == 1
+
+    deleted_example = client.delete(f"/api/sessions/{session_id}/examples/{example_id}")
+    assert deleted_example.status_code == 204
+    assert client.get(f"/api/sessions/{session_id}/examples").json()["examples"] == []
+
+
+def test_an_example_with_sql_outside_the_export_is_rejected(client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+
+    response = client.post(
+        f"/api/sessions/{session_id}/examples",
+        json={"question": "list every user", "sql": "SELECT * FROM users"},
+    )
+
+    assert response.status_code == 409
