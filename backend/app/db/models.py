@@ -190,6 +190,12 @@ class IngestionSession(Base):
     name: Mapped[str] = mapped_column(String(255), default="Untitled session")
     status: Mapped[str] = mapped_column(String(40), default="created")
     source_files: Mapped[list] = mapped_column(JSON, default=list)
+    #: One content fingerprint per entry in ``source_files`` — a sha256 of an
+    #: uploaded file's bytes, or of a live connection's identity (host,
+    #: database, chosen tables; never the password). What
+    #: ``services.find_duplicate_session`` matches on, so the same source
+    #: cannot land in two sessions of the same account by accident.
+    source_fingerprints: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now

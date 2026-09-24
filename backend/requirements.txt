@@ -27,7 +27,9 @@ langgraph-checkpoint-postgres>=2.0
 langgraph-checkpoint-sqlite>=2.0
 
 # --- llm + embeddings ------------------------------------------------------
-anthropic>=0.40
+# OpenRouter exposes an OpenAI-compatible endpoint; the official openai SDK
+# talks to it via base_url, no separate client library needed.
+openai>=1.0.0
 sentence-transformers>=3.3
 
 # --- tests -----------------------------------------------------------------

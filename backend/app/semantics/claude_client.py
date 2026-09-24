@@ -1,8 +1,15 @@
-"""Claude API access.
+"""LLM access, backed by OpenRouter.
+
+The module, the class, and the ``source="claude"`` values stored in the
+database all still say "claude" — renaming them would ripple into routes,
+services, the frontend's status labels, and taxonomy rows already on disk —
+but every network call this file makes goes through OpenRouter's
+OpenAI-compatible endpoint (https://openrouter.ai), which itself proxies to
+whichever underlying model ``OPENROUTER_MODEL`` names.
 
 Two hard rules hold everywhere in this file:
 
-1. **Claude never sees raw data rows.**  Taxonomy classification gets ten
+1. **The model never sees raw data rows.**  Taxonomy classification gets ten
    sample values for one column; plan generation gets statistical summaries
    only.  This is a privacy and token-budget decision, and it is also why the
    platform scales to a ten-million-row database.
@@ -53,6 +60,48 @@ Allowed labels: %s
 
 Rules:
 - Pick "unknown" if the column's meaning is genuinely unclear from the evidence.
+- confidence must reflect real certainty; do not inflate it.
+- Never invent a label outside the allowed list.
+- Answer with the JSON object and nothing else."""
+
+TAXONOMY_BATCH_SYSTEM_PROMPT = """You label columns of business spreadsheets with a semantic taxonomy.
+
+You will be given one table and a list of its columns that a rule engine could \
+not confidently label: each with its name, its detected storage type, and at \
+most 10 sample values. For EACH column, choose the single label that best \
+describes what the column MEANS (not how it is stored).
+
+You must answer with JSON only, in exactly this shape:
+{"labels": [{"column": "<column name exactly as given>", "label": "<one label from the allowed list>", "confidence": <0.0-1.0>, "reasoning": "<one short sentence>"}]}
+
+Allowed labels: %s
+
+Rules:
+- Exactly one entry per column you were given, using the exact column name.
+- Judge each column independently on its own evidence — do not let one column's \
+label influence another's.
+- Pick "unknown" if a column's meaning is genuinely unclear from the evidence.
+- confidence must reflect real certainty; do not inflate it.
+- Never invent a label outside the allowed list.
+- Answer with the JSON object and nothing else."""
+
+TAXONOMY_DATASET_SYSTEM_PROMPT = """You label columns of business spreadsheets with a semantic taxonomy.
+
+You will be given every table of ONE dataset, each with the columns a rule engine \
+could not confidently label: each column's name, its detected storage type, and at \
+most 10 sample values. For EACH column of EACH table, choose the single label that \
+best describes what the column MEANS (not how it is stored).
+
+You must answer with JSON only, in exactly this shape:
+{"labels": [{"table": "<table name exactly as given>", "column": "<column name exactly as given>", "label": "<one label from the allowed list>", "confidence": <0.0-1.0>, "reasoning": "<one short sentence>"}]}
+
+Allowed labels: %s
+
+Rules:
+- Exactly one entry per column you were given, using the exact table and column names.
+- Judge each column independently on its own evidence — do not let one column's \
+label influence another's, even within the same table.
+- Pick "unknown" if a column's meaning is genuinely unclear from the evidence.
 - confidence must reflect real certainty; do not inflate it.
 - Never invent a label outside the allowed list.
 - Answer with the JSON object and nothing else."""
@@ -139,6 +188,28 @@ Answer with JSON only, in exactly this shape:
 
 Rules:
 - One entry per column you were given, using the exact column name.
+- One sentence each, no bullet points, no markdown.
+- Describe meaning, not storage ("total value of the sale in BDT", not "a float").
+- Do not invent business context the evidence does not support.
+- Answer with the JSON object and nothing else."""
+
+DESCRIBE_DATASET_SYSTEM_PROMPT = """You write one-sentence semantic descriptions of spreadsheet columns.
+
+You receive every table of ONE dataset: its name, and for each column the detected \
+storage type, the semantic taxonomy label, and at most five sample values. Never a \
+full data row.
+
+For every column of every table, write the single sentence a business analyst would \
+use to explain what that column holds and what it is for — what it measures or \
+identifies, whether it can be summed, and how it relates to the table it belongs to. \
+These descriptions are embedded for semantic search, so include the words someone \
+would naturally use when asking a question about this column.
+
+Answer with JSON only, in exactly this shape:
+{"columns": [{"table": "<table name exactly as given>", "name": "<column name exactly as given>", "description": "<one sentence>"}]}
+
+Rules:
+- Exactly one entry per column you were given, using the exact table and column names.
 - One sentence each, no bullet points, no markdown.
 - Describe meaning, not storage ("total value of the sale in BDT", not "a float").
 - Do not invent business context the evidence does not support.
@@ -289,26 +360,29 @@ def _extract_json(text: str) -> Any:
 
 
 class ClaudeClient:
-    """Thin wrapper over the Anthropic Messages API."""
+    """Thin wrapper over OpenRouter's OpenAI-compatible chat completions endpoint."""
 
     def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
         settings = get_settings()
         self._api_key = api_key or settings.resolved_api_key()
-        self._model = model or settings.claude_model
-        self._max_tokens = settings.claude_max_tokens
-        self._timeout = settings.claude_timeout_seconds
-        self._effort = settings.claude_effort
+        self._model = model or settings.openrouter_model
+        self._max_tokens = settings.openrouter_max_tokens
+        self._timeout = settings.openrouter_timeout_seconds
         self._client: Any = None
         self.last_error: str | None = None
         if not self._api_key:
-            self.last_error = "ANTHROPIC_API_KEY is not set"
+            self.last_error = "OPENROUTER_API_KEY is not set"
             return
         try:
-            from anthropic import Anthropic  # noqa: PLC0415
+            from openai import OpenAI  # noqa: PLC0415
 
-            self._client = Anthropic(api_key=self._api_key, timeout=self._timeout)
+            self._client = OpenAI(
+                api_key=self._api_key,
+                base_url="https://openrouter.ai/api/v1",
+                timeout=self._timeout,
+            )
         except Exception as exc:  # pragma: no cover - import/config failure
-            self.last_error = f"anthropic client unavailable: {exc}"
+            self.last_error = f"openrouter client unavailable: {exc}"
             logger.warning(self.last_error)
 
     @property
@@ -327,72 +401,75 @@ class ClaudeClient:
         }
 
     # -- low level -------------------------------------------------------
-    def _complete(self, system: str, user: str, max_tokens: int | None = None) -> str | None:
+    def _complete(
+        self,
+        system: str,
+        user: str,
+        max_tokens: int | None = None,
+        json_mode: bool = True,
+    ) -> str | None:
         if not self.available:
             return None
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens or self._max_tokens,
+            "temperature": 0.0,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
         try:
-            response = self._client.messages.create(
-                model=self._model,
-                max_tokens=max_tokens or self._max_tokens,
-                output_config={"effort": self._effort},
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
+            response = self._client.chat.completions.create(**kwargs)
         except Exception as exc:
-            self.last_error = str(exc)
-            logger.warning("Claude call failed: %s", exc)
+            if json_mode:
+                # Not every free OpenRouter model honours structured JSON
+                # output; retry once in plain text and let _extract_json
+                # pull the object out of whatever prose comes back.
+                kwargs.pop("response_format", None)
+                try:
+                    response = self._client.chat.completions.create(**kwargs)
+                except Exception as exc2:
+                    self.last_error = str(exc2)
+                    logger.warning("OpenRouter call failed: %s", exc2)
+                    return None
+            else:
+                self.last_error = str(exc)
+                logger.warning("OpenRouter call failed: %s", exc)
+                return None
+
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            self.last_error = "the model returned no choices"
+            logger.warning("OpenRouter call produced no choices")
             return None
 
-        # A refusal is a successful HTTP call with no usable content; treat it
-        # like any other unavailable answer so the caller falls back.
-        if getattr(response, "stop_reason", None) == "refusal":
-            self.last_error = "the model declined this request"
-            logger.warning("Claude declined the request")
+        # A refusal/content-filter block is a successful HTTP call with no
+        # usable content; treat it like any other unavailable answer so the
+        # caller falls back.
+        finish_reason = getattr(choices[0], "finish_reason", None)
+        if finish_reason == "length":
+            self.last_error = "the model's reply was cut off (raise OPENROUTER_MAX_TOKENS)"
+            logger.warning("OpenRouter reply hit the token limit — JSON is likely truncated")
+        elif finish_reason == "content_filter":
+            self.last_error = "the model declined this request (content filter)"
+            logger.warning("OpenRouter declined the request: content filter")
             return None
-        if getattr(response, "stop_reason", None) == "max_tokens":
-            self.last_error = "the model's reply was cut off (raise CLAUDE_MAX_TOKENS)"
-            logger.warning("Claude reply hit max_tokens — JSON is likely truncated")
 
-        parts = [block.text for block in response.content if getattr(block, "type", "") == "text"]
-        return "\n".join(parts).strip() or None
+        text = (getattr(choices[0].message, "content", None) or "").strip()
+        return text or None
 
     # -- Phase 1 ---------------------------------------------------------
-    def classify_taxonomy(
-        self,
-        column_name: str,
-        table_name: str,
-        column_type: str,
-        samples: list[str],
-    ) -> TaxonomyDecision | None:
-        """Label one column the rule engine could not claim."""
+    @staticmethod
+    def _taxonomy_decision(label_raw: Any, confidence_raw: Any, reasoning_raw: Any) -> TaxonomyDecision:
+        """Shared validation between :meth:`classify_taxonomy` and its batch sibling."""
 
-        payload = {
-            "table": table_name,
-            "column": column_name,
-            "detected_type": column_type,
-            "sample_values": samples[:10],
-        }
-        raw = self._complete(
-            TAXONOMY_SYSTEM_PROMPT % ", ".join(TAXONOMY_LABELS),
-            json.dumps(payload, ensure_ascii=False, default=str),
-            # The JSON answer is tiny, but max_tokens also has to cover the
-            # model's thinking; 300 truncates before the reply is ever written.
-            max_tokens=min(self._max_tokens, 4096),
-        )
-        if raw is None:
-            return None
+        label = str(label_raw or "").strip().lower()
+        reasoning = str(reasoning_raw or "")
         try:
-            parsed = _extract_json(raw)
-        except ValueError:
-            logger.warning("Claude taxonomy response was not JSON: %r", raw[:200])
-            return None
-        if not isinstance(parsed, dict):
-            return None
-
-        label = str(parsed.get("label", "")).strip().lower()
-        reasoning = str(parsed.get("reasoning", "") or "")
-        try:
-            confidence = float(parsed.get("confidence", 0.0))
+            confidence = float(confidence_raw)
         except (TypeError, ValueError):
             confidence = 0.0
 
@@ -413,6 +490,170 @@ class ClaudeClient:
             source="claude",
             reasoning=reasoning or None,
         )
+
+    def classify_taxonomy(
+        self,
+        column_name: str,
+        table_name: str,
+        column_type: str,
+        samples: list[str],
+    ) -> TaxonomyDecision | None:
+        """Label one column the rule engine could not claim.
+
+        Prefer :meth:`classify_taxonomy_batch` when labelling more than one
+        column of the same table — it does the same job in one request
+        instead of one per column.
+        """
+
+        payload = {
+            "table": table_name,
+            "column": column_name,
+            "detected_type": column_type,
+            "sample_values": samples[:10],
+        }
+        raw = self._complete(
+            TAXONOMY_SYSTEM_PROMPT % ", ".join(TAXONOMY_LABELS),
+            json.dumps(payload, ensure_ascii=False, default=str),
+            # The JSON answer is tiny, but max_tokens also has to cover the
+            # model's thinking; 300 truncates before the reply is ever written.
+            max_tokens=min(self._max_tokens, 4096),
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("OpenRouter taxonomy response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        return self._taxonomy_decision(
+            parsed.get("label"), parsed.get("confidence", 0.0), parsed.get("reasoning")
+        )
+
+    def classify_taxonomy_batch(
+        self,
+        table_name: str,
+        columns: list[dict[str, Any]],
+    ) -> dict[str, TaxonomyDecision] | None:
+        """Label every rule-unresolved column of one table in a single call.
+
+        Same evidence boundary as :meth:`classify_taxonomy` — name, detected
+        type, at most ten sample values — but one request per *table* rather
+        than one per column.  A wide table can leave a couple dozen columns
+        unclaimed by the rule engine, and paying network latency (plus a
+        rate-limited free-tier quota) once per column instead of once per
+        table made Phase 1 unusably slow.
+
+        ``columns`` is a list of ``{"column", "detected_type",
+        "sample_values"}`` dicts (mirroring :meth:`classify_taxonomy`'s
+        arguments). Returns ``{column_name: TaxonomyDecision}`` — missing
+        entries mean the model skipped that column, and the caller falls back
+        to ``unknown`` for those same as it would for a ``None`` result.
+        """
+
+        if not columns:
+            return {}
+        payload = {"table": table_name, "columns": columns}
+        raw = self._complete(
+            TAXONOMY_BATCH_SYSTEM_PROMPT % ", ".join(TAXONOMY_LABELS),
+            json.dumps(payload, ensure_ascii=False, default=str),
+            max_tokens=min(self._max_tokens, 300 * len(columns) + 1000),
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("OpenRouter batch taxonomy response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        entries = parsed.get("labels")
+        if not isinstance(entries, list):
+            return None
+        known = {str(c.get("column", "")) for c in columns}
+        decisions: dict[str, TaxonomyDecision] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("column", "")).strip()
+            # A label for a column that does not exist is a hallucination;
+            # drop it rather than store it against the wrong column.
+            if name not in known:
+                continue
+            decisions[name] = self._taxonomy_decision(
+                entry.get("label"), entry.get("confidence", 0.0), entry.get("reasoning")
+            )
+        return decisions
+
+    def classify_taxonomy_dataset(
+        self,
+        tables: list[dict[str, Any]],
+    ) -> dict[str, dict[str, TaxonomyDecision]] | None:
+        """Label every rule-unresolved column of an entire dataset in one call.
+
+        Same evidence boundary as :meth:`classify_taxonomy` — name, detected
+        type, at most ten sample values per column — but one request for the
+        *whole dataset* rather than one per table or one per column. This is
+        what :func:`app.semantics.pipeline.analyze_tables` calls so that
+        Phase 1 costs exactly one LLM request no matter how many sheets or
+        columns a dataset has.
+
+        ``tables`` is ``[{"table": name, "columns": [{"column",
+        "detected_type", "sample_values"}, ...]}, ...]`` — one entry per
+        table that has at least one rule-unresolved column. Returns
+        ``{table_name: {column_name: TaxonomyDecision}}``; a table or column
+        missing from the result means the model skipped it, and the caller
+        falls back to ``unknown`` for those same as it would for a ``None``
+        result.
+        """
+
+        if not tables:
+            return {}
+        raw = self._complete(
+            TAXONOMY_DATASET_SYSTEM_PROMPT % ", ".join(TAXONOMY_LABELS),
+            json.dumps({"tables": tables}, ensure_ascii=False, default=str),
+            max_tokens=min(
+                self._max_tokens,
+                300 * sum(len(t.get("columns", [])) for t in tables) + 1000,
+            ),
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("OpenRouter dataset taxonomy response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        entries = parsed.get("labels")
+        if not isinstance(entries, list):
+            return None
+        known = {
+            (str(t.get("table", "")), str(c.get("column", "")))
+            for t in tables
+            for c in t.get("columns", [])
+        }
+        decisions: dict[str, dict[str, TaxonomyDecision]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            table_name = str(entry.get("table", "")).strip()
+            column_name = str(entry.get("column", "")).strip()
+            # A label for a table/column pair that was not sent is a
+            # hallucination; drop it rather than store it against the wrong
+            # column.
+            if (table_name, column_name) not in known:
+                continue
+            decisions.setdefault(table_name, {})[column_name] = self._taxonomy_decision(
+                entry.get("label"), entry.get("confidence", 0.0), entry.get("reasoning")
+            )
+        return decisions
 
     def describe_columns(
         self,
@@ -444,7 +685,7 @@ class ClaudeClient:
         try:
             parsed = _extract_json(raw)
         except ValueError:
-            logger.warning("Claude description response was not JSON: %r", raw[:200])
+            logger.warning("OpenRouter description response was not JSON: %r", raw[:200])
             return None
         if not isinstance(parsed, dict):
             return None
@@ -463,6 +704,68 @@ class ClaudeClient:
             # drop it rather than store it against the wrong column.
             if name in known and description:
                 descriptions[name] = description
+        return descriptions
+
+    def describe_columns_dataset(
+        self,
+        tables: list[dict[str, Any]],
+    ) -> dict[str, dict[str, str]] | None:
+        """Rich semantic descriptions for every table's columns, in one call.
+
+        Same evidence boundary as :meth:`describe_columns` — detected type,
+        taxonomy label, five sample values, never a data row — but one
+        request for the whole dataset instead of one per table, so Phase 1
+        costs one taxonomy call (:meth:`classify_taxonomy_dataset`) plus one
+        description call, no matter how many sheets the dataset has.
+
+        ``tables`` is ``[{"table": name, "columns": [...]}, ...]`` (the same
+        per-column payload shape :meth:`describe_columns` takes). Returns
+        ``{table_name: {column_name: description}}``; the caller falls back
+        to its deterministic template for anything missing, same as it would
+        for a ``None`` result.
+        """
+
+        if not tables:
+            return {}
+        total_columns = sum(len(t.get("columns", [])) for t in tables)
+        if total_columns == 0:
+            return {}
+        raw = self._complete(
+            DESCRIBE_DATASET_SYSTEM_PROMPT,
+            json.dumps({"tables": tables}, ensure_ascii=False, default=str),
+            max_tokens=min(self._max_tokens, 200 * total_columns + 500),
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("OpenRouter dataset description response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        entries = parsed.get("columns")
+        if not isinstance(entries, list):
+            return None
+        known = {
+            (str(t.get("table", "")), str(c.get("name", "")))
+            for t in tables
+            for c in t.get("columns", [])
+        }
+        descriptions: dict[str, dict[str, str]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            table_name = str(entry.get("table", "")).strip()
+            column_name = str(entry.get("name", "")).strip()
+            description = str(entry.get("description", "") or "").strip()
+            # A description for a table/column pair that was not sent is a
+            # hallucination; drop it rather than store it against the wrong
+            # column.
+            if (table_name, column_name) not in known or not description:
+                continue
+            descriptions.setdefault(table_name, {})[column_name] = description
         return descriptions
 
     def describe_tables(self, tables: list[dict[str, Any]]) -> dict[str, str] | None:
@@ -489,7 +792,7 @@ class ClaudeClient:
         try:
             parsed = _extract_json(raw)
         except ValueError:
-            logger.warning("Claude table description response was not JSON: %r", raw[:200])
+            logger.warning("OpenRouter table description response was not JSON: %r", raw[:200])
             return None
         if not isinstance(parsed, dict):
             return None
@@ -531,6 +834,7 @@ class ClaudeClient:
             RELATIONSHIP_SYSTEM_PROMPT,
             json.dumps(candidate, ensure_ascii=False, default=str),
             max_tokens=min(self._max_tokens, 4096),
+            json_mode=False,
         )
         if raw is None:
             return None
@@ -558,7 +862,7 @@ class ClaudeClient:
         (:func:`app.query.retrieval.schema_context`): table and column names,
         types and roles, at most five example values per column.  No row of
         the actual table is ever part of this call, the same boundary every
-        other Claude call in this platform holds.
+        other OpenRouter call in this platform holds.
 
         ``business_rules``/``examples`` are the third retrieval index
         (:func:`app.query.retrieval.retrieve_business_rules` /
@@ -595,7 +899,7 @@ class ClaudeClient:
         try:
             parsed = _extract_json(raw)
         except ValueError:
-            logger.warning("Claude SQL response was not JSON: %r", raw[:200])
+            logger.warning("OpenRouter SQL response was not JSON: %r", raw[:200])
             return None
         if not isinstance(parsed, dict):
             return None
@@ -623,7 +927,7 @@ class ClaudeClient:
         generation — "before any SQL is generated" (§3.1.6). ``None`` (no
         client, or an unusable reply) degrades to "not ambiguous": the
         generate → guard → EXPLAIN loop still runs, the same way every other
-        optional Claude call in this file leaves the deterministic path intact
+        optional OpenRouter call in this file leaves the deterministic path intact
         when the model is unavailable.
         """
 
@@ -637,7 +941,7 @@ class ClaudeClient:
         try:
             parsed = _extract_json(raw)
         except ValueError:
-            logger.warning("Claude ambiguity response was not JSON: %r", raw[:200])
+            logger.warning("OpenRouter ambiguity response was not JSON: %r", raw[:200])
             return None
         if not isinstance(parsed, dict):
             return None
@@ -672,7 +976,7 @@ class ClaudeClient:
         try:
             parsed = _extract_json(raw)
         except ValueError:
-            logger.warning("Claude suggested-questions response was not JSON: %r", raw[:200])
+            logger.warning("OpenRouter suggested-questions response was not JSON: %r", raw[:200])
             return None
         if not isinstance(parsed, dict):
             return None
@@ -707,7 +1011,7 @@ class ClaudeClient:
         try:
             parsed = _extract_json(raw)
         except ValueError:
-            logger.warning("Claude follow-up response was not JSON: %r", raw[:200])
+            logger.warning("OpenRouter follow-up response was not JSON: %r", raw[:200])
             return None
         if not isinstance(parsed, dict):
             return None
@@ -722,16 +1026,24 @@ class ClaudeClient:
         raw = self._complete(
             PLAN_SYSTEM_PROMPT,
             json.dumps(summary, ensure_ascii=False, default=str),
+            # This prompt's contract is a top-level JSON *array*, which
+            # conflicts with response_format: json_object (that mode forces
+            # an object) — some models then wrap a single step directly
+            # instead of {"steps": [...]}. Leave JSON mode off here and rely
+            # on _extract_json's bracket matching instead.
+            json_mode=False,
         )
         if raw is None:
             return None
         try:
             parsed = _extract_json(raw)
         except ValueError:
-            logger.warning("Claude plan response was not JSON: %r", raw[:200])
+            logger.warning("OpenRouter plan response was not JSON: %r", raw[:200])
             return None
         if isinstance(parsed, dict):
-            parsed = parsed.get("steps", [])
+            # A model that ignores the "array" instruction may hand back
+            # either {"steps": [...]} or a single step object directly.
+            parsed = parsed.get("steps", [parsed] if "type" in parsed else [])
         if not isinstance(parsed, list):
             return None
         return [step for step in parsed if isinstance(step, dict)]

@@ -13,11 +13,11 @@ from typing import Any, Iterable, Mapping
 import pandas as pd
 
 from app.core.config import get_settings
-from app.core.schemas import ColumnProfile, ColumnType
+from app.core.schemas import TAXONOMY_UNKNOWN, ColumnProfile, ColumnType
 from app.ingestion.cleaning import ColumnCleanReport
 from app.semantics.column_types import detect_column_type
 from app.semantics.profiling import basic_stats, profile_series, sample_values
-from app.semantics.taxonomy import classify_column
+from app.semantics.taxonomy import TaxonomyDecision, classify_by_rules, sample_strings
 
 
 @dataclass(slots=True)
@@ -47,33 +47,71 @@ def _currency_symbols(reports: Iterable[ColumnCleanReport] | None) -> dict[str, 
     }
 
 
-def analyze_table(
-    table: str,
-    df: pd.DataFrame,
-    clean_reports: Iterable[ColumnCleanReport] | None = None,
-    claude=None,
-    original_names: Mapping[str, str] | None = None,
-) -> TableSemantics:
-    """Full Phase 1 pass over one sheet."""
+def _collect_table(
+    table: str, df: pd.DataFrame, symbols: Mapping[str, str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Rule pass + sample collection for one sheet — no network call.
+
+    Returns ``(rows, pending)``: ``rows`` carries everything needed to build
+    this table's :class:`ColumnProfile` list once taxonomy decisions are
+    known, and ``pending`` is the ``classify_taxonomy_batch`` /
+    ``classify_taxonomy_dataset`` payload for the columns the rule engine
+    left unclaimed.
+    """
 
     settings = get_settings()
-    symbols = _currency_symbols(clean_reports)
-    originals = dict(original_names or {})
-    semantics = TableSemantics(table=table, row_count=int(len(df)))
-
+    rows: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
     for raw_column in df.columns:
         column = str(raw_column)
         series = df[raw_column]
-        stats = basic_stats(series)
-
         type_decision = detect_column_type(series, column, symbols.get(column))
-        taxonomy = classify_column(
-            name=column,
-            table=table,
-            column_type=type_decision.column_type,
-            series=series,
-            claude=claude,
-            sample_limit=settings.taxonomy_sample_values,
+        taxonomy = classify_by_rules(column, type_decision.column_type, series)
+        samples = sample_strings(series, settings.taxonomy_sample_values)
+        rows.append(
+            {
+                "column": column,
+                "series": series,
+                "stats": basic_stats(series),
+                "type_decision": type_decision,
+                "taxonomy": taxonomy,
+            }
+        )
+        if taxonomy is None:
+            pending.append(
+                {
+                    "column": column,
+                    "detected_type": type_decision.column_type.value,
+                    "sample_values": samples,
+                }
+            )
+    return rows, pending
+
+
+def _assemble_table(
+    table: str,
+    row_count: int,
+    rows: list[dict[str, Any]],
+    decisions: Mapping[str, TaxonomyDecision],
+    original_names: Mapping[str, str] | None,
+) -> TableSemantics:
+    """Builds a :class:`TableSemantics` from ``_collect_table``'s output plus
+    whatever taxonomy decisions the LLM returned for its ``pending`` columns."""
+
+    settings = get_settings()
+    originals = dict(original_names or {})
+    semantics = TableSemantics(table=table, row_count=row_count)
+
+    for row in rows:
+        column = row["column"]
+        series = row["series"]
+        stats = row["stats"]
+        type_decision = row["type_decision"]
+        taxonomy = row["taxonomy"] or decisions.get(column) or TaxonomyDecision(
+            label=TAXONOMY_UNKNOWN,
+            confidence=0.0,
+            source="fallback",
+            reasoning="No rule matched and no LLM label was available — label manually.",
         )
 
         semantics.columns.append(
@@ -101,15 +139,65 @@ def analyze_table(
     return semantics
 
 
+def analyze_table(
+    table: str,
+    df: pd.DataFrame,
+    clean_reports: Iterable[ColumnCleanReport] | None = None,
+    claude=None,
+    original_names: Mapping[str, str] | None = None,
+) -> TableSemantics:
+    """Full Phase 1 pass over one sheet.
+
+    Taxonomy classification runs in two passes: the rule engine first
+    (instant, free, no network), then a *single* LLM call for every column
+    of this table the rules left unclaimed — not one call per unclaimed
+    column.  Labelling more than one sheet at once (the common case) should
+    go through :func:`analyze_tables` instead, which batches across every
+    sheet in one further call.
+    """
+
+    symbols = _currency_symbols(clean_reports)
+    rows, pending = _collect_table(table, df, symbols)
+
+    decisions: dict[str, TaxonomyDecision] = {}
+    if pending and claude is not None and claude.available:
+        decisions = claude.classify_taxonomy_batch(table, pending) or {}
+
+    return _assemble_table(table, int(len(df)), rows, decisions, original_names)
+
+
 def analyze_tables(
     tables: Mapping[str, pd.DataFrame],
     clean_reports: Mapping[str, Iterable[ColumnCleanReport]] | None = None,
     claude=None,
 ) -> dict[str, TableSemantics]:
+    """Full Phase 1 pass over every sheet of a dataset.
+
+    Every rule-unresolved column of every table is sent to the LLM in ONE
+    request (:meth:`~app.semantics.claude_client.ClaudeClient.classify_taxonomy_dataset`),
+    not one request per table and not one per column — the naive per-column
+    version made Phase 1 take minutes and burn through a rate-limited
+    free-tier quota on a dataset with more than a handful of unclaimed
+    columns.
+    """
+
     reports = clean_reports or {}
+    collected: dict[str, tuple[list[dict[str, Any]], int]] = {}
+    dataset_pending: list[dict[str, Any]] = []
+    for name, df in tables.items():
+        symbols = _currency_symbols(reports.get(name))
+        rows, pending = _collect_table(name, df, symbols)
+        collected[name] = (rows, int(len(df)))
+        if pending:
+            dataset_pending.append({"table": name, "columns": pending})
+
+    decisions: dict[str, dict[str, TaxonomyDecision]] = {}
+    if dataset_pending and claude is not None and claude.available:
+        decisions = claude.classify_taxonomy_dataset(dataset_pending) or {}
+
     return {
-        name: analyze_table(name, df, reports.get(name), claude=claude)
-        for name, df in tables.items()
+        name: _assemble_table(name, row_count, rows, decisions.get(name, {}), None)
+        for name, (rows, row_count) in collected.items()
     }
 
 

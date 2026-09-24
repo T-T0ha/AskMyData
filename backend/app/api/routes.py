@@ -273,6 +273,25 @@ def _our_database_failed(exc: SQLAlchemyError) -> HTTPException:
     return HTTPException(status_code=500, detail=detail)
 
 
+def _duplicate_source(exc: services.DuplicateSourceError) -> HTTPException:
+    """This account already has this exact source, in another session.
+
+    409 rather than 422: nothing about the upload is wrong, the request just
+    conflicts with data that already exists. The existing session's id and
+    name ride along so the client can offer to open it instead of erroring out.
+    """
+
+    existing = exc.existing_session
+    return HTTPException(
+        status_code=409,
+        detail={
+            "message": f'This data is already in "{existing.name}" — open it instead of uploading it again.',
+            "existing_session_id": existing.id,
+            "existing_session_name": existing.name,
+        },
+    )
+
+
 @router.post("/sessions", status_code=201)
 def create_session(
     body: SessionCreate,
@@ -353,6 +372,9 @@ def upload(
 
     try:
         sheets = services.ingest_file(db, record, destination)
+    except services.DuplicateSourceError as exc:
+        destination.unlink(missing_ok=True)
+        raise _duplicate_source(exc) from exc
     except SQLAlchemyError as exc:
         logger.exception("storing %s failed", destination)
         raise _our_database_failed(exc) from exc
@@ -404,6 +426,8 @@ def connect_database(
 
     try:
         sheets = services.ingest_database(db, record, body.url, body.tables or None)
+    except services.DuplicateSourceError as exc:
+        raise _duplicate_source(exc) from exc
     except SourceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except SQLAlchemyError as exc:

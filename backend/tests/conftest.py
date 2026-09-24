@@ -24,7 +24,8 @@ def _isolated_environment(tmp_path_factory: pytest.TempPathFactory) -> None:
     root = tmp_path_factory.mktemp("semanticlayer")
     os.environ["DATABASE_URL"] = f"sqlite:///{root / 'test.db'}"
     os.environ["UPLOAD_DIR"] = str(root / "uploads")
-    os.environ["ANTHROPIC_API_KEY"] = ""
+    os.environ["OPENROUTER_API_KEY"] = ""
+    os.environ["openrouter_api_key"] = ""
     # scrypt at the production work factor costs ~60 ms and ~16 MB per hash;
     # every authenticated test pays it at least twice.  The algorithm under
     # test is the same one either way — only the cost differs — and the

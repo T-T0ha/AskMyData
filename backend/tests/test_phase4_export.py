@@ -837,16 +837,20 @@ def test_a_table_too_small_to_analyse_is_still_exported(client):
     ]
 
 
-def test_deleting_the_account_drops_every_schema_it_materialized(client, relational_workbook):
+def test_deleting_the_account_drops_every_schema_it_materialized(
+    client, relational_workbook, clean_workbook
+):
     """FR-15, at the account level.
 
     Deleting the dataset was already covered; an account holds several, and a
     ``ds_…`` schema left behind by a deleted account holds the rows themselves
-    in a database that keeps running.
+    in a database that keeps running. The two sessions need distinct source
+    files — same-account duplicate-source detection would otherwise reject
+    the second upload before this test ever gets to deletion.
     """
 
     first = _uploaded(client, relational_workbook)
-    second = _uploaded(client, relational_workbook)
+    second = _uploaded(client, clean_workbook)
     client.post(f"/api/sessions/{first}/export")
     client.post(f"/api/sessions/{second}/export")
 

@@ -45,6 +45,7 @@ from app.export.quality import build_quality_report
 from app.export.runner import drop_export, explain, read_semantic_layer, run_export, run_readonly
 from app.export.schema import build_plan
 from app.ingestion.equivalence import detect_equivalences
+from app.ingestion.fingerprint import database_fingerprint, file_fingerprint
 from app.ingestion.keys import KeyAnalysis, confirm_key, decline_key, is_unique_key
 from app.ingestion.loader import load_file_source
 from app.ingestion.relational import display_url, load_relational_tables
@@ -117,10 +118,46 @@ def list_sessions(db: Session, owner_id: str) -> list[IngestionSession]:
 # ---------------------------------------------------------------------------
 
 
+class DuplicateSourceError(Exception):
+    """A source's fingerprint matches one the same account already ingested.
+
+    Carries the existing session so the API can point the caller at it —
+    the useful response to "you already have this" is a link to it, not a
+    bare refusal.
+    """
+
+    def __init__(self, existing_session: IngestionSession) -> None:
+        self.existing_session = existing_session
+        super().__init__(f"already ingested as session {existing_session.id!r}")
+
+
+def find_duplicate_session(
+    db: Session, record: IngestionSession, fingerprint: str
+) -> IngestionSession | None:
+    """Another session of the same account that already has this fingerprint.
+
+    Ownerless sessions (predating authentication) are never matched — there is
+    no account to have "already" ingested anything into.
+    """
+
+    if not record.user_id:
+        return None
+    for other in list_sessions(db, record.user_id):
+        if other.id != record.id and fingerprint in (other.source_fingerprints or []):
+            return other
+    return None
+
+
 def ingest_file(db: Session, record: IngestionSession, path: Path) -> list[SheetRecord]:
     """Run Phase 0 over one uploaded file and persist the results."""
 
-    return _persist_results(db, record, load_file_source(path), source_label=path.name)
+    fingerprint = file_fingerprint(path)
+    duplicate = find_duplicate_session(db, record, fingerprint)
+    if duplicate is not None:
+        raise DuplicateSourceError(duplicate)
+    sheets = _persist_results(db, record, load_file_source(path), source_label=path.name)
+    record.source_fingerprints = [*(record.source_fingerprints or []), fingerprint]
+    return sheets
 
 
 def ingest_database(
@@ -136,8 +173,14 @@ def ingest_database(
     credentials is a liability the platform has no reason to take on.
     """
 
+    fingerprint = database_fingerprint(url, tables)
+    duplicate = find_duplicate_session(db, record, fingerprint)
+    if duplicate is not None:
+        raise DuplicateSourceError(duplicate)
     results = load_relational_tables(url, tables=tables)
-    return _persist_results(db, record, results, source_label=display_url(url))
+    sheets = _persist_results(db, record, results, source_label=display_url(url))
+    record.source_fingerprints = [*(record.source_fingerprints or []), fingerprint]
+    return sheets
 
 
 def _persist_results(
@@ -374,10 +417,11 @@ def _semantic_description(column: ColumnSemantics, table_type: str = "data table
 def _describe_columns(rows: list[ColumnSemantics], claude=None) -> None:
     """Phase 1's final step — rich semantic descriptions for pgvector.
 
-    One Claude call per table (never per column).  Claude sees column names,
-    detected types, taxonomy labels and five sample values — never a data row.
-    Any column Claude does not return keeps its deterministic description, so a
-    partial response degrades instead of leaving a gap.
+    One Claude call for the WHOLE dataset (never per table, never per
+    column).  Claude sees column names, detected types, taxonomy labels and
+    five sample values — never a data row.  Any column Claude does not
+    return keeps its deterministic description, so a partial response
+    degrades instead of leaving a gap.
     """
 
     if not rows or claude is None or not claude.available:
@@ -388,27 +432,34 @@ def _describe_columns(rows: list[ColumnSemantics], claude=None) -> None:
         by_table.setdefault(row.table_name, []).append(row)
 
     settings = get_settings()
+    tables_payload = [
+        {
+            "table": table_name,
+            "columns": [
+                {
+                    "name": column.column_name,
+                    "detected_type": column.effective_type,
+                    "taxonomy": column.effective_label,
+                    "null_ratio": round(column.null_ratio, 3),
+                    "is_additive": column.is_additive,
+                    "sample_values": (column.sample_values or [])[: settings.plan_sample_values],
+                }
+                for column in columns
+            ],
+        }
+        for table_name, columns in by_table.items()
+    ]
+    try:
+        descriptions = claude.describe_columns_dataset(tables_payload)
+    except Exception as exc:  # pragma: no cover - defensive, network dependent
+        logger.warning("column description failed: %s", exc)
+        return
+    if not descriptions:
+        return
     for table_name, columns in by_table.items():
-        payload = [
-            {
-                "name": column.column_name,
-                "detected_type": column.effective_type,
-                "taxonomy": column.effective_label,
-                "null_ratio": round(column.null_ratio, 3),
-                "is_additive": column.is_additive,
-                "sample_values": (column.sample_values or [])[: settings.plan_sample_values],
-            }
-            for column in columns
-        ]
-        try:
-            descriptions = claude.describe_columns(table_name, payload)
-        except Exception as exc:  # pragma: no cover - defensive, network dependent
-            logger.warning("column description failed for %s: %s", table_name, exc)
-            continue
-        if not descriptions:
-            continue
+        table_descriptions = descriptions.get(table_name, {})
         for column in columns:
-            described = descriptions.get(column.column_name)
+            described = table_descriptions.get(column.column_name)
             if described:
                 column.semantic_description = described
 

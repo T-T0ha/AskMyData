@@ -174,6 +174,8 @@ _ADDED_COLUMNS: dict[str, dict[str, "str | Callable[[], str]"]] = {
         "db_schema_name": "VARCHAR(100)",
         "semantic_version": "INTEGER DEFAULT 0",
         "enriched_at": _timestamp_ddl,
+        # Cross-session duplicate detection, added alongside the sessions list.
+        "source_fingerprints": "JSON",
     },
     # The column-name embeddings a cross-sheet equivalence score was computed
     # from, added so the prior is inspectable rather than discarded the

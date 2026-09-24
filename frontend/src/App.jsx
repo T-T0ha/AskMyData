@@ -32,6 +32,7 @@ import { DashboardPanel } from './components/DashboardPanel'
 import { PlanBoard } from './components/PlanBoard'
 import { QualityReportPanel } from './components/QualityReportPanel'
 import { QueryPanel } from './components/QueryPanel'
+import { SessionSwitcher } from './components/SessionSwitcher'
 import { SourcePicker } from './components/SourcePicker'
 import { CleaningProgress, CleaningSummary, StepValidation } from './components/StepValidation'
 import { TriageBoard } from './components/TriageBoard'
@@ -109,6 +110,10 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false)
   const [sessionId, setSessionId] = useState(null)
   const [session, setSession] = useState(null)
+  //: Every dataset this account has ever created — the list behind the
+  //: "Your databases" switcher. Kept separate from `session` (the one that's
+  //: open) so switching between them never has to re-fetch the whole list.
+  const [sessions, setSessions] = useState([])
   const [triage, setTriage] = useState(null)
   const [equivalences, setEquivalences] = useState([])
   const [semantics, setSemantics] = useState(null)
@@ -191,6 +196,15 @@ export default function App() {
     if (user) api.vocabulary().then(setVocabulary).catch(() => {})
   }, [user])
 
+  const refreshSessions = useCallback(
+    () => api.listSessions().then((payload) => setSessions(payload.sessions)).catch(() => {}),
+    [],
+  )
+
+  useEffect(() => {
+    if (user) refreshSessions()
+  }, [user, refreshSessions])
+
   useEffect(
     () =>
       onSessionExpired(() => {
@@ -271,7 +285,19 @@ export default function App() {
       setDashboardCards([])
       setQueryHistory([])
       setStage('upload')
+      await refreshSessions()
       return created
+    })
+
+  const removeSession = (id) =>
+    run(async () => {
+      await api.deleteSession(id)
+      await refreshSessions()
+      if (id === sessionId) {
+        if (user) localStorage.removeItem(lastDatasetKey(user.id))
+        resetWorkspace()
+      }
+      return true
     })
 
   const signIn = async (email, password) => {
@@ -319,17 +345,43 @@ export default function App() {
     [sessionId],
   )
 
+  // A 409 here means this exact file/database is already sitting in another
+  // session of this account. Rather than error out, drop back into that
+  // session — that is what "cannot be stored twice" should feel like from
+  // the outside. `freshId` is deleted first when it was created just for
+  // this attempt and nothing has landed in it yet (`safeToDelete`), so a
+  // rejected upload never leaves an empty orphan session behind in the
+  // switcher — but a session that already holds an earlier file from the
+  // same batch is kept, because it has real data now.
+  const handleDuplicateSource = async (err, freshId, safeToDelete) => {
+    if (err.status !== 409 || !err.detail?.existing_session_id) throw err
+    if (safeToDelete) await api.deleteSession(freshId).catch(() => {})
+    await refreshSessions()
+    setSessionId(err.detail.existing_session_id)
+    setStage('triage')
+    setError(err.message)
+    return true
+  }
+
   const handleUpload = (files) =>
     run(async () => {
       // One request per file: each is ingested, triaged and named on its own,
       // and a failure on the third file must not discard the first two.
       const chosen = (Array.isArray(files) ? files : [files]).filter(Boolean)
       if (!chosen.length) return null
+      const wasFresh = !sessionId
       const id = await ensureSession(chosen[0].name)
-      for (const file of chosen) {
-        await api.upload(id, file)
+      let ingestedAny = false
+      try {
+        for (const file of chosen) {
+          await api.upload(id, file)
+          ingestedAny = true
+        }
+      } catch (err) {
+        return handleDuplicateSource(err, id, wasFresh && !ingestedAny)
       }
       await loadSession(id)
+      await refreshSessions()
       setStage('triage')
       return true
     })
@@ -339,9 +391,15 @@ export default function App() {
   const handleConnect = (url, tables) =>
     run(async () => {
       // Never name a session after the raw URL: it carries the password.
+      const wasFresh = !sessionId
       const id = await ensureSession(`Database ${url.split('@').pop()}`)
-      await api.connectDatabase(id, url, tables)
+      try {
+        await api.connectDatabase(id, url, tables)
+      } catch (err) {
+        return handleDuplicateSource(err, id, wasFresh)
+      }
       await loadSession(id)
+      await refreshSessions()
       setStage('triage')
       return true
     })
@@ -710,6 +768,14 @@ export default function App() {
               <option value="light">Light</option>
               <option value="dark">Dark</option>
             </select>
+            <SessionSwitcher
+              sessions={sessions}
+              activeId={sessionId}
+              busy={busy}
+              onOpen={refreshSessions}
+              onSelect={setSessionId}
+              onDelete={removeSession}
+            />
             <Button variant="primary" onClick={startSession} disabled={busy}>
               New session
             </Button>

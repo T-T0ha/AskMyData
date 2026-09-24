@@ -90,6 +90,35 @@ def test_upload_runs_phase0(client, messy_workbook):
         db.close()
 
 
+def test_reuploading_the_same_file_into_a_new_session_is_rejected_as_duplicate(
+    client, messy_workbook
+):
+    first_id = _create_session(client, "First")
+    assert _upload(client, first_id, messy_workbook).status_code == 200
+
+    second_id = _create_session(client, "Second")
+    response = _upload(client, second_id, messy_workbook)
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["existing_session_id"] == first_id
+    assert detail["existing_session_name"] == "First"
+
+    # Rejected as a duplicate, not partially ingested.
+    assert client.get(f"/api/sessions/{second_id}").json()["sheets"] == []
+
+
+def test_uploading_the_same_file_twice_into_the_same_session_is_not_a_duplicate(
+    client, messy_workbook
+):
+    session_id = _create_session(client)
+    assert _upload(client, session_id, messy_workbook).status_code == 200
+    # Re-running an upload into the session that already has it (e.g. a
+    # retried request) is not what duplicate detection is for — only a
+    # *second session* holding the same source is.
+    assert _upload(client, session_id, messy_workbook).status_code == 200
+
+
 def test_uploading_a_sqlite_database_ingests_its_tables(client, tmp_path):
     import sqlite3
 

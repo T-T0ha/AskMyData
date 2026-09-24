@@ -107,17 +107,19 @@ class Settings(BaseSettings):
     #: claude.md's "last 20 questions, clickable to re-run".
     query_history_limit: int = 20
 
-    # ---- Claude --------------------------------------------------------
-    anthropic_api_key: str | None = None
-    claude_model: str = "claude-opus-5"
-    #: Current models think before answering, and max_tokens caps thinking plus
-    #: the answer together — a budget sized only for the JSON reply truncates
-    #: mid-object and the response fails to parse.
-    claude_max_tokens: int = 16000
-    claude_timeout_seconds: float = 120.0
-    #: "low" is right for the structured, evidence-bounded JSON this app asks
-    #: for; raise to "high" if plan quality matters more than latency.
-    claude_effort: str = "low"
+    # ---- OpenRouter --------------------------------------------------------
+    #: The module is still called ``claude_client.py`` / ``ClaudeClient`` —
+    #: renaming it would ripple into routes, services, the frontend's status
+    #: labels and the ``taxonomy_source == "claude"`` values already stored in
+    #: the database — but the API calls it actually makes go through
+    #: OpenRouter's OpenAI-compatible endpoint.
+    openrouter_api_key: str | None = None
+    openrouter_model: str = "nex-agi/nex-n2.5-pro:free"
+    #: Current models think before answering, and max_tokens caps thinking
+    #: plus the answer together — a budget sized only for the JSON reply
+    #: truncates mid-object and the response fails to parse.
+    openrouter_max_tokens: int = 16000
+    openrouter_timeout_seconds: float = 120.0
 
     # ---- authentication -------------------------------------------------
     #: scrypt work factors.  ``n`` dominates both time and memory: the hash
@@ -149,7 +151,11 @@ class Settings(BaseSettings):
         return self.database_url.startswith("postgres")
 
     def resolved_api_key(self) -> str | None:
-        return self.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
+        return (
+            self.openrouter_api_key
+            or os.environ.get("OPENROUTER_API_KEY")
+            or os.environ.get("openrouter_api_key")
+        )
 
 
 @lru_cache(maxsize=1)

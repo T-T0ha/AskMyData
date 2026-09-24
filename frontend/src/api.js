@@ -28,9 +28,13 @@ export function onSessionExpired(listener) {
 }
 
 class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, detail) {
     super(message)
     this.status = status
+    // The raw `detail` from the response body — a plain string for most
+    // errors, but a structured object for ones a caller needs to act on (e.g.
+    // a 409 duplicate-source conflict names the session that already has it).
+    this.detail = detail
   }
 }
 
@@ -52,10 +56,11 @@ async function request(path, options = {}) {
   const payload = text ? JSON.parse(text) : null
   if (!response.ok) {
     const detail = payload?.detail
-    throw new ApiError(
-      typeof detail === 'string' ? detail : `${response.status} ${response.statusText}`,
-      response.status,
-    )
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : detail?.message || `${response.status} ${response.statusText}`
+    throw new ApiError(message, response.status, detail)
   }
   return payload
 }
