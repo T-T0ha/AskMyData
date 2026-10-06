@@ -88,6 +88,9 @@ class CleaningState(TypedDict, total=False):
     plan: Annotated[list[dict[str, Any]], _last]
     plan_source: str
     plan_rejections: list[str]
+    #: Once set, a step that ran cleanly is approved without stopping to ask.
+    #: A step that *fails* still stops: that is a decision, not a confirmation.
+    auto_approve: bool
     cursor: int
     status: str
     history: Annotated[list[dict[str, Any]], _append]
@@ -177,6 +180,7 @@ def review_node(state: CleaningState) -> Command[Literal["execute", "finalize"]]
     )
     decision = decision or {}
     action = str(decision.get("action", "confirm"))
+    auto_approve = bool(decision.get("auto_approve"))
 
     if action == "cancel":
         return Command(
@@ -218,6 +222,7 @@ def review_node(state: CleaningState) -> Command[Literal["execute", "finalize"]]
             "cursor": 0,
             "status": "executing",
             "plan_rejections": rejections,
+            "auto_approve": auto_approve,
         },
     )
 
@@ -239,7 +244,15 @@ def execute_node(state: CleaningState) -> dict[str, Any]:
 
     try:
         outcome = execute_step(store, step)
-    except StepError as exc:
+    except Exception as exc:
+        # StepError is the expected refusal; anything else is a bug in an
+        # executor or a value it did not anticipate.  Either way it must land
+        # on the step-failed prompt (retry / skip / abort): an exception that
+        # escapes a LangGraph node leaves the thread parked on it, with no
+        # prompt, so every later click is rejected and the session is stuck.
+        if not isinstance(exc, StepError):
+            logger.exception("cleaning step %s on %s crashed", step.type.value, step.table)
+            store.restore(snapshot_tag)
         store.persist()
         failed = [dict(s) for s in plan]
         failed[cursor] = {**failed[cursor], "status": "failed"}
@@ -278,6 +291,8 @@ def validate_node(state: CleaningState) -> Command[Literal["execute", "finalize"
     Resume payloads:
 
     ``{"action": "approve"}``                  keep the change, move on
+    ``{"action": "approve_all"}``              keep it, and approve every later step
+                                               that runs cleanly without asking
     ``{"action": "revert"}``                   restore the snapshot, skip the step
     ``{"action": "retry", "params": {...}}``   restore, re-parameterise, run again
     ``{"action": "skip"}``                     leave the step unexecuted
@@ -289,8 +304,15 @@ def validate_node(state: CleaningState) -> Command[Literal["execute", "finalize"
     cursor = int(state.get("cursor", 0))
     pending = state.get("pending") or {}
 
-    decision = interrupt({**pending, "kind": pending.get("kind", "step_validation")}) or {}
+    kind = pending.get("kind", "step_validation")
+    if state.get("auto_approve") and kind == "step_validation":
+        decision: dict[str, Any] = {"action": "approve"}
+    else:
+        decision = interrupt({**pending, "kind": kind}) or {}
     action = str(decision.get("action", "approve"))
+    auto_approve = bool(state.get("auto_approve"))
+    if action == "approve_all":
+        action, auto_approve = "approve", True
     snapshot = str(pending.get("snapshot") or f"{cursor}-{plan[cursor]['id']}")
 
     if action == "abort":
@@ -338,6 +360,7 @@ def validate_node(state: CleaningState) -> Command[Literal["execute", "finalize"
         plan[cursor] = {**plan[cursor], "status": "approved"}
 
     store.persist()
+    store.discard_snapshot(snapshot)
     return Command(
         goto="execute",
         update={
@@ -345,6 +368,7 @@ def validate_node(state: CleaningState) -> Command[Literal["execute", "finalize"
             "cursor": cursor + 1,
             "pending": None,
             "status": "executing",
+            "auto_approve": auto_approve,
             "history": [
                 {
                     "cursor": cursor,
@@ -406,10 +430,19 @@ def build_graph(checkpointer=None):
     return graph.compile(checkpointer=checkpointer)
 
 
+#: LangGraph stops a run after 25 node executions by default.  Approving every
+#: step without stopping runs execute -> validate once per step, so a plan of a
+#: dozen steps would hit that and die half-done.
+RECURSION_LIMIT = 10_000
+
+
 def thread_config(session_id: str) -> dict[str, Any]:
     """LangGraph thread id == cleaning session id."""
 
-    return {"configurable": {"thread_id": f"cleaning-{session_id}"}}
+    return {
+        "configurable": {"thread_id": f"cleaning-{session_id}"},
+        "recursion_limit": RECURSION_LIMIT,
+    }
 
 
 def interrupt_payload(result: Any) -> dict[str, Any] | None:

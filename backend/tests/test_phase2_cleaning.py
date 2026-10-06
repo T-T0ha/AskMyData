@@ -114,6 +114,20 @@ def test_standardize_format_collapses_case_variants(store):
     assert outcome.cells_changed == 3
 
 
+def test_standardize_date_format_survives_unparseable_and_missing_values(store):
+    # pandas turns the None results of Series.map into NaT once the rest are
+    # datetimes; NaT has no strftime, which used to crash the step with a 500.
+    store.put("t", pd.DataFrame({"d": ["2024-01-05", "not a date", None, "2024-03-01"]}))
+    execute_step(
+        store,
+        _step(StepType.STANDARDIZE_FORMAT, "t", column="d", format="date", date_format="%d/%m/%Y"),
+    )
+    result = store.get("t")["d"]
+    assert result.iloc[0] == "05/01/2024"
+    assert result.iloc[3] == "01/03/2024"
+    assert result.iloc[[1, 2]].isna().all()
+
+
 def test_deduplicate(store):
     outcome = execute_step(store, _step(StepType.DEDUPLICATE, "orders", subset=None))
     assert len(store.get("orders")) == 3
@@ -216,14 +230,101 @@ def test_planner_leaves_gaps_alone_instead_of_inventing_or_deleting(store):
     assert not [s for s in steps if "fill" in s.type.value]
 
 
-def test_planner_still_offers_to_drop_an_almost_empty_column():
-    """Emptiness is only actionable when there is nothing left to lose."""
+def test_planner_only_offers_to_drop_a_completely_empty_column():
+    """A column with even one value in it is the user's data, however sparse."""
 
-    df = pd.DataFrame({"legacy_note": [None] * 9 + ["x"], "id": list(range(10))})
+    df = pd.DataFrame(
+        {
+            "all_blank": [None] * 10,
+            "almost_blank": [None] * 9 + ["x"],
+            "id": list(range(10)),
+        }
+    )
     steps = heuristic_plan({"t": df})
     dropped = {s.params.get("column") for s in steps if s.type is StepType.DROP_COLUMN}
 
-    assert dropped == {"legacy_note"}
+    assert dropped == {"all_blank"}
+
+
+def test_a_models_plan_cannot_drop_a_column_that_holds_values():
+    from app.cleaning.planner import normalize_claude_plan
+
+    df = pd.DataFrame(
+        {"all_blank": [None] * 10, "almost_blank": [None] * 9 + ["x"], "id": range(10)}
+    )
+    accepted, rejected = normalize_claude_plan(
+        [
+            {"type": "drop_column", "table": "t", "params": {"column": "all_blank"}},
+            {"type": "drop_column", "table": "t", "params": {"column": "almost_blank"}},
+        ],
+        {"t": df},
+    )
+
+    assert [s.params["column"] for s in accepted] == ["all_blank"]
+    assert len(rejected) == 1 and "almost_blank" in rejected[0]
+
+
+def test_a_models_step_with_its_column_outside_params_is_still_read():
+    """Models put a step's column at the top level, under another name, or in a
+    ``columns`` list.  Each must reach the executor with ``params["column"]`` —
+    a step that arrived without one failed on the step screen, one after another."""
+
+    from app.cleaning.planner import normalize_claude_plan
+
+    df = pd.DataFrame({"a": [" x "], "b": [" y "], "c": [" z "], "d": [" w "], "e": [1]})
+    accepted, rejected = normalize_claude_plan(
+        [
+            {"type": "strip_whitespace", "table": "t", "column": "a"},
+            {"type": "strip_whitespace", "table": "t", "params": {"column_name": "b"}},
+            {"type": "strip_whitespace", "table": "t", "params": {"columns": ["c", "d"]}},
+            {"type": "standardize_casing", "table": "t", "params": {"column": ["e"], "casing": "upper"}},
+        ],
+        {"t": df},
+    )
+
+    assert rejected == []
+    assert sorted((s.type.value, s.params["column"]) for s in accepted) == [
+        ("standardize_casing", "e"),
+        ("strip_whitespace", "a"),
+        ("strip_whitespace", "b"),
+        ("strip_whitespace", "c"),
+        ("strip_whitespace", "d"),
+    ]
+
+
+def test_a_models_step_that_names_no_column_is_rejected_before_it_can_fail_at_run_time():
+    from app.cleaning.planner import normalize_claude_plan
+
+    df = pd.DataFrame({"a": [" x "]})
+    accepted, rejected = normalize_claude_plan(
+        [
+            {"type": "strip_whitespace", "table": "t", "params": {}},
+            {"type": "strip_whitespace", "table": "t"},
+            {"type": "type_cast", "table": "t", "params": {"column": "a"}},
+            {"type": "deduplicate", "table": "t", "params": {"columns": ["a"]}},
+        ],
+        {"t": df},
+    )
+
+    assert [(s.type.value, s.params) for s in accepted] == [("deduplicate", {"subset": ["a"]})]
+    assert len(rejected) == 3
+    assert "'column'" in rejected[0] and "'to'" in rejected[2]
+
+
+def test_a_split_table_gets_one_merge_step_however_many_columns_match():
+    """Every column of a split table matches its twin; that is still one merge."""
+
+    left = pd.DataFrame({"k": [1, 2, 3], "v": [4, 5, 6]})
+    right = pd.DataFrame({"k": [7, 8, 9], "v": [1, 2, 3]})
+    equivalences = [
+        {"left_table": "a", "left_column": "k", "right_table": "b", "right_column": "k",
+         "score": 1.0, "confirmed": True},
+        {"left_table": "a", "left_column": "v", "right_table": "b", "right_column": "v",
+         "score": 1.0, "confirmed": True},
+    ]
+    steps = heuristic_plan({"a": left, "b": right}, equivalences=equivalences)
+
+    assert len([s for s in steps if s.type is StepType.MERGE_SHEETS]) == 1
 
 
 def test_casing_step_quotes_real_values_and_keeps_the_dominant_spelling():
@@ -352,9 +453,9 @@ def test_plan_is_ordered_structure_then_rows_then_joins():
 def test_claude_plan_validation_rejects_hallucinated_references(store):
     accepted, rejected = normalize_claude_plan(
         [
-            {"type": "drop_column", "table": "orders", "params": {"column": "customer"}},
-            {"type": "drop_column", "table": "ghost_table", "params": {"column": "x"}},
-            {"type": "drop_column", "table": "orders", "params": {"column": "ghost_column"}},
+            {"type": "strip_whitespace", "table": "orders", "params": {"column": "customer"}},
+            {"type": "strip_whitespace", "table": "ghost_table", "params": {"column": "x"}},
+            {"type": "strip_whitespace", "table": "orders", "params": {"column": "ghost_column"}},
             {"type": "teleport_column", "table": "orders", "params": {}},
         ],
         store.tables(),
@@ -614,6 +715,69 @@ def test_failed_step_is_reported_not_raised(graph_session):
 
     result = resume(graph, session_id, {"action": "skip"})
     assert result["status"] == "completed"
+
+
+def _date_plan(store):
+    column = next(c for c in store.get("sales_data").columns)
+    return column, [
+        {
+            "id": "x1",
+            "type": "rename_column",
+            "table": "sales_data",
+            "description": "any executable step",
+            "params": {"column": column, "new_name": "renamed_by_test"},
+            "origin": "user",
+            "status": "pending",
+        }
+    ]
+
+
+def test_an_unexpected_executor_crash_lands_on_the_failed_step_prompt(graph_session, monkeypatch):
+    """A bug in an executor is not a StepError, but it must not wedge the
+    session: the user gets retry / skip instead of a thread with no prompt."""
+
+    import app.cleaning.graph as graph_module
+
+    session_id, store, graph = graph_session
+    _start(graph, session_id)
+    _, plan = _date_plan(store)
+
+    def boom(*_args, **_kwargs):
+        raise ValueError("NaTType does not support strftime")
+
+    monkeypatch.setattr(graph_module, "execute_step", boom)
+    result = resume(graph, session_id, {"action": "confirm", "plan": plan})
+    pending = interrupt_payload(result)
+    assert pending["kind"] == "step_failed"
+    assert "NaTType" in pending["error"]
+
+    monkeypatch.undo()
+    result = resume(graph, session_id, {"action": "retry"})
+    assert interrupt_payload(result)["kind"] == "step_validation"
+
+
+def test_a_stalled_thread_is_resumed_by_running_its_crashed_task_again(graph_session, monkeypatch):
+    """A crash outside the step itself (or a server that died mid-step)
+    leaves the checkpoint parked on the task with no prompt; the API re-runs
+    it instead of answering 409 forever."""
+
+    from app.api import routes
+
+    session_id, store, graph = graph_session
+    _start(graph, session_id)
+    _, plan = _date_plan(store)
+
+    original = TableStore.snapshot
+    monkeypatch.setattr(TableStore, "snapshot", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+    with pytest.raises(OSError):
+        resume(graph, session_id, {"action": "confirm", "plan": plan})
+    monkeypatch.setattr(TableStore, "snapshot", original)
+
+    monkeypatch.setattr(routes, "_graph", graph)
+    assert routes._pending_interrupt(session_id) is None  # the stuck state
+    recovered = routes._resume_stalled(session_id)
+    assert interrupt_payload(recovered)["kind"] == "step_validation"
+    assert routes._resume_stalled(session_id) is None  # now at a prompt, not stalled
 
 
 def test_state_survives_a_new_graph_instance(graph_session, tmp_path):

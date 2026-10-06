@@ -77,6 +77,10 @@ class TypeDecision:
     currency_symbol: str | None = None
 
 
+#: Values inspected per column when deciding whether it holds dates.
+DATE_DETECTION_SAMPLE = 1000
+
+
 def _non_null(series: pd.Series) -> pd.Series:
     return series.dropna()
 
@@ -119,7 +123,24 @@ def _is_date(series: pd.Series, values: pd.Series, threshold: float) -> TypeDeci
     text_values = _as_text(values)
     if not text_values:
         return None
-    hits = sum(1 for v in text_values if try_parse_date(v)[0] is not None)
+    # Whether a column is a date column is a question about its format, not its
+    # length: a few hundred evenly spaced values answer it as well as every
+    # row, and strptime over 10^5 rows x every known format is what made this
+    # step take minutes.  Even spacing (not the first N) keeps it
+    # deterministic and representative of sorted files.
+    if len(text_values) > DATE_DETECTION_SAMPLE:
+        step = len(text_values) / DATE_DETECTION_SAMPLE
+        text_values = [text_values[int(i * step)] for i in range(DATE_DETECTION_SAMPLE)]
+    parsed: dict[str, bool] = {}
+    hits = 0
+    for v in text_values:
+        hit = parsed.get(v)
+        if hit is None:
+            # A date always contains a digit; this rejects free text without
+            # trying every format against it.
+            hit = any(ch.isdigit() for ch in v) and try_parse_date(v)[0] is not None
+            parsed[v] = hit
+        hits += hit
     ratio = hits / len(text_values)
     if ratio >= threshold:
         return TypeDecision(

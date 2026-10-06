@@ -213,6 +213,105 @@ def test_a_key_read_as_a_number_on_one_side_still_matches(shop):
     assert len(plan.enforced_keys) == 1
 
 
+def _heroes():
+    """A table as a database source delivers it: heights as integers, few distinct."""
+
+    tables = {"hero": pd.DataFrame({"hero_id": [1, 2, 3, 4], "height": [180, 200, 55, 210]})}
+    columns = {
+        "hero": [
+            _column("hero_id", "identifier", declared_type="INTEGER"),
+            _column("height", "integer_nominal", declared_type="INTEGER"),
+        ]
+    }
+    return tables, columns, {"hero": {"primary_key": ["hero_id"]}}
+
+
+def test_a_number_the_source_declared_stays_a_number_in_the_export():
+    """The reason this exists: ``55`` sorts after ``200`` as text, so a question
+    about heights over 200 answered from VARCHAR was wrong without any error."""
+
+    tables, columns, keys = _heroes()
+    session_id = _session_id()
+
+    plan = build_plan(tables, columns, keys)
+    run_export(session_id, plan, tables)
+
+    assert [c.type_plan.render() for c in plan.tables[0].columns] == ["INTEGER", "INTEGER"]
+    assert plan.tables[0].columns[1].column_type.value == "integer_nominal", "the reading is kept"
+    assert read_back(session_id, "SELECT COUNT(*) AS n FROM hero WHERE height > 200") == [{"n": 1}]
+    assert read_back(session_id, "SELECT MAX(height) AS m FROM hero") == [{"m": 210}]
+    assert read_back(session_id, "SELECT typeof(height) AS t FROM hero LIMIT 1") == [{"t": "integer"}]
+    drop_export(session_id)
+
+
+def test_a_type_the_user_chose_is_not_overridden_by_the_source():
+    tables, columns, keys = _heroes()
+    columns["hero"][1]["user_column_type"] = "integer_nominal"
+
+    plan = build_plan(tables, columns, keys)
+
+    assert plan.tables[0].columns[1].type_plan.render() == "VARCHAR(50)"
+    assert plan.tables[0].columns[0].type_plan.render() == "INTEGER", "only the corrected column"
+
+
+def test_a_spreadsheet_column_is_still_typed_by_the_mapping():
+    tables, columns, keys = _heroes()
+    for column in columns["hero"]:
+        column.pop("declared_type")
+
+    plan = build_plan(tables, columns, keys)
+
+    assert plan.tables[0].columns[1].type_plan.render() == "VARCHAR(50)"
+
+
+def test_a_reference_between_a_number_and_text_is_recorded_but_not_enforced():
+    """PostgreSQL will not create it, and the export must not die trying."""
+
+    tables = {
+        "team": pd.DataFrame({"team_id": ["T1", "T2"]}),
+        "hero": pd.DataFrame({"hero_id": [1, 2], "team_id": [1, 2]}),
+    }
+    columns = {
+        "team": [_column("team_id", "identifier")],
+        "hero": [
+            _column("hero_id", "identifier", declared_type="INTEGER"),
+            _column("team_id", "integer_nominal", declared_type="INTEGER"),
+        ],
+    }
+    keys = {"team": {"primary_key": ["team_id"]}, "hero": {"primary_key": ["hero_id"]}}
+
+    plan = build_plan(
+        tables, columns, keys, relationships=[_fk("hero", "team_id", "team", "team_id")]
+    )
+
+    fk = next(fk for table in plan.tables for fk in table.foreign_keys)
+    assert fk.enforced is False
+    assert "number and text" in fk.reason
+    assert plan.enforced_keys == []
+    assert "INTEGER" in fk.reason and "VARCHAR" in fk.reason
+
+
+def test_a_reference_between_two_declared_integers_is_still_enforced():
+    tables = {
+        "team": pd.DataFrame({"team_id": [1, 2]}),
+        "hero": pd.DataFrame({"hero_id": [1, 2], "team_id": [1, 2]}),
+    }
+    columns = {
+        "team": [_column("team_id", "identifier", declared_type="INTEGER")],
+        "hero": [
+            _column("hero_id", "identifier", declared_type="INTEGER"),
+            _column("team_id", "integer_nominal", declared_type="INTEGER"),
+        ],
+    }
+    keys = {"team": {"primary_key": ["team_id"]}, "hero": {"primary_key": ["hero_id"]}}
+
+    plan = build_plan(
+        tables, columns, keys, relationships=[_fk("hero", "team_id", "team", "team_id")]
+    )
+
+    assert len(plan.enforced_keys) == 1
+
+
 def test_parents_are_created_before_the_tables_that_reference_them(shop):
     tables, columns, keys = shop
 
@@ -686,6 +785,93 @@ def test_the_export_endpoint_builds_a_database_and_reports_it(client, relational
     assert client.get(f"/api/sessions/{session_id}/export").json()["exported"] is True
 
 
+def test_a_database_upload_keeps_its_numbers_dates_and_stored_text_through_the_export(
+    client, tmp_path
+):
+    """The whole path, from a SQLite file to the exported tables.
+
+    Ingestion, Phase 1 and the export each had a way of changing what the source
+    said — a ``-`` read as a blank, a low-cardinality ``INTEGER`` read as a code
+    and stored as text, a ``DATE`` stored with a time of day.  Each is correct
+    for a spreadsheet and wrong for a database that declared its types, and this
+    is the test that fails if any one of them is switched back on.
+    """
+
+    import sqlite3
+
+    path = tmp_path / "heroes.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE hero (id INTEGER PRIMARY KEY, height INTEGER, born DATE, bond TEXT, "
+        "speed TEXT, joined TEXT, active TEXT)"
+    )
+    heights = [55, 170, 175, 180, 185, 190, 195, 200, 205, 210]
+    speeds = ["218.300", "91.610", "257.320", "100.500", "89.540"]
+    connection.executemany(
+        "INSERT INTO hero VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                i,
+                heights[i % 10],
+                f"2000-01-{1 + i % 28:02d}",
+                "-" if i % 3 == 0 else "single",
+                speeds[i % 5],
+                f"2019-09-{1 + i % 28:02d}",
+                "true" if i % 2 else "false",
+            )
+            for i in range(1, 121)
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    session_id = _uploaded(client, path)
+    response = client.post(f"/api/sessions/{session_id}/export")
+    assert response.status_code == 200, response.text
+
+    columns = {
+        row["column_name"]: row
+        for row in read_back(
+            session_id,
+            "SELECT column_name, data_type, sql_type FROM sem_metadata WHERE table_name = 'hero'",
+        )
+    }
+    assert columns["height"]["data_type"] == "integer_nominal", "Phase 1 still reads a code"
+    assert columns["height"]["sql_type"] == "INTEGER", "but the source's type is what is stored"
+    assert read_back(session_id, "SELECT typeof(height) AS t FROM hero GROUP BY 1") == [
+        {"t": "integer"}
+    ]
+    assert read_back(session_id, "SELECT COUNT(*) AS n FROM hero WHERE height > 200") == [
+        {"n": 24}
+    ], "205 and 210 are above 200 as numbers; as text '55' would be too"
+
+    assert columns["born"]["sql_type"] == "DATE"
+    assert read_back(session_id, "SELECT born FROM hero WHERE id = 1") == [{"born": "2000-01-02"}]
+    assert read_back(session_id, "SELECT COUNT(*) AS n FROM hero WHERE born = '2000-01-02'")[0]["n"] > 0
+
+    assert read_back(session_id, "SELECT COUNT(*) AS n FROM hero WHERE bond = '-'") == [{"n": 40}]
+    assert read_back(session_id, "SELECT COUNT(*) AS n FROM hero WHERE bond IS NULL") == [{"n": 0}]
+
+    # TEXT columns whose contents Phase 1 reads as a number, a day and a flag.
+    # The source stored text, so the export holds that text — the same ORDER BY,
+    # the same literal comparison and the same 'true' the gold query was written for.
+    assert columns["speed"]["data_type"] != "text", "Phase 1 reads the contents as a number"
+    assert columns["joined"]["data_type"] == "date", "…as a day"
+    assert columns["active"]["data_type"] == "boolean", "…as a flag"
+    for name in ("speed", "joined", "active"):
+        assert columns[name]["sql_type"] == "TEXT", name
+        assert read_back(session_id, f"SELECT typeof({name}) AS t FROM hero GROUP BY 1") == [
+            {"t": "text"}
+        ], name
+    assert read_back(session_id, "SELECT speed FROM hero ORDER BY speed DESC LIMIT 1") == [
+        {"speed": "91.610"}
+    ], "text order: '91.610' is after '257.320', as in the source"
+    assert read_back(session_id, "SELECT joined FROM hero WHERE id = 13") == [{"joined": "2019-09-14"}]
+    assert read_back(session_id, "SELECT COUNT(*) AS n FROM hero WHERE joined = '2019-09-14'")[0]["n"] > 0
+    assert read_back(session_id, "SELECT COUNT(*) AS n FROM hero WHERE active = 'true'") == [{"n": 60}]
+    drop_export(session_id)
+
+
 def test_a_confirmed_reference_reaches_the_exported_schema(client, relational_workbook):
     """The whole pipeline, ending in a constraint the database enforces."""
 
@@ -705,14 +891,34 @@ def test_a_confirmed_reference_reaches_the_exported_schema(client, relational_wo
     assert "FOREIGN KEY" in report["ddl"]
 
 
-def test_an_unconfirmed_reference_does_not_reach_it(client, relational_workbook):
+def test_a_clear_reference_reaches_the_database_without_being_asked(client, relational_workbook):
     session_id = _uploaded(client, relational_workbook)
     client.post(f"/api/sessions/{session_id}/relationships")
 
     report = client.post(f"/api/sessions/{session_id}/export").json()["report"]
 
+    assert {fk["target_table"] for fk in report["foreign_keys"]} >= {"orders", "customers"}
+
+
+def test_a_reference_the_user_turned_down_does_not_reach_it(client, relational_workbook):
+    session_id = _uploaded(client, relational_workbook)
+    detected = client.post(f"/api/sessions/{session_id}/relationships").json()
+    for edge in detected["relationships"]:
+        if edge["rel_type"] == "foreign_key":
+            client.post(
+                f"/api/sessions/{session_id}/relationships/{edge['id']}",
+                json={"confirmed": False},
+            )
+
+    report = client.post(f"/api/sessions/{session_id}/export").json()["report"]
+
     assert report["foreign_keys"] == []
     assert "FOREIGN KEY" not in report["ddl"]
+
+    # And re-running detection does not talk them back into it.
+    client.post(f"/api/sessions/{session_id}/relationships")
+    again = client.post(f"/api/sessions/{session_id}/export").json()["report"]
+    assert again["foreign_keys"] == []
 
 
 def test_the_exported_database_answers_a_question_about_the_workbook(

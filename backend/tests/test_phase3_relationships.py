@@ -426,7 +426,12 @@ def test_detection_endpoint_returns_relationships_and_a_graph(detected):
     _, payload = detected
 
     assert payload["counts"]["foreign_keys"] >= 2
-    assert payload["counts"]["proposed"] == payload["counts"]["total"]
+    # Nothing here is a close call, so nothing is left for the user to rule on:
+    # the links the data supports are settled, each with the reason why.
+    assert payload["counts"]["needs_review"] == 0
+    assert payload["counts"]["confirmed"] == payload["counts"]["total"]
+    assert all(r["decided_by"] == "auto" for r in payload["relationships"])
+    assert all(r["evidence"].get("auto_reason") for r in payload["relationships"])
     assert {node["id"] for node in payload["graph"]["nodes"]} >= {
         "customers",
         "orders",

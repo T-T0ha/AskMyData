@@ -1,137 +1,179 @@
-/** Phase 0 view — cross-sheet column equivalence confirmation.
+/** Phase 0 view — which columns, in different tables, hold the same thing.
  *
- *  These suggestions are the only thing that tells the platform two sheets
- *  talk about the same entity. A confirmation is recorded as a *relationship*
- *  between the two tables — the prior that foreign-key detection starts from —
- *  not as an instruction to fold them into one, so each card shows the
- *  evidence behind the score rather than just the score.
+ *  Most pairs are not close calls: the same name, the same kind of values, many
+ *  of them shared. Those are linked without asking, and the screen says so. A
+ *  person is asked only about a pair the evidence cannot settle, in plain words,
+ *  and an unanswered pair is simply treated as "different" — nothing waits on it.
+ *
+ *  A confirmed pair feeds the cleaning plan (two sheets that are one table split
+ *  in two) and is shown to the model that helps plan it; it is not itself a
+ *  foreign key. Every automatic call can be reversed from here.
  */
 
 import { Button, EmptyState, Panel, StatusBadge } from './ui'
 
-function ScoreBar({ score }) {
+function Column({ table, column }) {
   return (
-    <div className="flex items-center gap-2">
-      <div className="h-1.5 w-20 rounded-full" style={{ background: 'var(--surface-3)' }}>
-        <div
-          className="bar-h h-full"
-          style={{ width: `${Math.round(score * 100)}%`, background: 'var(--series-1)' }}
-        />
-      </div>
-      <span className="tabular text-[11px]" style={{ color: 'var(--text-secondary)' }}>
-        {score.toFixed(2)}
-      </span>
-    </div>
+    <span>
+      <code className="rounded px-1" style={{ background: 'var(--surface-3)' }}>
+        {column}
+      </code>{' '}
+      <span style={{ color: 'var(--text-muted)' }}>in {table}</span>
+    </span>
   )
 }
 
-function Evidence({ candidate }) {
-  const items = [
-    ['name embedding', candidate.embedding_similarity?.toFixed(2)],
-    ['name spelling', candidate.lexical_similarity?.toFixed(2)],
-    [
-      'shared values',
-      candidate.value_overlap === null || candidate.value_overlap === undefined
-        ? '—'
-        : `${Math.round(candidate.value_overlap * 100)}%`,
-    ],
-    ['storage types', candidate.type_compatible ? 'compatible' : 'different'],
-  ]
+function Pair({ candidate }) {
   return (
-    <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[11px]">
-      {items.map(([label, value]) => (
-        <div key={label} className="flex justify-between gap-2">
-          <dt style={{ color: 'var(--text-muted)' }}>{label}</dt>
-          <dd className="tabular" style={{ color: 'var(--text-secondary)' }}>
-            {value}
-          </dd>
-        </div>
-      ))}
-    </dl>
+    <span className="text-sm">
+      <Column table={candidate.left_table} column={candidate.left_column} />
+      <span className="mx-2" style={{ color: 'var(--text-muted)' }}>
+        =
+      </span>
+      <Column table={candidate.right_table} column={candidate.right_column} />
+    </span>
+  )
+}
+
+function overlapNote(candidate) {
+  if (candidate.value_overlap === null || candidate.value_overlap === undefined) return null
+  const share = Math.round(candidate.value_overlap * 100)
+  return share === 0
+    ? 'They have no values in common.'
+    : `${share}% of the values in the smaller column also appear in the other.`
+}
+
+function Question({ candidate, onDecide, busy }) {
+  return (
+    <article
+      className="rounded-md border p-3"
+      style={{ borderColor: 'var(--status-warning)', background: 'var(--surface-2)' }}
+    >
+      <p className="text-sm">
+        Do these two columns mean the same thing?
+      </p>
+      <p className="mt-1">
+        <Pair candidate={candidate} />
+      </p>
+      <p className="mt-1 text-xs" style={{ color: 'var(--text-muted)' }}>
+        {overlapNote(candidate)} The names are similar but not identical.
+      </p>
+      <div className="mt-2 flex gap-2">
+        <Button variant="primary" disabled={busy} onClick={() => onDecide(candidate.id, true)}>
+          Yes, the same
+        </Button>
+        <Button disabled={busy} onClick={() => onDecide(candidate.id, false)}>
+          No, different
+        </Button>
+      </div>
+    </article>
+  )
+}
+
+function Row({ candidate, actionLabel, onAction, busy }) {
+  return (
+    <li className="flex flex-wrap items-center justify-between gap-2 py-1.5">
+      <Pair candidate={candidate} />
+      <span className="flex items-center gap-3 text-xs">
+        {candidate.decided_by === 'user' && (
+          <span style={{ color: 'var(--text-muted)' }}>your choice</span>
+        )}
+        <button
+          type="button"
+          className="focus-ring underline"
+          style={{ color: 'var(--series-1)' }}
+          disabled={busy}
+          onClick={onAction}
+        >
+          {actionLabel}
+        </button>
+      </span>
+    </li>
   )
 }
 
 export function EquivalencePanel({ equivalences, onDecide, busy }) {
-  const undecided = equivalences.filter((candidate) => candidate.confirmed === null)
-  const decided = equivalences.filter((candidate) => candidate.confirmed !== null)
+  const asking = equivalences.filter((candidate) => candidate.confirmed === null)
+  const linked = equivalences.filter((candidate) => candidate.confirmed === true)
+  const ruledOut = equivalences.filter((candidate) => candidate.confirmed === false)
 
   return (
     <Panel
-      title="Do these columns mean the same thing?"
-      subtitle="A confirmed pair is kept as a link between two tables, not merged into one — that link is what becomes a foreign key."
+      title="Matching columns"
+      subtitle="Columns in different tables that hold the same information — a customer number in both an orders table and a customers table, say. The obvious matches are linked for you."
     >
       {equivalences.length === 0 ? (
         <EmptyState>
-          No cross-sheet column pairs scored above the similarity threshold. Sheets will be treated
-          as unrelated until you say otherwise.
+          No matching columns were found between your tables. There is nothing for you to do here.
         </EmptyState>
       ) : (
-        <div className="space-y-3">
-          {undecided.map((candidate) => (
-            <article
-              key={candidate.id}
-              className="rounded-md border p-3"
-              style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
-            >
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-sm">
-                    <code className="rounded px-1" style={{ background: 'var(--surface-3)' }}>
-                      {candidate.left_table}.{candidate.left_column}
-                    </code>
-                    <span className="mx-2" style={{ color: 'var(--text-muted)' }}>
-                      ≈
-                    </span>
-                    <code className="rounded px-1" style={{ background: 'var(--surface-3)' }}>
-                      {candidate.right_table}.{candidate.right_column}
-                    </code>
-                  </p>
-                  <Evidence candidate={candidate} />
-                </div>
-                <div className="flex shrink-0 flex-col items-end gap-2">
-                  <ScoreBar score={candidate.score} />
-                  <div className="flex gap-2">
-                    <Button
-                      variant="primary"
-                      disabled={busy}
-                      onClick={() => onDecide(candidate.id, true)}
-                    >
-                      Same concept
-                    </Button>
-                    <Button disabled={busy} onClick={() => onDecide(candidate.id, false)}>
-                      Different
-                    </Button>
-                  </div>
-                </div>
-              </div>
-            </article>
-          ))}
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <StatusBadge status="good">{linked.length} linked automatically</StatusBadge>
+            {ruledOut.length > 0 && (
+              <StatusBadge status="neutral">{ruledOut.length} ruled out</StatusBadge>
+            )}
+            {asking.length > 0 && (
+              <StatusBadge status="warning">{asking.length} to check</StatusBadge>
+            )}
+            {asking.length === 0 && (
+              <span style={{ color: 'var(--text-muted)' }}>Nothing needs your attention.</span>
+            )}
+          </div>
 
-          {decided.length > 0 && (
-            <div className="space-y-2 pt-1">
-              {decided.map((candidate) => (
-                <div key={candidate.id} className="flex items-center justify-between gap-3 text-xs">
-                  <span style={{ color: 'var(--text-secondary)' }}>
-                    {candidate.left_table}.{candidate.left_column} ≈ {candidate.right_table}.
-                    {candidate.right_column}
-                  </span>
-                  <span className="flex items-center gap-2">
-                    <StatusBadge status={candidate.confirmed ? 'good' : 'neutral'}>
-                      {candidate.confirmed ? 'confirmed' : 'rejected'}
-                    </StatusBadge>
-                    <button
-                      type="button"
-                      className="focus-ring underline"
-                      style={{ color: 'var(--series-1)' }}
-                      disabled={busy}
-                      onClick={() => onDecide(candidate.id, !candidate.confirmed)}
-                    >
-                      undo
-                    </button>
-                  </span>
-                </div>
+          {asking.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                These are close calls. Answer if you know; if you skip them they are treated as
+                different, and nothing else waits on your answer.
+              </p>
+              {asking.map((candidate) => (
+                <Question
+                  key={candidate.id}
+                  candidate={candidate}
+                  onDecide={onDecide}
+                  busy={busy}
+                />
               ))}
             </div>
+          )}
+
+          {linked.length > 0 && (
+            <details>
+              <summary className="cursor-pointer text-sm font-medium">
+                See the {linked.length} linked pair{linked.length === 1 ? '' : 's'}
+              </summary>
+              <ul className="mt-1 divide-y" style={{ borderColor: 'var(--gridline)' }}>
+                {linked.map((candidate) => (
+                  <Row
+                    key={candidate.id}
+                    candidate={candidate}
+                    actionLabel="not the same"
+                    busy={busy}
+                    onAction={() => onDecide(candidate.id, false)}
+                  />
+                ))}
+              </ul>
+            </details>
+          )}
+
+          {ruledOut.length > 0 && (
+            <details>
+              <summary className="cursor-pointer text-sm font-medium">
+                See the {ruledOut.length} pair{ruledOut.length === 1 ? '' : 's'} ruled out
+              </summary>
+              <ul className="mt-1 divide-y" style={{ borderColor: 'var(--gridline)' }}>
+                {ruledOut.map((candidate) => (
+                  <Row
+                    key={candidate.id}
+                    candidate={candidate}
+                    actionLabel="they are the same"
+                    busy={busy}
+                    onAction={() => onDecide(candidate.id, true)}
+                  />
+                ))}
+              </ul>
+            </details>
           )}
         </div>
       )}

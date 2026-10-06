@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.cleaning.store import get_store
@@ -44,29 +45,35 @@ from app.export.metadata import bundle as semantic_bundle
 from app.export.quality import build_quality_report
 from app.export.runner import drop_export, explain, read_semantic_layer, run_export, run_readonly
 from app.export.schema import build_plan
-from app.ingestion.equivalence import detect_equivalences
+from app.ingestion.duplicates import duplicate_reason, find_duplicate_tables, is_duplicate_reason
+from app.ingestion.equivalence import auto_verdict, detect_equivalences
 from app.ingestion.fingerprint import database_fingerprint, file_fingerprint
 from app.ingestion.keys import KeyAnalysis, confirm_key, decline_key, is_unique_key
 from app.ingestion.loader import load_file_source
 from app.ingestion.relational import display_url, load_relational_tables
 from app.ingestion.triage import classify_issues
-from app.query.guard import QueryRejected, validate_select_only
+from app.query.guard import QueryRejected, referenced_names, validate_select_only
 from app.query.retrieval import (
+    columns_named_in,
+    examples_worth_showing,
     expand_by_references,
+    normalize_question,
+    rank_examples,
     rank_tables,
     retrieve_business_rules,
-    retrieve_examples,
     schema_context,
     select_columns,
     select_tables,
 )
 from app.query.shape import classify as classify_query_shape
+from app.relationships.auto import IDENTIFIER_LABELS, decide_dependency, settle_foreign_keys
 from app.relationships.dependencies import detect_all_dependencies
 from app.relationships.evidence import build_evidence
 from app.relationships.foreign_keys import (
     detect_foreign_keys,
     skipped_tables as fk_skipped_tables,
 )
+from app.semantics.descriptions import is_template_description, template_description
 from app.semantics.embeddings import get_embedder
 from app.semantics.pipeline import analyze_tables, statistical_summary
 from app.semantics import table_summary
@@ -228,6 +235,10 @@ def _persist_results(
         db.add(sheet)
         sheets.append(sheet)
 
+    db.flush()
+    # The same data arriving twice — a file uploaded again, two sources that
+    # both carry the sheet — is kept as a note, not as a second table to analyse.
+    skip_duplicate_tables(db, record)
     store.persist()
     files = list(record.source_files or [])
     if source_label not in files:
@@ -239,14 +250,84 @@ def _persist_results(
     return sheets
 
 
+def skip_duplicate_tables(db: Session, record: IngestionSession) -> dict[str, str]:
+    """Set aside every table that is an exact copy of an earlier one.
+
+    Returns ``{copy: original}``.  A copy keeps its row in the triage list —
+    with the reason, so the user can see what happened to the file they added —
+    but leaves the store and everything derived from it: its column semantics,
+    its relationships and its equivalence pairs.  Idempotent, and cheap when
+    there is nothing to do, so it runs both when a source arrives and when an
+    older session is opened (sessions made before this existed still hold
+    their ``_2`` copies).
+    """
+
+    sheets = {
+        sheet.table_name: sheet
+        for sheet in db.execute(select(SheetRecord).where(SheetRecord.session_id == record.id))
+        .scalars()
+        .all()
+    }
+    if sum(1 for sheet in sheets.values() if not sheet.skipped) < 2:
+        return {}
+
+    store = get_store(record.id)
+    live = {
+        name: store.get(name)
+        for name, sheet in sheets.items()
+        if not sheet.skipped and store.has(name)
+    }
+    duplicates = find_duplicate_tables(live)
+    if not duplicates:
+        return {}
+
+    names = list(duplicates)
+    for copy, original in duplicates.items():
+        sheet = sheets[copy]
+        sheet.skipped = True
+        sheet.skip_reason = duplicate_reason(original)
+        sheet.triage = TriageStatus.CLEAN.value
+        store.drop(copy)
+    store.persist()
+
+    db.execute(
+        delete(ColumnSemantics).where(
+            ColumnSemantics.session_id == record.id, ColumnSemantics.table_name.in_(names)
+        )
+    )
+    db.execute(
+        delete(RelationshipRecord).where(
+            RelationshipRecord.session_id == record.id,
+            or_(RelationshipRecord.from_table.in_(names), RelationshipRecord.to_table.in_(names)),
+        )
+    )
+    db.execute(
+        delete(EquivalenceCandidateRecord).where(
+            EquivalenceCandidateRecord.session_id == record.id,
+            or_(
+                EquivalenceCandidateRecord.left_table.in_(names),
+                EquivalenceCandidateRecord.right_table.in_(names),
+            ),
+        )
+    )
+    record.stats = {**(record.stats or {}), **triage_stats(db, record)}
+    db.flush()
+    logger.info("session %s: set aside duplicate table(s) %s", record.id, duplicates)
+    return duplicates
+
+
 def triage_stats(db: Session, record: IngestionSession) -> dict[str, Any]:
     counts = {status.value: 0 for status in TriageStatus}
     total_rows = 0
-    sheets = list(
-        db.execute(select(SheetRecord).where(SheetRecord.session_id == record.id))
+    sheets = [
+        sheet
+        for sheet in db.execute(select(SheetRecord).where(SheetRecord.session_id == record.id))
         .scalars()
         .all()
-    )
+        # A set-aside copy is not a table of the dataset; counting it would
+        # double its rows in the totals.
+        if not is_duplicate_reason(sheet.skip_reason)
+    ]
     for sheet in sheets:
         counts[sheet.triage] = counts.get(sheet.triage, 0) + 1
         total_rows += sheet.row_count
@@ -356,9 +437,28 @@ def set_table_key(
 def detect_and_store_equivalences(
     db: Session, record: IngestionSession
 ) -> list[EquivalenceCandidateRecord]:
-    """Phase 0 cross-sheet equivalence detection."""
+    """Phase 0 cross-sheet equivalence detection.
+
+    Pairs the evidence settles are decided here (``decided_by == "auto"``); only
+    a pair it cannot settle is left for the user.  Detection runs again after
+    every upload, so an answer the user already gave is carried over rather than
+    wiped — and an automatic one is simply recomputed from the new data.
+    """
 
     tables = analyzable_tables(db, record.id)
+    earlier = {
+        (r.left_table, r.left_column, r.right_table, r.right_column): r.confirmed
+        for r in db.execute(
+            select(EquivalenceCandidateRecord).where(
+                EquivalenceCandidateRecord.session_id == record.id
+            )
+        )
+        .scalars()
+        .all()
+        # Answered, and not by the platform: a row from before ``decided_by``
+        # existed has it unset and can only have been answered by a person.
+        if r.confirmed is not None and r.decided_by != "auto"
+    }
     db.execute(
         delete(EquivalenceCandidateRecord).where(
             EquivalenceCandidateRecord.session_id == record.id
@@ -368,6 +468,17 @@ def detect_and_store_equivalences(
     rows: list[EquivalenceCandidateRecord] = []
     for candidate in candidates:
         payload = candidate.to_dict()
+        key = (
+            payload["left_table"],
+            payload["left_column"],
+            payload["right_table"],
+            payload["right_column"],
+        )
+        if key in earlier:
+            confirmed, decided_by = earlier[key], "user"
+        else:
+            confirmed = auto_verdict(candidate)
+            decided_by = "auto" if confirmed is not None else None
         row = EquivalenceCandidateRecord(
             session_id=record.id,
             left_table=payload["left_table"],
@@ -380,7 +491,8 @@ def detect_and_store_equivalences(
             value_overlap=payload["value_overlap"],
             type_compatible=payload["type_compatible"],
             explanation=payload["explanation"],
-            confirmed=None,
+            confirmed=confirmed,
+            decided_by=decided_by,
             left_embedding=payload.get("left_embedding"),
             right_embedding=payload.get("right_embedding"),
         )
@@ -402,16 +514,66 @@ def _semantic_description(column: ColumnSemantics, table_type: str = "data table
     Claude-written sentences when an API key is configured.
     """
 
-    samples = ", ".join(str(v) for v in (column.sample_values or [])[:5])
-    parts = [
-        column.column_name.replace("_", " "),
-        f"in table {column.table_name}",
-        f"({column.effective_label.replace('_', ' ')}, {column.effective_type})",
-        f"— {table_type}",
-    ]
-    if samples:
-        parts.append(f"example values: {samples}")
-    return " ".join(parts)
+    return template_description(
+        column.column_name,
+        column.table_name,
+        column.effective_label,
+        column.effective_type,
+        table_type,
+        column.sample_values or [],
+    )
+
+
+#: Columns per description request.  A model's latency is dominated by how much
+#: it has to write, so a few shorter requests in parallel finish well before one
+#: long one — but every request also counts against the model's quota, and a
+#: free-tier key allows only a few dozen a day.  Sixty columns keeps a typical
+#: dataset (a hundred-odd columns) to two or three requests.
+DESCRIBE_CHUNK_COLUMNS = 60
+DESCRIBE_MAX_WORKERS = 4
+
+
+def _describe_in_chunks(
+    claude, tables_payload: list[dict[str, Any]]
+) -> dict[str, dict[str, str]]:
+    """``claude.describe_columns_dataset`` split into parallel column chunks.
+
+    A chunk may hold part of a table; the results are merged per
+    ``table -> column``.  A chunk that fails costs only its own columns their
+    Claude-written description — they keep the deterministic template.
+    """
+
+    chunks: list[list[dict[str, Any]]] = [[]]
+    room = DESCRIBE_CHUNK_COLUMNS
+    for table in tables_payload:
+        columns = list(table["columns"])
+        while columns:
+            take, columns = columns[:room], columns[room:]
+            chunks[-1].append({"table": table["table"], "columns": take})
+            room -= len(take)
+            if room == 0:
+                chunks.append([])
+                room = DESCRIBE_CHUNK_COLUMNS
+    chunks = [chunk for chunk in chunks if chunk]
+
+    def run(chunk: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+        try:
+            return claude.describe_columns_dataset(chunk) or {}
+        except Exception as exc:  # pragma: no cover - defensive, network dependent
+            logger.warning("column description failed: %s", exc)
+            return {}
+
+    if len(chunks) == 1:
+        results = [run(chunks[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=min(DESCRIBE_MAX_WORKERS, len(chunks))) as pool:
+            results = list(pool.map(run, chunks))
+
+    merged: dict[str, dict[str, str]] = {}
+    for result in results:
+        for table_name, columns in result.items():
+            merged.setdefault(table_name, {}).update(columns)
+    return merged
 
 
 def _describe_columns(rows: list[ColumnSemantics], claude=None) -> None:
@@ -449,11 +611,7 @@ def _describe_columns(rows: list[ColumnSemantics], claude=None) -> None:
         }
         for table_name, columns in by_table.items()
     ]
-    try:
-        descriptions = claude.describe_columns_dataset(tables_payload)
-    except Exception as exc:  # pragma: no cover - defensive, network dependent
-        logger.warning("column description failed: %s", exc)
-        return
+    descriptions = _describe_in_chunks(claude, tables_payload)
     if not descriptions:
         return
     for table_name, columns in by_table.items():
@@ -593,6 +751,13 @@ def semantics_payload(db: Session, session_id: str) -> dict[str, Any]:
         "unknown_count": sum(1 for c in columns if c.effective_label == "unknown"),
         "validated_count": sum(1 for c in columns if c.validated),
         "total_columns": len(columns),
+        # Columns whose description is still the mechanical template — the
+        # language model was unavailable (a rate limit, no key) when they were
+        # described.  Questions find columns through these descriptions, so the
+        # screen says so and offers to run it again.
+        "basic_description_count": sum(
+            1 for c in columns if is_template_description(c.semantic_description)
+        ),
     }
 
 
@@ -754,7 +919,9 @@ def _upsert_relationship(
     ).scalar_one_or_none()
 
     if existing is not None:
-        if existing.status == RelationshipStatus.PROPOSED.value:
+        # A verdict the platform reached is a default, so it is re-derived from
+        # the fresh evidence; one a person reached is theirs and stays.
+        if existing.status == RelationshipStatus.PROPOSED.value or existing.decided_by == "auto":
             existing.score = payload["score"]
             existing.origin = payload["origin"]
             existing.evidence = payload.get("evidence", {})
@@ -800,8 +967,10 @@ def detect_relationships(
     dependencies = detect_all_dependencies(tables, key_columns=key_columns)
 
     created = 0
+    found: set[tuple[str, str, str, str, str]] = set()
     for candidate in candidates:
         payload = candidate.to_dict()
+        found.add(_relationship_key(payload))
         stored, is_new = _upsert_relationship(db, record.id, payload)
         created += int(is_new)
         low, high = LLM_EXPLAIN_BAND
@@ -809,16 +978,129 @@ def detect_relationships(
             stored.llm_explanation = _explain_candidate(db, record.id, payload, claude)
 
     for dependency in dependencies:
-        _, is_new = _upsert_relationship(db, record.id, dependency.to_dict())
+        payload = dependency.to_dict()
+        found.add(_relationship_key(payload))
+        _, is_new = _upsert_relationship(db, record.id, payload)
         created += int(is_new)
 
     db.flush()
+    _forget_unfound_relationships(db, record.id, found)
+    apply_auto_relationship_decisions(db, record.id)
+    sync_key_roles(db, record.id)
     payload = relationships_payload(db, record.id)
     payload["created"] = created
     # SemTabla runs table profiling as Step 4, on the output of the three
     # detection steps before it.  This is that step.
     payload["profiles"] = profile_tables(db, record)["profiles"]
     return payload
+
+
+def _relationship_key(payload: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        payload["rel_type"],
+        payload["from_table"],
+        payload["from_column"],
+        payload["to_table"],
+        payload["to_column"],
+    )
+
+
+def _forget_unfound_relationships(
+    db: Session, session_id: str, found: set[tuple[str, str, str, str, str]]
+) -> int:
+    """Drop what detection no longer finds and no person ever ruled on.
+
+    Detection's output is the truth about the data as it is *now*.  A proposal
+    or a platform verdict from an earlier run that the cleaned data no longer
+    supports (or that named a table since set aside) would otherwise sit in the
+    list forever, looking current.  A user's decision, a drawn edge and a
+    declared key are never touched.
+    """
+
+    removed = 0
+    for row in db.execute(
+        select(RelationshipRecord).where(RelationshipRecord.session_id == session_id)
+    ).scalars():
+        if row.origin in (RelationshipOrigin.MANUAL.value, RelationshipOrigin.DECLARED.value):
+            continue
+        undecided = row.status == RelationshipStatus.PROPOSED.value
+        if not (undecided or row.decided_by == "auto"):
+            continue
+        key = (row.rel_type, row.from_table, row.from_column, row.to_table, row.to_column)
+        if key not in found:
+            db.delete(row)
+            removed += 1
+    if removed:
+        db.flush()
+    return removed
+
+
+def apply_auto_relationship_decisions(db: Session, session_id: str) -> dict[str, int]:
+    """Settle every relationship the evidence settles; leave the rest proposed.
+
+    Touches only rows nobody has ruled on (still proposed, or decided by this
+    function on an earlier run).  Returns how many ended up in each state.
+    """
+
+    rows = list(
+        db.execute(select(RelationshipRecord).where(RelationshipRecord.session_id == session_id))
+        .scalars()
+        .all()
+    )
+    labels = {
+        (c.table_name, c.column_name): c.effective_label
+        for c in db.execute(
+            select(ColumnSemantics).where(ColumnSemantics.session_id == session_id)
+        )
+        .scalars()
+        .all()
+    }
+
+    def person_decided(row: RelationshipRecord) -> bool:
+        return row.status != RelationshipStatus.PROPOSED.value and row.decided_by != "auto"
+
+    eligible = [row for row in rows if not person_decided(row)]
+    taken = [
+        (row.from_table, row.from_column, row.to_table, row.to_column)
+        for row in rows
+        if row.rel_type == RelationshipType.FOREIGN_KEY.value
+        and row.status == RelationshipStatus.CONFIRMED.value
+        and person_decided(row)
+    ]
+
+    foreign_keys = [
+        {
+            "id": row.id,
+            "from_table": row.from_table,
+            "from_column": row.from_column,
+            "to_table": row.to_table,
+            "to_column": row.to_column,
+            "score": row.score,
+            "origin": row.origin,
+            "evidence": row.evidence or {},
+            "child_is_identifier": labels.get((row.from_table, row.from_column))
+            in IDENTIFIER_LABELS,
+        }
+        for row in eligible
+        if row.rel_type == RelationshipType.FOREIGN_KEY.value
+    ]
+    verdicts = settle_foreign_keys(foreign_keys, taken=taken)
+
+    now = datetime.now(timezone.utc)
+    tally = {"confirmed": 0, "rejected": 0, "proposed": 0}
+    for row in eligible:
+        verdict = (
+            verdicts[row.id]
+            if row.rel_type == RelationshipType.FOREIGN_KEY.value
+            else decide_dependency(row.rel_type)
+        )
+        row.status = verdict.status
+        row.decided_by = "auto" if verdict.decided else None
+        row.decided_at = now if verdict.decided else None
+        row.evidence = {**(row.evidence or {}), "auto_reason": verdict.reason}
+        tally[verdict.status] += 1
+    db.flush()
+    return tally
 
 
 def relationships_payload(db: Session, session_id: str) -> dict[str, Any]:
@@ -849,6 +1131,14 @@ def relationships_payload(db: Session, session_id: str) -> dict[str, Any]:
                 1 for r in rows if r.rel_type != RelationshipType.FOREIGN_KEY.value
             ),
             **by_status,
+            # The only thing left for a person: a link that nearly holds.
+            # Patterns inside a table describe the data and ask nothing.
+            "needs_review": sum(
+                1
+                for r in rows
+                if r.rel_type == RelationshipType.FOREIGN_KEY.value
+                and r.status == RelationshipStatus.PROPOSED.value
+            ),
         },
         # Named so the UI can explain an empty diagram instead of implying
         # the tables are unrelated.
@@ -977,6 +1267,7 @@ def decide_relationship(
     row.status = (
         RelationshipStatus.CONFIRMED.value if confirmed else RelationshipStatus.REJECTED.value
     )
+    row.decided_by = "user"
     row.decided_at = datetime.now(timezone.utc)
     db.flush()
     return row
@@ -1027,6 +1318,7 @@ def add_manual_relationship(
     if existing is not None:
         existing.status = RelationshipStatus.CONFIRMED.value
         existing.origin = RelationshipOrigin.MANUAL.value
+        existing.decided_by = "user"
         existing.decided_at = datetime.now(timezone.utc)
         db.flush()
         return existing
@@ -1041,6 +1333,7 @@ def add_manual_relationship(
         score=1.0,
         origin=RelationshipOrigin.MANUAL.value,
         status=RelationshipStatus.CONFIRMED.value,
+        decided_by="user",
         explanation="drawn by you in the relationship diagram",
         evidence={},
         decided_at=datetime.now(timezone.utc),
@@ -1485,13 +1778,26 @@ def _export_inputs(
         if not (sheets.get(name) is not None and sheets[name].skipped)
     }
 
+    # What the source database called each column's type.  A spreadsheet has no
+    # native schema, so it contributes nothing here and its columns are typed by
+    # the mapping alone.
+    declared_types = {
+        name: {
+            str(c.get("name")): str(c.get("data_type"))
+            for c in (sheet.native_schema or {}).get("columns", [])
+        }
+        for name, sheet in sheets.items()
+    }
+
     columns: dict[str, list[dict[str, Any]]] = {}
     for column in (
         db.execute(select(ColumnSemantics).where(ColumnSemantics.session_id == record.id))
         .scalars()
         .all()
     ):
-        columns.setdefault(column.table_name, []).append(column.to_dict())
+        fact = column.to_dict()
+        fact["declared_type"] = declared_types.get(column.table_name, {}).get(column.column_name)
+        columns.setdefault(column.table_name, []).append(fact)
 
     relationships = [
         row.to_dict() | {"status": row.status}
@@ -1848,6 +2154,16 @@ def _record_history(db: Session, session_id: str, question: str, result: dict[st
             chart=(result.get("visualization") or {}).get("chart"),
             confidence=result.get("confidence"),
             outcome=result.get("outcome") or ("answered" if result.get("ok") else "rejected"),
+            resolved_question=(
+                result.get("resolved_question")
+                if result.get("resolved_question") not in (None, question)
+                else None
+            ),
+            explanation=result.get("explanation"),
+            tables_used=result.get("tables_used") or result.get("tables_considered"),
+            clarification_options=result.get("clarification_options") or None,
+            clarifies=result.get("clarifies"),
+            source=result.get("source"),
         )
     )
     db.flush()
@@ -1864,6 +2180,75 @@ def _record_history(db: Session, session_id: str, question: str, result: dict[st
     )
     if stale:
         db.execute(delete(QueryHistoryRecord).where(QueryHistoryRecord.id.in_(stale)))
+
+
+def recent_conversation(db: Session, session_id: str, limit: int) -> list[dict[str, Any]]:
+    """The last ``limit`` turns of this session, oldest first, as the server reads them.
+
+    Kept server-side (``query_history``) rather than echoed back by the browser
+    so a follow-up is understood the same way after a reload, and so what a
+    turn "meant" is whatever the server decided it meant — never client input.
+    """
+
+    rows = (
+        db.execute(
+            select(QueryHistoryRecord)
+            .where(QueryHistoryRecord.session_id == session_id)
+            .order_by(QueryHistoryRecord.created_at.desc())
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "question": row.resolved_question or row.question,
+            "outcome": row.outcome,
+            "sql": row.sql,
+            "explanation": row.explanation or "",
+            "tables_used": list(row.tables_used or []),
+            "clarification_options": list(row.clarification_options or []),
+            "reason": row.error,
+        }
+        for row in reversed(rows)
+    ]
+
+
+def _awaiting_clarification(turn: dict[str, Any] | None) -> bool:
+    """Whether this turn ended by asking the user which reading they meant."""
+
+    return bool(turn and turn["outcome"] == "abstained" and turn["clarification_options"])
+
+
+def _conversation_for_model(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What a model is shown of earlier turns: the question, how it ended, what it computed.
+
+    Never a result row — the same boundary every other call holds.  A turn that
+    failed outright says nothing a later question can build on, so it is left
+    out.
+    """
+
+    shown: list[dict[str, Any]] = []
+    for turn in turns:
+        if turn["outcome"] == "answered":
+            shown.append(
+                {
+                    "question": turn["question"],
+                    "outcome": "answered",
+                    "computed": turn["explanation"],
+                    "sql": turn["sql"],
+                }
+            )
+        elif _awaiting_clarification(turn):
+            shown.append(
+                {
+                    "question": turn["question"],
+                    "outcome": "clarification requested",
+                    "asked": turn["reason"],
+                    "options_offered": turn["clarification_options"],
+                }
+            )
+    return shown
 
 
 def question_history(db: Session, session_id: str) -> list[dict[str, Any]]:
@@ -1938,7 +2323,12 @@ def list_query_examples(
 
 
 def save_query_example(
-    db: Session, record: IngestionSession, question: str, sql: str
+    db: Session,
+    record: IngestionSession,
+    question: str,
+    sql: str,
+    explanation: str = "",
+    also_asked_as: list[str] | None = None,
 ) -> QueryExample:
     """Save one successful answer as a verified example — the click itself is the verification.
 
@@ -1947,6 +2337,13 @@ def save_query_example(
     :func:`pin_dashboard_card` re-validates: a save request is client-supplied
     input, and this is the write path that turns a stored statement into
     context every future question is judged against.
+
+    ``question`` is the complete, standalone form.  ``also_asked_as`` carries
+    the vaguer wording that led to it — an ambiguous question the user settled
+    by picking a reading — so typing that wording again lands on this SQL
+    instead of being asked about all over again.  Saving a question that is
+    already an example replaces its SQL: the latest verification wins, rather
+    than two rows disagreeing about one question.
     """
 
     question = (question or "").strip()
@@ -1965,13 +2362,34 @@ def save_query_example(
     except QueryRejected as exc:
         raise ValueError(f"this query can no longer be saved as an example: {exc}") from exc
 
-    vector = get_embedder().encode([question])[0]
-    example = QueryExample(
-        session_id=record.id, question=question, sql=validated_sql, embedding=vector, verified=True
-    )
-    db.add(example)
+    wordings: dict[str, str] = {normalize_question(question): question}
+    for alias in also_asked_as or []:
+        alias = (alias or "").strip()
+        if alias:
+            wordings.setdefault(normalize_question(alias), alias)
+    wordings.pop("", None)
+    if not wordings:
+        raise ValueError("an example needs both a question and its SQL")
+
+    existing = {
+        normalize_question(example.question): example
+        for example in list_query_examples(db, record.id)
+    }
+    texts = list(wordings.values())
+    vectors = get_embedder().encode(texts)
+    saved: list[QueryExample] = []
+    for key, text, vector in zip(wordings, texts, vectors):
+        example = existing.get(key)
+        if example is None:
+            example = QueryExample(session_id=record.id, question=text)
+            db.add(example)
+        example.sql = validated_sql
+        example.explanation = (explanation or "").strip() or None
+        example.embedding = vector
+        example.verified = True
+        saved.append(example)
     db.flush()
-    return example
+    return saved[0]
 
 
 def delete_query_example(db: Session, record: IngestionSession, example_id: str) -> None:
@@ -1986,8 +2404,61 @@ def delete_query_example(db: Session, record: IngestionSession, example_id: str)
     db.flush()
 
 
+def _run_and_package(
+    db: Session,
+    record: IngestionSession,
+    claude,
+    *,
+    question: str,
+    sql: str,
+    explanation: str,
+    confidence: float,
+    dialect: str,
+    tables: list[str],
+    columns: list[str],
+    result_rows: list[dict[str, Any]],
+    truncated: bool,
+    attempts: list[dict[str, Any]],
+    meta: dict[str, Any],
+) -> dict[str, Any]:
+    """Shape an already-executed statement's result into an answer — shared by every path that gets here."""
+
+    visualization = classify_query_shape(columns, result_rows)
+    # A dashboard nicety, not part of the answer itself: a fake standing in for
+    # Claude in a test need not implement it, and an unavailable/degraded model
+    # simply yields no suggestions rather than breaking the question that just
+    # succeeded.
+    suggest = getattr(claude, "suggest_followups", None)
+    suggestions = (suggest(question, sql, columns, tables) if suggest else None) or []
+
+    result = {
+        "ok": True,
+        "outcome": "answered",
+        "question": question,
+        "sql": sql,
+        "explanation": explanation,
+        "confidence": confidence,
+        "dialect": dialect,
+        "columns": columns,
+        "rows": result_rows,
+        "row_count": len(result_rows),
+        "truncated": truncated,
+        "tables_used": tables,
+        "attempts": attempts,
+        "visualization": visualization,
+        "suggestions": suggestions,
+        **meta,
+    }
+    _record_history(db, record.id, question, result)
+    return result
+
+
 def answer_question(
-    db: Session, record: IngestionSession, question: str, claude=None
+    db: Session,
+    record: IngestionSession,
+    question: str,
+    claude=None,
+    extra_rules: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Turn one natural-language question into SQL, run it once, and shape the result.
 
@@ -1998,6 +2469,21 @@ def answer_question(
     one statement that survives :func:`~app.query.guard.validate_select_only`
     and an ``EXPLAIN`` (§Phase 5's self-correction loop) ever reaches the
     exported database, and it runs exactly once, row-capped, at the very end.
+
+    A question is read **in the context of the session's last few turns**: a
+    follow-up ("and by month?") or the reply to a clarification is first made
+    a complete, standalone question (``resolved_question``), and everything
+    after — retrieval, the ambiguity check, generation, saving an example —
+    works from that.  What the user has already settled is not asked again: a
+    question that answers a clarification, refines an answer, or matches a
+    verified example skips the ambiguity check, and one that *is* a verified
+    example is answered from its saved SQL without a model call at all.
+
+    ``extra_rules`` are rules for this one question — what a person types beside
+    it to say how to read it ("revenue means shipped orders") — as opposed to the
+    ones recorded for the whole dataset.  They are read exactly like recorded
+    rules: shown to the model ahead of them, and any column they name by name is
+    kept in the schema the model is given however the retrieval scored it.
 
     Unlike taxonomy labelling or plan generation, there is no rule-based
     fallback for "turn English into SQL" — so with no model available this
@@ -2020,7 +2506,8 @@ def answer_question(
         raise ValueError("the semantic layer has no columns to query yet")
 
     settings = get_settings()
-    question_vector = get_embedder().encode([question])[0]
+    embedder = get_embedder()
+    dialect = export.dialect
 
     sheets = _sheets_by_name(db, record.id)
     exported_tables = sorted({str(row.get("table_name")) for row in rows})
@@ -2029,12 +2516,12 @@ def answer_question(
         for name in exported_tables
     }
 
-    scored = rank_tables(question_vector, table_vectors)
-    selected = select_tables(scored, settings.query_max_tables)
-    selected = expand_by_references(selected, rows)
-    dialect = export.dialect
+    def pick_tables(vector) -> list[str]:
+        scored = rank_tables(vector, table_vectors)
+        return expand_by_references(select_tables(scored, settings.query_max_tables), rows)
 
     if claude is None or not claude.available:
+        selected = pick_tables(embedder.encode([question])[0])
         result = {
             "ok": False,
             "outcome": "rejected",
@@ -2050,51 +2537,190 @@ def answer_question(
         _record_history(db, record.id, question, result)
         return result
 
-    # Ambiguity resolution (§3.1.6) — a discrete call on the pre-selected
-    # tables, before column ranking or SQL generation. Degrades to "not
-    # ambiguous" with no client, same as every other optional Claude call.
-    check_ambiguity = getattr(claude, "check_ambiguity", None)
-    ambiguity_tables = [
-        {"name": name, "description": sheets[name].effective_description if name in sheets else ""}
-        for name in selected
-    ]
-    ambiguity = check_ambiguity(question, ambiguity_tables) if check_ambiguity else None
-    if ambiguity and ambiguity.get("ambiguous"):
-        result = {
-            "ok": False,
-            "outcome": "abstained",
-            "ambiguous": True,
-            "question": question,
-            "tables_considered": selected,
-            "attempts": [],
-            "clarification_options": ambiguity.get("options", []),
-            "error": ambiguity.get("reason")
-            or "this question is ambiguous — pick a specific interpretation",
-        }
-        _record_history(db, record.id, question, result)
-        return result
+    # -- What is actually being asked, given what came before ----------------
+    conversation = recent_conversation(db, record.id, settings.query_conversation_turns)
+    previous = conversation[-1] if conversation else None
+    pending = previous if _awaiting_clarification(previous) else None
 
-    selected_columns = select_columns(
-        question_vector, rows, selected, settings.query_max_ranked_columns
-    )
-    context = schema_context(selected_columns)
-    allowed_tables = {name.lower() for name in selected}
+    resolved = question
+    follow_up = False
+    clarifies: str | None = None
+    if pending and normalize_question(question) in {
+        normalize_question(option) for option in pending["clarification_options"]
+    }:
+        # One of the rephrasings the user was just offered — already complete.
+        follow_up = True
+        clarifies = pending["question"]
+    elif conversation:
+        rewrite = getattr(claude, "rewrite_question", None)
+        rewritten = rewrite(question, _conversation_for_model(conversation)) if rewrite else None
+        if rewritten and rewritten["follow_up"]:
+            resolved = rewritten["question"]
+            follow_up = True
+            if pending:
+                clarifies = pending["question"]
+
+    meta: dict[str, Any] = {
+        "resolved_question": resolved,
+        "follow_up": follow_up,
+        "clarifies": clarifies,
+    }
+
+    question_vector = embedder.encode([resolved])[0]
+    selected = pick_tables(question_vector)
+    if follow_up and previous:
+        # A refinement lives in the tables the answer it refines already read.
+        known = {name.lower() for name in selected}
+        selected += [
+            name
+            for name in previous["tables_used"]
+            if name.lower() not in known and name in exported_tables
+        ]
 
     # The third retrieval index (§4.2): the user's own recorded rules and
     # previously verified question/SQL pairs for this dataset, ranked by
     # relevance to this question exactly like tables and columns are.
     rule_records = list_business_rules(db, record.id)
-    retrieved_rules = retrieve_business_rules(
+    retrieved_rules = [
+        *(str(rule).strip() for rule in extra_rules if str(rule).strip()),
+        *retrieve_business_rules(
+            question_vector,
+            [{"rule_text": r.rule_text, "embedding": r.embedding} for r in rule_records],
+            settings.query_max_business_rules,
+        ),
+    ]
+    ranked_examples = rank_examples(
         question_vector,
-        [{"rule_text": r.rule_text, "embedding": r.embedding} for r in rule_records],
-        settings.query_max_business_rules,
+        [
+            {
+                "id": e.id,
+                "question": e.question,
+                "sql": e.sql,
+                "explanation": e.explanation,
+                "embedding": e.embedding,
+            }
+            for e in list_query_examples(db, record.id, verified_only=True)
+        ],
     )
-    example_records = list_query_examples(db, record.id, verified_only=True)
-    retrieved_examples = retrieve_examples(
-        question_vector,
-        [{"question": e.question, "sql": e.sql, "embedding": e.embedding} for e in example_records],
+
+    # -- A question the user already verified is answered from what they verified.
+    # Only a *same question* qualifies (not merely a similar one — "top 5" and
+    # "top 10" read alike to an embedder): reusing SQL for a different question
+    # would be a wrong answer shown as a trusted one.  If the saved SQL no
+    # longer holds (a re-export renamed something) it falls through to ordinary
+    # generation, with the example still offered as a pattern.
+    asked = {normalize_question(resolved), normalize_question(question)}
+    exact = next((e for e in ranked_examples if normalize_question(e["question"]) in asked), None)
+    if exact is not None:
+        saved_columns: list[str] = []
+        saved_rows: list[dict[str, Any]] = []
+        saved_truncated = False
+        try:
+            saved_sql = validate_select_only(
+                exact["sql"], {name.lower() for name in exported_tables}, dialect
+            )
+            explain(record.id, saved_sql)
+            saved_columns, saved_rows, saved_truncated = run_readonly(
+                record.id, saved_sql, settings.query_row_cap
+            )
+        except Exception:  # QueryRejected, or the driver's own error
+            saved_sql = None
+        if saved_sql is not None:
+            used, _ = referenced_names(saved_sql, dialect)
+            return _run_and_package(
+                db,
+                record,
+                claude,
+                question=question,
+                sql=saved_sql,
+                explanation=exact["explanation"] or "Answered from the query you saved for this question.",
+                confidence=1.0,
+                dialect=dialect,
+                tables=[name for name in exported_tables if name.lower() in used],
+                columns=saved_columns,
+                result_rows=saved_rows,
+                truncated=saved_truncated,
+                attempts=[],
+                meta={**meta, "source": "saved_example"},
+            )
+
+    # An example is shown only if it resembles the question: ranking orders the
+    # examples, it does not make the nearest of a few unrelated ones relevant.  A
+    # *close* one is more — what the user already settled.  The floor never sits
+    # above the close threshold, so a close example is always shown.
+    shown_examples = examples_worth_showing(
+        ranked_examples,
         settings.query_max_examples,
+        min(settings.query_example_min_similarity, settings.query_example_match_threshold),
     )
+    close_examples = [
+        e for e in shown_examples if e["similarity"] >= settings.query_example_match_threshold
+    ]
+    example_columns: set[str] = set()
+    for example in shown_examples:
+        example_tables, columns_named = referenced_names(example["sql"], dialect)
+        example_columns |= columns_named
+        known = {name.lower() for name in selected}
+        selected += [
+            name for name in exported_tables if name.lower() in example_tables - known
+        ]
+
+    selected_columns = select_columns(
+        question_vector,
+        rows,
+        selected,
+        settings.query_max_ranked_columns,
+        question=resolved,
+        include_columns=example_columns | columns_named_in(retrieved_rules, rows, set(selected)),
+    )
+    context = schema_context(selected_columns)
+    allowed_tables = {name.lower() for name in selected}
+    retrieved_examples = [
+        {"question": str(e["question"]), "sql": str(e["sql"])} for e in shown_examples
+    ]
+
+    # -- Ambiguity resolution (§3.1.6) ---------------------------------------
+    # A discrete call on the pre-selected tables and their columns, before any
+    # SQL is written.  Skipped whenever the user has already told us what they
+    # mean — by picking an offered reading, by refining an answer they got, or
+    # by saving a close example — so a clarification is asked at most once and
+    # never about something already settled.  Degrades to "not ambiguous" with
+    # no client, same as every other optional Claude call.
+    check_ambiguity = getattr(claude, "check_ambiguity", None)
+    already_settled = follow_up or bool(close_examples)
+    if check_ambiguity and not already_settled:
+        columns_by_table: dict[str, list[str]] = {}
+        for row in selected_columns:
+            description = str(row.get("semantic_description") or "")[:80]
+            entry = f"{row.get('column_name')}: {description}" if description else str(row.get("column_name"))
+            columns_by_table.setdefault(str(row.get("table_name")), []).append(entry)
+        ambiguity_tables = [
+            {
+                "name": name,
+                "description": sheets[name].effective_description if name in sheets else "",
+                "columns": columns_by_table.get(name, []),
+            }
+            for name in selected
+        ]
+        ambiguity_args: dict[str, Any] = {}
+        if retrieved_rules:
+            ambiguity_args["business_rules"] = retrieved_rules
+        ambiguity = check_ambiguity(resolved, ambiguity_tables, **ambiguity_args)
+        if ambiguity and ambiguity.get("ambiguous"):
+            result = {
+                "ok": False,
+                "outcome": "abstained",
+                "ambiguous": True,
+                "question": question,
+                "tables_considered": selected,
+                "attempts": [],
+                "clarification_options": ambiguity.get("options", []),
+                "error": ambiguity.get("reason")
+                or "this question is ambiguous — pick a specific interpretation",
+                **meta,
+            }
+            _record_history(db, record.id, question, result)
+            return result
 
     attempts: list[dict[str, Any]] = []
     sql: str | None = None
@@ -2102,16 +2728,27 @@ def answer_question(
     confidence = 0.0
     last_error: str | None = None
     prior_sql: str | None = None
+    result_columns: list[str] = []
+    result_rows: list[dict[str, Any]] = []
+    result_truncated = False
+
+    # A model fake that predates conversation support is simply not offered it.
+    generation_extras: dict[str, Any] = {}
+    if follow_up and conversation:
+        shown = _conversation_for_model(conversation)
+        if shown:
+            generation_extras["conversation"] = shown
 
     for attempt_no in range(1, settings.query_max_attempts + 1):
         generated = claude.generate_sql(
-            question,
+            resolved,
             dialect,
             context,
             prior_sql=prior_sql,
             prior_error=last_error,
             business_rules=retrieved_rules,
             examples=retrieved_examples,
+            **generation_extras,
         )
         if generated is None:
             last_error = claude.last_error or "the language model returned no usable answer"
@@ -2140,6 +2777,30 @@ def answer_question(
         # tests keep succeeding rather than starting to abstain.
         confidence = generated.get("confidence", 1.0)
         attempts.append({"attempt": attempt_no, "sql": validated, "error": None})
+
+        # A candidate below the confidence gate is withheld below — never
+        # executed, never rendered — so it is not run here either; the loop
+        # ends with ``sql`` set and the gate reports the abstention.
+        if confidence < settings.query_confidence_threshold:
+            break
+
+        # ``EXPLAIN`` plans the query without evaluating it, so it never sees
+        # a value-dependent failure — a CAST that only breaks on an empty
+        # string, a date parse that only breaks on a "TOTAL" footer row.
+        # Running it for real, still inside the retry loop, turns that class
+        # of error into a retryable one too: the driver's message goes back
+        # to the model as ``prior_error`` so the next attempt can write
+        # defensive SQL instead of the question failing with a 500.
+        try:
+            result_columns, result_rows, result_truncated = run_readonly(
+                record.id, validated, settings.query_row_cap
+            )
+        except Exception as exc:  # the driver's own exception type, dialect-dependent
+            last_error = str(exc)
+            sql = None
+            attempts[-1]["error"] = last_error
+            continue
+
         break
 
     if sql is None:
@@ -2150,6 +2811,7 @@ def answer_question(
             "tables_considered": selected,
             "attempts": attempts,
             "error": last_error or "the model could not produce a usable query for this question",
+            **meta,
         }
         _record_history(db, record.id, question, result)
         return result
@@ -2171,38 +2833,27 @@ def answer_question(
                 f"correctly — {explanation}" if explanation else
                 f"low confidence ({confidence:.2f}) that this query answers the question correctly"
             ),
+            **meta,
         }
         _record_history(db, record.id, question, result)
         return result
 
-    columns, result_rows, truncated = run_readonly(record.id, sql, settings.query_row_cap)
-    visualization = classify_query_shape(columns, result_rows)
-    # A dashboard nicety, not part of the answer itself: a fake standing in for
-    # Claude in a test need not implement it, and an unavailable/degraded model
-    # simply yields no suggestions rather than breaking the question that just
-    # succeeded.
-    suggest = getattr(claude, "suggest_followups", None)
-    suggestions = (suggest(question, sql, columns, selected) if suggest else None) or []
-
-    result = {
-        "ok": True,
-        "outcome": "answered",
-        "question": question,
-        "sql": sql,
-        "explanation": explanation,
-        "confidence": confidence,
-        "dialect": dialect,
-        "columns": columns,
-        "rows": result_rows,
-        "row_count": len(result_rows),
-        "truncated": truncated,
-        "tables_used": selected,
-        "attempts": attempts,
-        "visualization": visualization,
-        "suggestions": suggestions,
-    }
-    _record_history(db, record.id, question, result)
-    return result
+    return _run_and_package(
+        db,
+        record,
+        claude,
+        question=question,
+        sql=sql,
+        explanation=explanation,
+        confidence=confidence,
+        dialect=dialect,
+        tables=selected,
+        columns=result_columns,
+        result_rows=result_rows,
+        truncated=result_truncated,
+        attempts=attempts,
+        meta=meta,
+    )
 
 
 # ---------------------------------------------------------------------------

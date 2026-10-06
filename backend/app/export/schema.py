@@ -34,9 +34,23 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import pandas as pd
-from sqlalchemy import Column, ForeignKeyConstraint, MetaData, PrimaryKeyConstraint, Table
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Float,
+    ForeignKeyConstraint,
+    Integer,
+    MetaData,
+    Numeric,
+    PrimaryKeyConstraint,
+    Table,
+    Text,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
+from sqlalchemy.types import TypeEngine
 
 from app.core.schemas import (
     ADDITIVE_LABELS,
@@ -304,12 +318,15 @@ def build_plan(
             fact = facts.get(source_column, {})
             column_type = _column_type(fact)
             series = df[source_column]
+            # A type the user chose by hand is a decision; the source's own
+            # declaration only fills in for the type Phase 1 guessed.
+            declared = None if fact.get("user_column_type") else fact.get("declared_type")
             columns.append(
                 ColumnSpec(
                     source_name=source_column,
                     name=column_names[source_column],
                     column_type=column_type,
-                    type_plan=plan_type(column_type, series),
+                    type_plan=plan_type(column_type, series, declared),
                     nullable=True,
                     taxonomy_label=_label(fact),
                     is_additive=bool(
@@ -367,6 +384,23 @@ def _apply_primary_key(
             column.nullable = False  # PRIMARY KEY implies NOT NULL; say it anyway
 
 
+def _sql_type_of(spec: TableSpec, column_name: str) -> TypeEngine:
+    column = spec.column(column_name)
+    return column.type_plan.sql_type if column is not None else Text()
+
+
+def _storage_kind(sql_type: TypeEngine) -> str:
+    """Which family a database sorts a column into when it compares two of them."""
+
+    if isinstance(sql_type, Boolean):
+        return "boolean"
+    if isinstance(sql_type, (Integer, Numeric, Float)):
+        return "number"
+    if isinstance(sql_type, (DateTime, Date)):
+        return "time"
+    return "text"
+
+
 def _apply_foreign_keys(
     specs: Mapping[str, TableSpec],
     tables: Mapping[str, pd.DataFrame],
@@ -404,11 +438,24 @@ def _apply_foreign_keys(
             target_column=parent_column,
         )
 
+        child_type = _sql_type_of(child_spec, child_column)
+        parent_type = _sql_type_of(parent_spec, parent_column)
         if parent_spec.primary_key != [parent_column]:
             fk.enforced = False
             fk.reason = (
                 f"{parent_spec.name}.{parent_column} is not the primary key of its table, and "
                 "a foreign key can only point at a key"
+            )
+        elif _storage_kind(child_type) != _storage_kind(parent_type):
+            # PostgreSQL refuses to create a constraint between a number and a
+            # text column.  The reference is still true, so it stays in the
+            # semantic layer and Phase 5 can join on it; it just is not a
+            # constraint.
+            fk.enforced = False
+            fk.reason = (
+                f"{child_spec.name}.{child_column} is {render_type(child_type)} but "
+                f"{parent_spec.name}.{parent_column} is {render_type(parent_type)}, and a "
+                "database cannot enforce a reference between a number and text"
             )
         else:
             holds, reason = _reference_holds(

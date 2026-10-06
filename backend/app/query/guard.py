@@ -148,3 +148,28 @@ def validate_select_only(
         )
 
     return statement.sql(dialect=read)
+
+
+def referenced_names(sql: str, dialect: str = "postgresql") -> tuple[set[str], set[str]]:
+    """The (tables, columns) a statement names, lower-cased; both empty if it will not parse.
+
+    Not a safety check — :func:`validate_select_only` is that.  This only reads
+    what an already-accepted statement points at, so a verified example's own
+    tables and columns can be kept in the schema a later question is answered
+    against.  A CTE's alias is not a table and is left out.
+    """
+
+    try:
+        tree = sqlglot.parse_one(sql, read=_read_dialect(dialect))
+    except Exception:
+        return set(), set()
+    if tree is None:
+        return set(), set()
+    cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    tables = {
+        table.name.lower()
+        for table in tree.find_all(exp.Table)
+        if table.name and table.name.lower() not in cte_names
+    }
+    columns = {column.name.lower() for column in tree.find_all(exp.Column) if column.name}
+    return tables, columns

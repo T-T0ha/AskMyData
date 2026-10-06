@@ -199,7 +199,13 @@ function AnswerCard({ entry, onPin, onAsk, onSaveExample }) {
       actions={
         result.ok ? (
           <div className="flex items-center gap-2">
-            <ConfidenceBadge confidence={result.confidence} />
+            {result.source === 'saved_example' ? (
+              <Tag title="answered from the query you saved for this question — no model call">
+                Saved example
+              </Tag>
+            ) : (
+              <ConfidenceBadge confidence={result.confidence} />
+            )}
             {result.visualization?.chart !== 'table' && (
               <Button onClick={() => setView((value) => (value === 'chart' ? 'table' : 'chart'))}>
                 {view === 'chart' ? 'Table view' : 'Chart view'}
@@ -242,7 +248,7 @@ function AnswerCard({ entry, onPin, onAsk, onSaveExample }) {
           {result.ambiguous && result.clarification_options?.length > 0 && (
             <div className="mt-3">
               <p className="mb-1.5 text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>
-                Pick what you meant
+                Pick what you meant — or just type your answer below
               </p>
               <div className="flex flex-wrap gap-1.5">
                 {result.clarification_options.map((option) => (
@@ -268,6 +274,11 @@ function AnswerCard({ entry, onPin, onAsk, onSaveExample }) {
         </div>
       ) : (
         <div>
+          {result.resolved_question && result.resolved_question !== entry.question && (
+            <p className="mb-1 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+              Understood as: {result.resolved_question}
+            </p>
+          )}
           {result.explanation && (
             <p className="mb-3 text-sm" style={{ color: 'var(--text-secondary)' }}>
               {result.explanation}

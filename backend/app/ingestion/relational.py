@@ -10,14 +10,19 @@ what Phase 0 should do with them:
   no merged cells to flatten and no banner row to skip.  Names are sanitised to
   the same identifier shape the spreadsheet path produces, and the original is
   kept so the UI can show both.
-* **Declared types are authoritative, so nothing is re-typed.**  The
-  spreadsheet cleaner converts a text column to numeric when 80 % of its values
-  parse, which is right for a sheet where everything is a string, and wrong for
-  a database that has already committed to ``VARCHAR``.  Re-typing one side of
-  a declared foreign key and not the other would break exactly the joins the
-  source told us about.  Null markers are still normalised and whitespace still
-  trimmed — those change no type.  Phase 1 detects semantic types from *values*
-  regardless of dtype, so nothing is lost by leaving them alone.
+* **Declared types and stored values are authoritative, so nothing is re-typed
+  and nothing is rewritten.**  The spreadsheet cleaner converts a text column
+  to numeric when 80 % of its values parse, which is right for a sheet where
+  everything is a string, and wrong for a database that has already committed
+  to ``VARCHAR``.  Re-typing one side of a declared foreign key and not the
+  other would break exactly the joins the source told us about.  The same
+  holds for values: a sheet writes ``N/A`` where it means "not known", but a
+  database tells NULL from the text ``'-'`` and ``'unknown'`` and stored the
+  text on purpose, so a marker is counted and reported (``null_like_kept``),
+  never turned into a blank.  Phase 1 detects semantic types from *values*
+  regardless of dtype, and the reviewed cleaning step is where a person
+  changes a value.  The export honours the declared type too
+  (:func:`app.export.types.plan_type`).
 * **The schema itself is evidence.**  Declared primary keys, foreign keys and
   nullability are ground truth that Phase 3 would otherwise have to rediscover
   statistically, so they are captured into :class:`TableSchema` and persisted
@@ -464,8 +469,9 @@ def _load_one_table(
     }
     frame = frame.rename(columns=rename)
 
-    # retype=False: the source already declared these types (see module docstring).
-    cleaned, reports = clean_dataframe(frame, retype=False)
+    # The source already declared these types and stored these values (see the
+    # module docstring): nothing is re-typed, nothing is rewritten.
+    cleaned, reports = clean_dataframe(frame, retype=False, rewrite_values=False)
     info.row_count = int(len(cleaned)) if not truncated else info.row_count
 
     header = HeaderAnalysis(

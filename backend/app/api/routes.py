@@ -92,10 +92,14 @@ class ColumnOverride(BaseModel):
 class PlanDecision(BaseModel):
     action: str = Field(default="confirm", pattern="^(confirm|cancel)$")
     plan: list[dict[str, Any]] | None = None
+    #: Run the whole plan without pausing after each step for an approval.
+    auto_approve: bool = False
 
 
 class StepDecision(BaseModel):
-    action: str = Field(default="approve", pattern="^(approve|revert|retry|skip|abort)$")
+    action: str = Field(
+        default="approve", pattern="^(approve|approve_all|revert|retry|skip|abort)$"
+    )
     params: dict[str, Any] | None = None
 
 
@@ -152,6 +156,12 @@ class QueryExampleCreate(BaseModel):
 
     question: str = Field(min_length=1, max_length=2000)
     sql: str = Field(min_length=1)
+    #: What the answer said it computed, kept so the example explains itself
+    #: when a later identical question is answered from it.
+    explanation: str = Field(default="", max_length=2000)
+    #: Vaguer wordings this answer settled — the ambiguous question the user
+    #: resolved by picking a reading — saved against the same SQL.
+    also_asked_as: list[str] = Field(default_factory=list, max_length=5)
 
 
 class DashboardCardLayout(BaseModel):
@@ -451,6 +461,8 @@ def triage(
     record: IngestionSession = Depends(require_session),
     db: Session = Depends(session_scope),
 ) -> dict[str, Any]:
+    # Opening an older session is where its identical copies get set aside.
+    services.skip_duplicate_tables(db, record)
     return {
         "summary": services.triage_stats(db, record),
         "sheets": [s.to_dict() for s in record.sheets],
@@ -481,6 +493,7 @@ def decide_equivalence(
     if candidate is None or candidate.session_id != session_id:
         raise HTTPException(status_code=404, detail="equivalence candidate not found")
     candidate.confirmed = body.confirmed
+    candidate.decided_by = "user"
     db.flush()
     return candidate.to_dict()
 
@@ -924,7 +937,14 @@ def save_query_example(
     db: Session = Depends(session_scope),
 ) -> dict[str, Any]:
     try:
-        example = services.save_query_example(db, record, body.question, body.sql)
+        example = services.save_query_example(
+            db,
+            record,
+            body.question,
+            body.sql,
+            explanation=body.explanation,
+            also_asked_as=[text[:2000] for text in body.also_asked_as],
+        )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return example.to_dict()
@@ -1061,6 +1081,22 @@ def _pending_interrupt(session_id: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _resume_stalled(session_id: str) -> Any | None:
+    """Re-run a cleaning task that crashed and left the thread with no prompt.
+
+    A node that raises (or a server that dies mid-step) leaves the checkpoint
+    parked on that node with nothing to answer, so the step/plan endpoints
+    reject every click.  Running the parked task again — with no new input —
+    either completes it or lands on a prompt, which is what the user was
+    waiting for.  ``None`` when the thread is not stalled.
+    """
+
+    snapshot = graph().get_state(thread_config(session_id))
+    if snapshot.next and any(task.error for task in snapshot.tasks):
+        return graph().invoke(None, thread_config(session_id))
+    return None
+
+
 def _cleaning_response(db: Session, session_id: str, result: Any) -> dict[str, Any]:
     state = _graph_state(session_id)
     pending = interrupt_payload(result) or _pending_interrupt(session_id)
@@ -1154,10 +1190,16 @@ def submit_plan(
     """Answer the plan-review interrupt with the user's edited plan."""
 
     pending = _pending_interrupt(session_id)
+    if pending is None:
+        recovered = _resume_stalled(session_id)
+        if recovered is not None:
+            return _cleaning_response(db, session_id, recovered)
     if pending is None or pending.get("kind") != "plan_review":
         raise HTTPException(status_code=409, detail="no plan review is pending")
     result = resume_graph(
-        graph(), session_id, {"action": body.action, "plan": body.plan}
+        graph(),
+        session_id,
+        {"action": body.action, "plan": body.plan, "auto_approve": body.auto_approve},
     )
     return _cleaning_response(db, session_id, result)
 
@@ -1171,6 +1213,10 @@ def submit_step(
     """Answer a step-validation interrupt (approve / revert / retry / skip)."""
 
     pending = _pending_interrupt(session_id)
+    if pending is None:
+        recovered = _resume_stalled(session_id)
+        if recovered is not None:
+            return _cleaning_response(db, session_id, recovered)
     if pending is None or pending.get("kind") not in {"step_validation", "step_failed"}:
         raise HTTPException(status_code=409, detail="no step validation is pending")
     payload: dict[str, Any] = {"action": body.action}

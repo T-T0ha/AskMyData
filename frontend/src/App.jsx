@@ -138,6 +138,10 @@ export default function App() {
   const [stage, setStage] = useState('upload')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+  //: A file drop / "Choose file(s)" / database connect that is waiting on the
+  //: user to say whether it belongs in the currently open session or in a new
+  //: one — see `handleUpload`/`handleConnect` below.
+  const [pendingSource, setPendingSource] = useState(null)
 
   const run = useCallback(async (task) => {
     setBusy(true)
@@ -218,9 +222,12 @@ export default function App() {
   const loadSession = useCallback(
     async (id) => {
       if (!id) return
+      // Asked for first, on its own: opening an older session is when its
+      // identical copies are set aside, and everything fetched below should
+      // describe the session as it is afterwards.
+      const triageData = await api.triage(id)
       const [
         sessionData,
-        triageData,
         equivalenceData,
         semanticsData,
         cleaningData,
@@ -229,7 +236,6 @@ export default function App() {
         exportData,
       ] = await Promise.all([
         api.getSession(id),
-        api.triage(id),
         api.equivalences(id),
         api.getSemantics(id),
         api.cleaningState(id),
@@ -272,22 +278,27 @@ export default function App() {
     })
   }, [user, sessionId, loadSession, run, resetWorkspace])
 
+  // Shared by the explicit "New session" button and by "start a new database
+  // instead", the choice offered when a drop/connect would otherwise land
+  // quietly in an already-populated open session (see `pendingSource`).
+  const createAndOpenSession = async (name) => {
+    const created = await api.createSession(name)
+    setSessionId(created.id)
+    setSession(created)
+    setTriage(null)
+    setEquivalences([])
+    setSemantics(null)
+    setCleaning(null)
+    setQueryEntries([])
+    setDashboardCards([])
+    setQueryHistory([])
+    setStage('upload')
+    await refreshSessions()
+    return created
+  }
+
   const startSession = () =>
-    run(async () => {
-      const created = await api.createSession(`Session ${new Date().toLocaleString()}`)
-      setSessionId(created.id)
-      setSession(created)
-      setTriage(null)
-      setEquivalences([])
-      setSemantics(null)
-      setCleaning(null)
-      setQueryEntries([])
-      setDashboardCards([])
-      setQueryHistory([])
-      setStage('upload')
-      await refreshSessions()
-      return created
-    })
+    run(() => createAndOpenSession(`Session ${new Date().toLocaleString()}`))
 
   const removeSession = (id) =>
     run(async () => {
@@ -335,16 +346,6 @@ export default function App() {
     resetWorkspace()
   }
 
-  const ensureSession = useCallback(
-    async (name) => {
-      if (sessionId) return sessionId
-      const created = await api.createSession(name)
-      setSessionId(created.id)
-      return created.id
-    },
-    [sessionId],
-  )
-
   // A 409 here means this exact file/database is already sitting in another
   // session of this account. Rather than error out, drop back into that
   // session — that is what "cannot be stored twice" should feel like from
@@ -363,46 +364,100 @@ export default function App() {
     return true
   }
 
-  const handleUpload = (files) =>
-    run(async () => {
-      // One request per file: each is ingested, triaged and named on its own,
-      // and a failure on the third file must not discard the first two.
-      const chosen = (Array.isArray(files) ? files : [files]).filter(Boolean)
-      if (!chosen.length) return null
-      const wasFresh = !sessionId
-      const id = await ensureSession(chosen[0].name)
-      let ingestedAny = false
-      try {
-        for (const file of chosen) {
-          await api.upload(id, file)
-          ingestedAny = true
-        }
-      } catch (err) {
-        return handleDuplicateSource(err, id, wasFresh && !ingestedAny)
+  // One request per file: each is ingested, triaged and named on its own, and
+  // a failure on the third file must not discard the first two. `freshlyCreated`
+  // (this session exists solely for this call, nothing has landed in it yet)
+  // is what lets a duplicate-source rejection safely delete it instead of
+  // leaving an empty orphan in the switcher.
+  const uploadFilesInto = async (id, files, freshlyCreated) => {
+    let ingestedAny = false
+    try {
+      for (const file of files) {
+        await api.upload(id, file)
+        ingestedAny = true
       }
-      await loadSession(id)
-      await refreshSessions()
-      setStage('triage')
-      return true
+    } catch (err) {
+      return handleDuplicateSource(err, id, freshlyCreated && !ingestedAny)
+    }
+    await loadSession(id)
+    await refreshSessions()
+    setStage('triage')
+    return true
+  }
+
+  const connectDatabaseInto = async (id, url, tables, freshlyCreated) => {
+    try {
+      await api.connectDatabase(id, url, tables)
+    } catch (err) {
+      return handleDuplicateSource(err, id, freshlyCreated)
+    }
+    await loadSession(id)
+    await refreshSessions()
+    setStage('triage')
+    return true
+  }
+
+  // A session that already holds tables is somebody's real, named dataset —
+  // silently folding an unrelated upload into it is how two databases "merge"
+  // without anyone choosing that. Only an empty (just-created or never-used)
+  // open session gets a source attached without asking first.
+  const handleUpload = (files) => {
+    const chosen = (Array.isArray(files) ? files : [files]).filter(Boolean)
+    if (!chosen.length) return null
+    if (sessionId && session?.sheets?.length > 0) {
+      setPendingSource({ type: 'files', files: chosen })
+      return null
+    }
+    const wasFresh = !sessionId
+    return run(async () => {
+      const id = sessionId ?? (await createAndOpenSession(chosen[0].name)).id
+      return uploadFilesInto(id, chosen, wasFresh)
     })
+  }
 
   const inspectSource = (url) => run(() => api.inspectSource(url))
 
-  const handleConnect = (url, tables) =>
-    run(async () => {
+  const handleConnect = (url, tables) => {
+    if (sessionId && session?.sheets?.length > 0) {
+      setPendingSource({ type: 'database', url, tables })
+      return null
+    }
+    const wasFresh = !sessionId
+    return run(async () => {
       // Never name a session after the raw URL: it carries the password.
-      const wasFresh = !sessionId
-      const id = await ensureSession(`Database ${url.split('@').pop()}`)
-      try {
-        await api.connectDatabase(id, url, tables)
-      } catch (err) {
-        return handleDuplicateSource(err, id, wasFresh)
-      }
-      await loadSession(id)
-      await refreshSessions()
-      setStage('triage')
-      return true
+      const id = sessionId ?? (await createAndOpenSession(`Database ${url.split('@').pop()}`)).id
+      return connectDatabaseInto(id, url, tables, wasFresh)
     })
+  }
+
+  const confirmAddToSession = () => {
+    const pending = pendingSource
+    setPendingSource(null)
+    if (!pending) return null
+    return run(() =>
+      pending.type === 'files'
+        ? uploadFilesInto(sessionId, pending.files, false)
+        : connectDatabaseInto(sessionId, pending.url, pending.tables, false),
+    )
+  }
+
+  const confirmStartNewSession = () => {
+    const pending = pendingSource
+    setPendingSource(null)
+    if (!pending) return null
+    return run(async () => {
+      const name =
+        pending.type === 'files'
+          ? pending.files[0].name
+          : `Database ${pending.url.split('@').pop()}`
+      const created = await createAndOpenSession(name)
+      return pending.type === 'files'
+        ? uploadFilesInto(created.id, pending.files, true)
+        : connectDatabaseInto(created.id, pending.url, pending.tables, true)
+    })
+  }
+
+  const cancelPendingSource = () => setPendingSource(null)
 
   const runSemantics = () =>
     run(async () => {
@@ -442,9 +497,9 @@ export default function App() {
       return state
     })
 
-  const submitPlan = (action, plan) =>
+  const submitPlan = (action, plan, autoApprove = false) =>
     run(async () => {
-      setCleaning(await api.submitPlan(sessionId, action, plan))
+      setCleaning(await api.submitPlan(sessionId, action, plan, autoApprove))
       return true
     })
 
@@ -625,9 +680,20 @@ export default function App() {
   // Saving an example re-validates the SQL server-side (§Phase 5's third
   // retrieval index) — there is nothing to reflect back into query state,
   // only a confirmation that the next relevant question will see it.
+  //
+  // It is saved under the *standalone* question the server resolved ("and by
+  // month?" is meaningless without the turns before it), and also under the
+  // vaguer question the user settled by choosing a reading — so asking that
+  // again lands on this SQL instead of being asked about all over again.
   const saveExample = (entry) =>
     run(async () => {
-      await api.saveExample(sessionId, entry.question, entry.result.sql)
+      const { result } = entry
+      await api.saveExample(sessionId, {
+        question: result.resolved_question || entry.question,
+        sql: result.sql,
+        explanation: result.explanation,
+        alsoAskedAs: result.clarifies ? [result.clarifies] : [],
+      })
       return true
     })
 
@@ -830,6 +896,10 @@ export default function App() {
             onUpload={handleUpload}
             onInspect={inspectSource}
             onConnect={handleConnect}
+            pendingSource={pendingSource}
+            onConfirmAdd={confirmAddToSession}
+            onConfirmNewSession={confirmStartNewSession}
+            onCancelPending={cancelPendingSource}
           />
         )}
 
@@ -882,7 +952,7 @@ export default function App() {
                   Re-run detection
                 </Button>
                 <Button variant="primary" disabled={busy} onClick={startCleaning}>
-                  Plan the cleaning →
+                  Check for problems to tidy →
                 </Button>
               </div>
             )}
@@ -903,7 +973,7 @@ export default function App() {
             {['completed', 'cancelled'].includes(cleaning?.status) && (
               <div className="flex justify-end">
                 <Button variant="primary" disabled={busy} onClick={detectRelationships}>
-                  Detect relationships →
+                  Find how my tables connect →
                 </Button>
               </div>
             )}
@@ -984,6 +1054,43 @@ export default function App() {
   )
 }
 
+/** Patterns inside one table, read-only: each describes the data, none is a decision. */
+function TablePatterns({ patterns }) {
+  if (!patterns.length) return null
+  const byTable = {}
+  patterns.forEach((row) => {
+    ;(byTable[row.from_table] ??= []).push(row)
+  })
+  return (
+    <details className="panel">
+      <summary className="cursor-pointer px-4 py-3 text-sm font-semibold">
+        Patterns inside single tables ({patterns.length})
+      </summary>
+      <div className="border-t px-4 py-3" style={{ borderColor: 'var(--border)' }}>
+        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+          These describe your data — for example, that every district code goes with one county.
+          They do not connect tables, so there is nothing to approve.
+        </p>
+        {Object.entries(byTable).map(([table, rows]) => (
+          <div key={table} className="mt-3">
+            <p className="text-xs font-medium">{table}</p>
+            <ul className="mt-1 space-y-0.5 text-[11px]" style={{ color: 'var(--text-secondary)' }}>
+              {rows.slice(0, 8).map((row) => (
+                <li key={row.id}>
+                  · each <code>{row.from_column}</code> goes with{' '}
+                  {row.rel_type === 'functional_dependency' ? 'exactly one' : 'almost always one'}{' '}
+                  <code>{row.to_column}</code>
+                </li>
+              ))}
+              {rows.length > 8 && <li>· and {rows.length - 8} more</li>}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </details>
+  )
+}
+
 function RelationshipStage({
   relationships,
   selectedId,
@@ -1004,33 +1111,49 @@ function RelationshipStage({
   if (!relationships || !relationships.counts?.total) {
     return (
       <Panel
-        title="Relationships"
-        subtitle="Foreign keys between tables and functional dependencies inside them, found by value overlap — never by the model."
+        title="How your tables connect"
+        subtitle="Finds the values that link one table to another — a customer number in an orders table that points to a row in the customers table, for example."
       >
         <EmptyState>
-          <span className="mr-2">Nothing detected yet.</span>
+          <span className="mr-2">Not looked for yet.</span>
           <Button variant="primary" disabled={busy} onClick={onDetect}>
-            Detect relationships
+            Find how my tables connect
           </Button>
         </EmptyState>
       </Panel>
     )
   }
 
-  const counts = relationships.counts
   const rows = relationships.relationships ?? []
+  const links = rows.filter((row) => row.rel_type === 'foreign_key')
+  const patterns = rows.filter((row) => row.rel_type !== 'foreign_key')
+  const needsCheck = links.filter((row) => row.status === 'proposed')
+  const linked = links.filter((row) => row.status === 'confirmed')
+  const ruledOut = links.filter((row) => row.status === 'rejected')
+  const listProps = { selectedId, onSelect, busy }
 
   return (
     <div className="space-y-4">
       <Panel
-        title="Data model"
-        subtitle={`${counts.foreign_keys} foreign key(s), ${counts.dependencies} dependency(ies) · ${counts.confirmed} confirmed, ${counts.proposed} awaiting your review`}
+        title="How your tables connect"
+        subtitle={
+          links.length === 0
+            ? 'No links between your tables were found.'
+            : `${linked.length} link${linked.length === 1 ? '' : 's'} between your tables${
+                needsCheck.length ? ` · ${needsCheck.length} for you to check` : ' · nothing needs your attention'
+              }`
+        }
         actions={
           <Button disabled={busy} onClick={onDetect}>
-            Re-run detection
+            Look again
           </Button>
         }
       >
+        <p className="mb-3 text-xs" style={{ color: 'var(--text-secondary)' }}>
+          A link means a value in one table picks out a row in another. The clear ones are made for
+          you; click any to see why, or to undo it. You can also draw a link between two columns in
+          the diagram.
+        </p>
         <RelationshipDiagram
           graph={relationships.graph}
           selectedId={selectedId}
@@ -1039,21 +1162,45 @@ function RelationshipStage({
         />
         {relationships.skipped_tables?.length > 0 && (
           <p className="mt-3 text-[11px]" style={{ color: 'var(--text-muted)' }}>
-            Not searched for relationships: {relationships.skipped_tables.join(', ')} — with that
-            few rows, values land inside another column&apos;s by coincidence often enough that any
-            verdict would be noise.
+            Not searched for links: {relationships.skipped_tables.join(', ')} — with that few rows,
+            values land inside another column&apos;s by coincidence often enough that any verdict
+            would be noise.
           </p>
         )}
       </Panel>
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
-        <Panel title="Everything found" subtitle="Highest score first">
-          <RelationshipList
-            relationships={rows}
-            selectedId={selectedId}
-            onSelect={onSelect}
-            busy={busy}
-          />
+        <Panel title="Links between tables">
+          <div className="space-y-4">
+            {needsCheck.length > 0 && (
+              <div>
+                <p className="mb-1 text-xs font-medium" style={{ color: 'var(--status-warning)' }}>
+                  Please check ({needsCheck.length})
+                </p>
+                <RelationshipList relationships={needsCheck} {...listProps} />
+              </div>
+            )}
+            <div>
+              {needsCheck.length > 0 && (
+                <p className="mb-1 text-xs font-medium">Linked ({linked.length})</p>
+              )}
+              <RelationshipList
+                relationships={linked}
+                {...listProps}
+                emptyMessage="No links were made. Draw one in the diagram if you know two tables are connected."
+              />
+            </div>
+            {ruledOut.length > 0 && (
+              <details>
+                <summary className="cursor-pointer text-xs font-medium">
+                  Ruled out ({ruledOut.length})
+                </summary>
+                <div className="mt-1">
+                  <RelationshipList relationships={ruledOut} {...listProps} />
+                </div>
+              </details>
+            )}
+          </div>
         </Panel>
         <EvidencePanel
           relationship={selectedRelationship}
@@ -1064,6 +1211,8 @@ function RelationshipStage({
           onClose={() => onSelect(selectedId)}
         />
       </div>
+
+      <TablePatterns patterns={patterns} />
 
       <TableProfilePanel
         profiles={profiles?.profiles}
@@ -1087,13 +1236,13 @@ function CleaningStage({ cleaning, vocabulary, tableNames, busy, onStart, onSubm
   if (!cleaning || cleaning.status === 'not_started') {
     return (
       <Panel
-        title="Co-planned cleaning"
-        subtitle="Claude proposes a plan from statistics only. You edit it, then approve each step as it runs."
+        title="Tidy up your data"
+        subtitle="We look for common problems — extra spaces, repeated rows, empty columns — and suggest fixes. You choose which to apply; nothing changes until you do."
       >
         <EmptyState>
-          <span className="mr-2">No cleaning run yet.</span>
+          <span className="mr-2">Not checked yet.</span>
           <Button variant="primary" disabled={busy} onClick={onStart}>
-            Propose a cleaning plan
+            Look for problems to tidy
           </Button>
         </EmptyState>
       </Panel>

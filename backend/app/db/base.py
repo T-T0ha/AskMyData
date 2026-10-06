@@ -183,12 +183,30 @@ _ADDED_COLUMNS: dict[str, dict[str, "str | Callable[[], str]"]] = {
     "equivalence_candidates": {
         "left_embedding": _embedding_ddl,
         "right_embedding": _embedding_ddl,
+        # Whether a pair was decided by the platform or by the user.
+        "decided_by": "VARCHAR(10)",
+    },
+    # Whether a relationship's verdict came from the platform or from the user.
+    "relationships": {
+        "decided_by": "VARCHAR(10)",
     },
     # Confidence-based abstention (C-2): a three-way outcome and the model's
     # own confidence, alongside the original boolean `ok`.
     "query_history": {
         "confidence": "FLOAT",
         "outcome": "VARCHAR(20) DEFAULT 'rejected'",
+        # Conversation memory: what a later turn is shown of this one.
+        "resolved_question": "TEXT",
+        "explanation": "TEXT",
+        "tables_used": "JSON",
+        "clarification_options": "JSON",
+        "clarifies": "TEXT",
+        "source": "VARCHAR(20)",
+    },
+    # The reading a verified example was shown with, so it can be answered from
+    # directly without a model call.
+    "query_examples": {
+        "explanation": "TEXT",
     },
 }
 

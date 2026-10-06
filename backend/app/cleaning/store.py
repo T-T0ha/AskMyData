@@ -116,6 +116,16 @@ class TableStore:
         with self._lock, self._snapshot_path(tag).open("wb") as handle:
             pickle.dump(self._tables, handle, protocol=PICKLE_PROTOCOL)
 
+    def discard_snapshot(self, tag: str) -> None:
+        """Forget a snapshot once the step it guarded is settled.
+
+        Revert only ever reaches back to the step awaiting a decision, so a
+        snapshot of an approved step is dead weight — and a copy of every table
+        per step adds up fast on a plan that runs a dozen steps.
+        """
+
+        self._snapshot_path(tag).unlink(missing_ok=True)
+
     def has_snapshot(self, tag: str) -> bool:
         return self._snapshot_path(tag).exists()
 

@@ -224,6 +224,17 @@ export function FieldSemanticGrid({ semantics, vocabulary, onOverride, busy }) {
           </div>
         }
       >
+        {semantics.basic_description_count > 0 && (
+          <p
+            className="mb-3 rounded-md border px-3 py-2 text-xs"
+            style={{ borderColor: 'var(--status-warning)', color: 'var(--text-secondary)' }}
+          >
+            {semantics.basic_description_count} of {semantics.total_columns} columns were described
+            from their names alone, because the AI assistant wasn&apos;t available when they were
+            analysed (it may have reached its usage limit). Questions find columns through these
+            descriptions, so run the analysis again once it is back for better answers.
+          </p>
+        )}
         <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
           Types marked <span className="font-medium">*</span> (currency, boolean, identifier) extend
           the six types defined in SemTabla. Click a column name for its evidence, samples and

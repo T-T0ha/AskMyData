@@ -8,6 +8,7 @@ summary that Phase 2 sends to Claude *instead of* the data itself.
 
 from __future__ import annotations
 
+import datetime
 import math
 from typing import Any
 
@@ -43,7 +44,7 @@ def _json_safe(value: Any) -> Any:
         return _clean_number(float(value))
     if isinstance(value, (np.bool_, bool)):
         return bool(value)
-    if isinstance(value, pd.Timestamp):
+    if isinstance(value, (datetime.date, datetime.datetime)):
         return value.isoformat()
     if isinstance(value, float):
         return _clean_number(value)

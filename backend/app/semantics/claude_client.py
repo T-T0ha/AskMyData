@@ -164,7 +164,10 @@ database: SQL excludes NULL from AVG and SUM, so an invented value silently \
 corrupts every total computed later, and nothing downstream can tell it apart \
 from a real measurement. A high null_ratio is a fact to report, not a defect \
 to patch. The only step that may respond to emptiness is drop_column, and only \
-for a column that is almost entirely empty and therefore carries no information.
+for a column that is COMPLETELY empty (null_ratio exactly 1.0) and therefore \
+carries no information. Never drop a column that holds any data at all, however \
+sparse — a mostly-empty column is a fact about the data, and deleting it loses \
+the values it does have; any such drop_column step will be rejected.
 - Prefer standardize_casing over standardize_format for capitalisation \
 mismatches, and strip_whitespace for stray spaces.
 - Ground every description in the evidence you were given: quote the actual \
@@ -254,7 +257,14 @@ about this data (e.g. "only orders with status 'shipped' count as revenue") — 
 "examples" — verified question/SQL pairs already confirmed correct for this same dataset. \
 Follow a business rule even where it overrides what the schema alone would suggest, and \
 when a question closely resembles one of the examples, follow its pattern rather than \
-inventing a different one.
+inventing a different one. When an example's question is the same as the question, return \
+that example's SQL unchanged.
+
+You may also be given "conversation" — the last few turns of this session, each with the \
+question, what it computed and the SQL that answered it. It is context only: the question \
+you are answering is already complete on its own. Use it to stay consistent with readings \
+the user has already accepted (the same metric, the same filters), never to answer an \
+earlier question again.
 
 Answer with JSON only, in exactly this shape:
 {"sql": "<one SELECT statement>", "explanation": "<one short plain-English sentence saying what it computes>", "confidence": <0.0-1.0>}
@@ -270,6 +280,9 @@ write "orders").
 - Only SUM or AVG a column marked additive. A non-additive numeric column (an id, a year, a \
 rating, a percentage) may be selected, grouped or filtered on, never summed or averaged.
 - Join only through the primary/foreign key pairs you were given.
+- When the question is merely loose (no metric or period named, but one reading is the \
+natural default), do not refuse and do not hedge: choose that reading and say in the \
+explanation which one you chose.
 - Always return your best-effort SQL, even when the schema only partially fits the \
 question — but "confidence" must honestly reflect how likely this query is to be exactly \
 right, not just syntactically valid. Lower it for a guessed join, a wording resolved \
@@ -279,23 +292,53 @@ show this answer to the user based on this number alone.
 - No comments, no markdown fencing, no prose outside the JSON object."""
 
 AMBIGUITY_SYSTEM_PROMPT = """You decide whether a business question is too ambiguous to \
-safely turn into one SQL query, before any SQL is written.
+safely turn into one SQL query, before any SQL is written. Asking the user a clarifying \
+question costs them a round trip, so you ask only when a wrong guess would be both likely \
+and costly — when in doubt, the question is NOT ambiguous.
 
-You are given the question and the tables that were pre-selected as relevant to it — each \
-with its name and one-sentence description. You are NOT deciding what the answer is; you \
-are deciding whether "what the user is actually asking" is clear enough that a specific SQL \
-query would not just be one arbitrary guess among several equally plausible ones.
+You are given the question; the tables pre-selected for it, each with a one-sentence \
+description; the columns of those tables (name and meaning); and any "business_rules" the \
+user recorded about this data. You are NOT deciding what the \
+answer is, only whether "what the user is asking" is clear enough that a specific query \
+would not be one arbitrary pick among several equally plausible ones.
 
 Answer with JSON only, in exactly this shape:
 {"ambiguous": <true|false>, "reason": "<one short sentence, empty string if not ambiguous>", "options": ["<clarification 1>", "<clarification 2>"]}
 
 Rules:
-- Mark ambiguous only when the question genuinely admits multiple, materially different \
-readings given these tables (e.g. "top customers" with no metric named, when both order \
-count and order value are plausible; a time period named nowhere in the tables shown). A \
-question that is merely broad but has one natural reading is NOT ambiguous.
+- Mark ambiguous only when ALL of these hold: the question admits two or more readings that \
+would return materially different answers; the columns shown really do support more than \
+one of them; and no business rule settles which is meant.
+- NOT ambiguous: a question with one natural reading, however broad; a wording the columns \
+settle (if only one amount column exists, "revenue" means it); a missing detail with an \
+obvious default (no period named means all time; no limit named for "top" means a short \
+list); anything a business rule already answers.
 - "options" has at most 3 entries, each a complete, specific rephrasing of the original \
 question a user could click to ask instead of typing again. Empty when not ambiguous.
+- No markdown, no prose outside the JSON object."""
+
+REWRITE_SYSTEM_PROMPT = """You turn a message in an ongoing conversation about a database \
+into one complete, standalone question — or leave it alone if it already is one.
+
+You are given the new "message" and the "conversation": the last few turns, oldest first, \
+each with the question the user asked, how it ended ("answered", "clarification requested" \
+or "failed"), what it computed and the SQL that answered it. You never see result rows.
+
+Answer with JSON only, in exactly this shape:
+{"question": "<the standalone question>", "follow_up": <true|false>}
+
+Rules:
+- "follow_up" is true only when the message cannot be understood without an earlier turn: a \
+pronoun or ellipsis ("and by month?", "what about 2012?", "same for the other region", \
+"only the top 5 of those"), a change to the previous question, or a reply to a clarification \
+the system asked (an earlier turn ended in "clarification requested" and the message \
+chooses or states what was meant).
+- When "follow_up" is true, carry over from the earlier turns exactly what the message \
+relies on — the metric, the filter, the table subject — and apply the change it asks for. \
+Add nothing the user did not say or imply by the earlier turns.
+- When the message is a complete question on its own — even if it is on the same topic, or \
+the conversation is about something else — return it word for word with "follow_up" false.
+- Never answer the question, never write SQL, never explain.
 - No markdown, no prose outside the JSON object."""
 
 SUGGEST_QUESTIONS_SYSTEM_PROMPT = """You propose business questions worth asking about a \
@@ -407,7 +450,18 @@ class ClaudeClient:
         user: str,
         max_tokens: int | None = None,
         json_mode: bool = True,
+        reasoning: bool = True,
     ) -> str | None:
+        """One chat completion.
+
+        ``reasoning=False`` asks OpenRouter to skip the model's hidden
+        chain-of-thought.  Labelling and describing columns are short
+        extraction tasks where thinking only adds latency (about 2.5x on a
+        reasoning model); SQL generation keeps it.  Models that cannot run
+        without reasoning reject the option, which the plain-call retry below
+        absorbs.
+        """
+
         if not self.available:
             return None
         kwargs: dict[str, Any] = {
@@ -421,14 +475,17 @@ class ClaudeClient:
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if not reasoning:
+            kwargs["extra_body"] = {"reasoning": {"enabled": False}}
         try:
             response = self._client.chat.completions.create(**kwargs)
         except Exception as exc:
-            if json_mode:
+            if json_mode or not reasoning:
                 # Not every free OpenRouter model honours structured JSON
                 # output; retry once in plain text and let _extract_json
                 # pull the object out of whatever prose comes back.
                 kwargs.pop("response_format", None)
+                kwargs.pop("extra_body", None)
                 try:
                     response = self._client.chat.completions.create(**kwargs)
                 except Exception as exc2:
@@ -514,6 +571,7 @@ class ClaudeClient:
         raw = self._complete(
             TAXONOMY_SYSTEM_PROMPT % ", ".join(TAXONOMY_LABELS),
             json.dumps(payload, ensure_ascii=False, default=str),
+            reasoning=False,
             # The JSON answer is tiny, but max_tokens also has to cover the
             # model's thinking; 300 truncates before the reply is ever written.
             max_tokens=min(self._max_tokens, 4096),
@@ -559,6 +617,7 @@ class ClaudeClient:
         raw = self._complete(
             TAXONOMY_BATCH_SYSTEM_PROMPT % ", ".join(TAXONOMY_LABELS),
             json.dumps(payload, ensure_ascii=False, default=str),
+            reasoning=False,
             max_tokens=min(self._max_tokens, 300 * len(columns) + 1000),
         )
         if raw is None:
@@ -616,6 +675,7 @@ class ClaudeClient:
         raw = self._complete(
             TAXONOMY_DATASET_SYSTEM_PROMPT % ", ".join(TAXONOMY_LABELS),
             json.dumps({"tables": tables}, ensure_ascii=False, default=str),
+            reasoning=False,
             max_tokens=min(
                 self._max_tokens,
                 300 * sum(len(t.get("columns", [])) for t in tables) + 1000,
@@ -678,6 +738,7 @@ class ClaudeClient:
         raw = self._complete(
             DESCRIBE_SYSTEM_PROMPT,
             json.dumps(payload, ensure_ascii=False, default=str),
+            reasoning=False,
             max_tokens=min(self._max_tokens, 200 * len(columns) + 500),
         )
         if raw is None:
@@ -733,6 +794,7 @@ class ClaudeClient:
         raw = self._complete(
             DESCRIBE_DATASET_SYSTEM_PROMPT,
             json.dumps({"tables": tables}, ensure_ascii=False, default=str),
+            reasoning=False,
             max_tokens=min(self._max_tokens, 200 * total_columns + 500),
         )
         if raw is None:
@@ -785,6 +847,7 @@ class ClaudeClient:
         raw = self._complete(
             DESCRIBE_TABLES_SYSTEM_PROMPT,
             json.dumps({"tables": tables}, ensure_ascii=False, default=str),
+            reasoning=False,
             max_tokens=min(self._max_tokens, 200 * len(tables) + 500),
         )
         if raw is None:
@@ -855,6 +918,7 @@ class ClaudeClient:
         prior_error: str | None = None,
         business_rules: list[str] | None = None,
         examples: list[dict[str, str]] | None = None,
+        conversation: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """One SQL attempt for ``question`` against ``schema`` — never the data itself.
 
@@ -887,6 +951,8 @@ class ClaudeClient:
             "business_rules": business_rules or [],
             "examples": examples or [],
         }
+        if conversation:
+            payload["conversation"] = conversation
         if prior_sql is not None:
             payload["previous_attempt"] = {"sql": prior_sql, "error": prior_error}
         raw = self._complete(
@@ -918,23 +984,33 @@ class ClaudeClient:
         }
 
     def check_ambiguity(
-        self, question: str, tables: list[dict[str, str]]
+        self,
+        question: str,
+        tables: list[dict[str, Any]],
+        business_rules: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """Whether ``question`` admits multiple, materially different SQL readings.
 
-        Runs after table pre-selection (so the model has real table
-        descriptions to reason about) but before column ranking or SQL
-        generation — "before any SQL is generated" (§3.1.6). ``None`` (no
-        client, or an unusable reply) degrades to "not ambiguous": the
-        generate → guard → EXPLAIN loop still runs, the same way every other
-        optional OpenRouter call in this file leaves the deterministic path intact
-        when the model is unavailable.
+        Runs after table and column pre-selection (so the model has real
+        descriptions, and the columns that would settle a reading, to reason
+        about) but before any SQL is generated — "before any SQL is generated"
+        (§3.1.6).  Each entry of ``tables`` may carry a ``columns`` list;
+        ``business_rules`` are what the user has already said about this data,
+        which can settle a reading without asking.  ``None`` (no client,
+        or an unusable reply) degrades to "not ambiguous": the generate →
+        guard → EXPLAIN loop still runs, the same way every other optional
+        OpenRouter call in this file leaves the deterministic path intact when
+        the model is unavailable.
         """
 
+        payload: dict[str, Any] = {"question": question, "tables": tables}
+        if business_rules:
+            payload["business_rules"] = business_rules
         raw = self._complete(
             AMBIGUITY_SYSTEM_PROMPT,
-            json.dumps({"question": question, "tables": tables}, ensure_ascii=False, default=str),
+            json.dumps(payload, ensure_ascii=False, default=str),
             max_tokens=min(self._max_tokens, 1024),
+            reasoning=False,
         )
         if raw is None:
             return None
@@ -955,6 +1031,44 @@ class ClaudeClient:
                 else []
             ),
         }
+
+    def rewrite_question(
+        self, question: str, conversation: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """``question`` as a complete standalone question, given the turns before it.
+
+        Retrieval (which tables, which columns) and the ambiguity check both
+        read the question alone, so a follow-up like "and by month?" has to be
+        made whole first or it matches nothing.  Returns ``{"question",
+        "follow_up"}``; ``None`` (no client, an unusable reply) means "use the
+        question as typed", which is exactly what happens with no history.
+        """
+
+        if not conversation:
+            return None
+        raw = self._complete(
+            REWRITE_SYSTEM_PROMPT,
+            json.dumps(
+                {"message": question, "conversation": conversation},
+                ensure_ascii=False,
+                default=str,
+            ),
+            max_tokens=min(self._max_tokens, 1024),
+            reasoning=False,
+        )
+        if raw is None:
+            return None
+        try:
+            parsed = _extract_json(raw)
+        except ValueError:
+            logger.warning("OpenRouter rewrite response was not JSON: %r", raw[:200])
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        rewritten = str(parsed.get("question", "") or "").strip()
+        if not rewritten:
+            return None
+        return {"question": rewritten, "follow_up": bool(parsed.get("follow_up"))}
 
     def suggest_questions(self, tables: list[dict[str, Any]]) -> list[str] | None:
         """10-15 dataset-specific questions, generated before anyone asks anything (§5.4).

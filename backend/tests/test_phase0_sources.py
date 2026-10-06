@@ -11,6 +11,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from app.ingestion.loader import load_file_source
@@ -337,3 +338,47 @@ def test_an_empty_dump_is_reported(tmp_path: Path):
 
     with pytest.raises(DumpError, match="empty"):
         load_sql_dump(path)
+
+
+def test_a_database_keeps_the_text_it_stored_where_a_spreadsheet_reads_a_blank(tmp_path: Path):
+    """``'-'`` in a spreadsheet means "not known".  In a database it is a value.
+
+    A bond type of ``-``, an answer of ``unknown`` and a status of ``none`` are
+    what the source *said*, and a question about those rows must still find
+    them.  The markers are counted so the user can see them, and nothing else
+    about the column changes.
+    """
+
+    from app.ingestion.cleaning import clean_series
+
+    path = tmp_path / "chem.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE bond (bond_id INTEGER PRIMARY KEY, bond_type TEXT, label TEXT);
+        INSERT INTO bond VALUES (1, '-', ' padded '), (2, '=', 'unknown'), (3, '-', 'none'),
+                                (4, NULL, '');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    result = load_relational_tables(sqlite_url(path))[0]
+    frame = result.dataframe
+    reports = {r.column: r for r in result.clean_reports}
+
+    assert frame["bond_type"].tolist()[:3] == ["-", "=", "-"]
+    assert frame["bond_type"].isna().sum() == 1, "only the real NULL is missing"
+    assert frame["label"].tolist() == [" padded ", "unknown", "none", ""]
+    assert reports["bond_type"].null_like_kept == 2
+    assert reports["label"].null_like_kept == 3, "unknown, none and the empty string"
+    assert reports["bond_type"].nulls_normalized == 0
+    assert reports["label"].whitespace_trimmed == 0
+    assert any("kept as the source stored them" in n for n in reports["label"].notes)
+
+    # The spreadsheet path is unchanged: the same values are cleaned.
+    sheet_like = pd.Series(["-", "=", " padded ", "unknown", "none"])
+    cleaned, report = clean_series(sheet_like, "label")
+    assert cleaned.tolist()[1:3] == ["=", "padded"]
+    assert cleaned.isna().tolist() == [True, False, False, True, True]
+    assert report.nulls_normalized == 3 and report.whitespace_trimmed == 1

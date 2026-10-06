@@ -1,13 +1,17 @@
 /** Phase 2 view — co-planning.
  *
- *  The Cocoa pattern: the agent proposes, the human edits. Cards can be
- *  reordered by dragging, re-parameterised inline, deleted, or added from
- *  scratch — the plan that runs is the plan the user approved, not the one
- *  that was proposed. Nothing executes until "Run this plan" is pressed.
+ *  The Cocoa pattern: the agent proposes, the human edits. The proposal is
+ *  grouped by what it does, in plain words, so a person who has never heard of
+ *  a "type cast" can still tell what is being offered and why. Steps that can
+ *  only remove nothing (trim stray spaces, drop a column with no values in it)
+ *  are ticked; steps that change how a value is written are offered but left
+ *  unticked. Each can be edited, removed, or added from scratch — the plan that
+ *  runs is the plan the user approved, not the one that was proposed. Nothing
+ *  executes until "Run" is pressed.
  */
 
 import { useEffect, useState } from 'react'
-import { Button, Panel, StatusBadge, Tag } from './ui'
+import { Button, Panel, Tag } from './ui'
 
 const STEP_FIELDS = {
   rename_column: [
@@ -50,16 +54,16 @@ const STEP_FIELDS = {
 }
 
 const STEP_TITLES = {
-  rename_column: 'Rename column',
-  drop_column: 'Drop column',
-  standardize_format: 'Standardise format',
-  standardize_casing: 'Merge capitalisation variants',
-  strip_whitespace: 'Trim stray spaces',
-  merge_sheets: 'Merge sheets',
-  split_column: 'Split column',
-  deduplicate: 'Remove duplicate rows',
-  type_cast: 'Convert data type',
-  add_synthetic_key: 'Add row id',
+  rename_column: 'Rename a column',
+  drop_column: 'Remove an empty column',
+  standardize_format: 'Write values in one format',
+  standardize_casing: 'Make capitalisation consistent',
+  strip_whitespace: 'Trim extra spaces',
+  merge_sheets: 'Combine two tables',
+  split_column: 'Split a column in two',
+  deduplicate: 'Remove repeated rows',
+  type_cast: 'Change the kind of data',
+  add_synthetic_key: 'Add a row number',
 }
 
 function toInput(value) {
@@ -83,56 +87,102 @@ function fromInput(key, raw) {
   return raw
 }
 
-function StepCard({ step, index, total, editable, onChange, onDelete, onMove, dragHandlers }) {
+/** What each kind of step does, for someone who has never cleaned data.
+ *
+ *  ``safe`` steps change nothing a person typed: they remove blanks, extra
+ *  spaces or exact repeats. The rest rewrite values or restructure tables, so
+ *  they are offered but left for the person to tick.
+ */
+const GROUPS = [
+  {
+    types: ['drop_column'],
+    title: 'Remove empty columns',
+    blurb: 'Columns with nothing in any row. Removing them loses no data.',
+    safe: true,
+  },
+  {
+    types: ['strip_whitespace'],
+    title: 'Trim extra spaces',
+    blurb:
+      'Values with spaces at the start or end. They look the same but a database treats them as different.',
+    safe: true,
+  },
+  {
+    types: ['deduplicate'],
+    title: 'Remove repeated rows',
+    blurb: 'Rows that are exact copies of another row. One copy is kept.',
+    safe: true,
+  },
+  {
+    types: ['add_synthetic_key'],
+    title: 'Number the rows',
+    blurb: 'Adds a counter column to a table that has no way to tell one row from another.',
+    safe: true,
+  },
+  {
+    types: ['standardize_casing'],
+    title: 'Make capitalisation consistent',
+    blurb:
+      'The same value written with different capital letters. This changes how some values are spelled, so check the examples before you tick them.',
+    safe: false,
+  },
+  {
+    types: ['standardize_format'],
+    title: 'Write values in one format',
+    blurb: 'Rewrites values (dates, text) into a single style.',
+    safe: false,
+  },
+  {
+    types: ['type_cast'],
+    title: 'Change the kind of data',
+    blurb: 'Treats a column as numbers, dates or text. Values that do not fit become blank.',
+    safe: false,
+  },
+  {
+    types: ['rename_column', 'split_column'],
+    title: 'Rename and split columns',
+    blurb: 'Changes column names or splits one column into several.',
+    safe: false,
+  },
+  {
+    types: ['merge_sheets'],
+    title: 'Combine tables that were split in two',
+    blurb:
+      'Two tables with exactly the same columns look like one table that was split. Combining them is the only step that joins tables, so look before you tick it.',
+    safe: false,
+  },
+]
+
+function groupOf(step) {
+  return GROUPS.find((group) => group.types.includes(step.type))
+}
+
+function StepRow({ step, included, onToggle, onChange, onDelete, editable }) {
   const [open, setOpen] = useState(false)
   const fields = STEP_FIELDS[step.type] ?? []
 
   return (
-    <li
-      draggable={editable}
-      {...(editable ? dragHandlers : {})}
-      className="panel p-3"
-      style={{ cursor: editable ? 'grab' : 'default' }}
-    >
+    <li className="py-2.5">
       <div className="flex items-start gap-3">
-        <span
-          className="tabular mt-0.5 w-6 shrink-0 text-center text-xs"
-          style={{ color: 'var(--text-muted)' }}
-          aria-hidden="true"
-        >
-          {editable ? '⠿' : index + 1}
-        </span>
-
+        <input
+          type="checkbox"
+          className="mt-1 shrink-0"
+          checked={included}
+          disabled={!editable}
+          onChange={onToggle}
+          aria-label={`Include: ${step.description}`}
+        />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h4 className="text-sm font-semibold">{STEP_TITLES[step.type] ?? step.type}</h4>
             <Tag>{step.table}</Tag>
-            <Tag muted title={step.origin === 'agent' ? 'proposed by Claude' : `added by ${step.origin}`}>
-              {step.origin}
-            </Tag>
-            {step.status !== 'pending' && (
-              <StatusBadge
-                status={
-                  step.status === 'approved'
-                    ? 'good'
-                    : step.status === 'failed'
-                      ? 'critical'
-                      : step.status === 'reverted'
-                        ? 'serious'
-                        : 'neutral'
-                }
-              >
-                {step.status}
-              </StatusBadge>
-            )}
+            {step.params?.column && <Tag muted>{step.params.column}</Tag>}
+            {step.origin === 'user' && <Tag muted>added by you</Tag>}
           </div>
-
           <p className="mt-1 text-xs" style={{ color: 'var(--text-secondary)' }}>
             {step.description}
           </p>
-
           {step.rationale && (
-            <p className="mt-1 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+            <p className="mt-0.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
               ↳ {step.rationale}
             </p>
           )}
@@ -178,48 +228,24 @@ function StepCard({ step, index, total, editable, onChange, onDelete, onMove, dr
           )}
         </div>
 
-        <div className="flex shrink-0 flex-col items-end gap-1">
+        <div className="flex shrink-0 flex-col items-end gap-1 text-[11px]">
           <button
             type="button"
-            className="focus-ring text-[11px] underline"
+            className="focus-ring underline"
             style={{ color: 'var(--series-1)' }}
             onClick={() => setOpen((value) => !value)}
           >
-            {open ? 'hide' : 'edit'}
+            {open ? 'hide settings' : 'settings'}
           </button>
-          {editable && (
-            <>
-              <div className="flex gap-1">
-                <button
-                  type="button"
-                  aria-label="Move step up"
-                  disabled={index === 0}
-                  onClick={() => onMove(index, index - 1)}
-                  className="focus-ring rounded px-1 text-xs disabled:opacity-30"
-                  style={{ color: 'var(--text-secondary)' }}
-                >
-                  ↑
-                </button>
-                <button
-                  type="button"
-                  aria-label="Move step down"
-                  disabled={index === total - 1}
-                  onClick={() => onMove(index, index + 1)}
-                  className="focus-ring rounded px-1 text-xs disabled:opacity-30"
-                  style={{ color: 'var(--text-secondary)' }}
-                >
-                  ↓
-                </button>
-              </div>
-              <button
-                type="button"
-                className="focus-ring text-[11px] underline"
-                style={{ color: 'var(--status-critical)' }}
-                onClick={onDelete}
-              >
-                remove
-              </button>
-            </>
+          {editable && step.origin === 'user' && (
+            <button
+              type="button"
+              className="focus-ring underline"
+              style={{ color: 'var(--status-critical)' }}
+              onClick={onDelete}
+            >
+              remove
+            </button>
           )}
         </div>
       </div>
@@ -241,7 +267,7 @@ function AddStep({ tables, stepTypes, onAdd }) {
       style={{ borderColor: 'var(--baseline)' }}
     >
       <label className="text-[11px]">
-        <span style={{ color: 'var(--text-muted)' }}>Add a step</span>
+        <span style={{ color: 'var(--text-muted)' }}>Add a step of your own</span>
         <select className="mt-0.5 block text-xs" value={type} onChange={(e) => setType(e.target.value)}>
           {stepTypes.map((option) => (
             <option key={option} value={option}>
@@ -266,7 +292,7 @@ function AddStep({ tables, stepTypes, onAdd }) {
             id: `user-${Math.random().toString(36).slice(2, 10)}`,
             type,
             table,
-            description: 'Added by you.',
+            description: `${STEP_TITLES[type] ?? type} — added by you. Open “settings” to say which column.`,
             params: {},
             origin: 'user',
             status: 'pending',
@@ -279,96 +305,255 @@ function AddStep({ tables, stepTypes, onAdd }) {
   )
 }
 
+function sourceNote(planSource) {
+  switch (planSource) {
+    case 'claude':
+      return 'Suggested by the AI assistant from summaries of your data (never the rows themselves), then checked against your tables.'
+    case 'heuristic_after_llm_error':
+      return "The AI assistant couldn't be used just now, so these suggestions come from checking your data for common problems."
+    case 'heuristic_after_llm_rejected':
+      return "The AI assistant's suggestions didn't fit your data, so these come from checking it for common problems."
+    default:
+      return 'Found by checking your data for common problems.'
+  }
+}
+
 export function PlanBoard({ plan, planSource, rejections, tables, stepTypes, onSubmit, busy }) {
   const [draft, setDraft] = useState(plan)
-  const [dragIndex, setDragIndex] = useState(null)
+  const [excluded, setExcluded] = useState(() => initiallyExcluded(plan))
+  const [reviewEach, setReviewEach] = useState(false)
 
-  useEffect(() => setDraft(plan), [plan])
+  useEffect(() => {
+    setDraft(plan)
+    setExcluded(initiallyExcluded(plan))
+  }, [plan])
 
-  const move = (from, to) => {
-    if (to < 0 || to >= draft.length) return
-    const next = [...draft]
-    const [item] = next.splice(from, 1)
-    next.splice(to, 0, item)
-    setDraft(next)
-  }
+  const included = draft.filter((step) => !excluded.has(step.id))
+  const toggle = (id) =>
+    setExcluded((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  const setGroup = (steps, on) =>
+    setExcluded((current) => {
+      const next = new Set(current)
+      steps.forEach((step) => (on ? next.delete(step.id) : next.add(step.id)))
+      return next
+    })
+
+  const grouped = GROUPS.map((group) => ({
+    group,
+    steps: draft.filter((step) => groupOf(step) === group),
+  })).filter((entry) => entry.steps.length)
+  const ungrouped = draft.filter((step) => !groupOf(step))
+  const heldBack = draft.filter((step) => excluded.has(step.id) && groupOf(step)?.safe === false)
+
+  const llmFailed = planSource === 'heuristic_after_llm_error'
 
   return (
     <Panel
-      title="Review the cleaning plan"
-      subtitle={
-        planSource === 'claude'
-          ? 'Proposed by Claude from the statistics below, then checked against your data before you see it.'
-          : "Built directly from your data's statistics — no AI involved."
-      }
+      title="Tidy-up suggestions"
+      subtitle={sourceNote(planSource)}
       actions={
-        <div className="flex gap-2">
-          <Button disabled={busy} onClick={() => onSubmit('cancel', null)}>
-            Cancel
-          </Button>
-          <Button variant="primary" disabled={busy || !draft.length} onClick={() => onSubmit('confirm', draft)}>
-            Run this plan ({draft.length})
-          </Button>
-        </div>
+        <Button disabled={busy} onClick={() => onSubmit('cancel', null)}>
+          Skip cleaning
+        </Button>
       }
     >
-      {rejections?.length > 0 && (
-        <div
-          className="mb-3 rounded-md border px-3 py-2 text-xs"
-          style={{ borderColor: 'var(--status-warning)' }}
-        >
-          <p className="font-medium">Some proposed steps were rejected before you saw them:</p>
-          <ul className="mt-1 space-y-0.5" style={{ color: 'var(--text-secondary)' }}>
-            {rejections.map((reason) => (
-              <li key={reason}>· {reason}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      <ol className="space-y-2">
-        {draft.map((step, index) => (
-          <StepCard
-            key={step.id}
-            step={step}
-            index={index}
-            total={draft.length}
-            editable
-            onChange={(params) =>
-              setDraft(draft.map((item, i) => (i === index ? { ...item, params } : item)))
-            }
-            onDelete={() => setDraft(draft.filter((_, i) => i !== index))}
-            onMove={move}
-            dragHandlers={{
-              onDragStart: () => setDragIndex(index),
-              onDragOver: (event) => event.preventDefault(),
-              onDrop: () => {
-                if (dragIndex !== null && dragIndex !== index) move(dragIndex, index)
-                setDragIndex(null)
-              },
-              onDragEnd: () => setDragIndex(null),
-            }}
-          />
-        ))}
-      </ol>
-
-      {draft.length === 0 && (
-        <p className="py-4 text-center text-sm" style={{ color: 'var(--text-muted)' }}>
-          The plan is empty — nothing will be changed.
+      <div className="space-y-4">
+        <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+          We checked every column for common problems. Nothing here fills in a blank cell, and your
+          uploaded file is never touched — changes are made to a working copy. Tick what you want
+          done, then press the button at the bottom.
         </p>
-      )}
 
-      <div className="mt-3">
-        <AddStep tables={tables} stepTypes={stepTypes} onAdd={(step) => setDraft([...draft, step])} />
+        {(llmFailed || rejections?.length > 0) && (
+          <div
+            className="rounded-md border px-3 py-2 text-xs"
+            style={{ borderColor: 'var(--status-warning)' }}
+          >
+            {llmFailed ? (
+              <p>The AI assistant is unavailable right now (it may have reached its usage limit).</p>
+            ) : (
+              <p className="font-medium">
+                {rejections.length} suggestion{rejections.length === 1 ? ' was' : 's were'} left out
+                because {rejections.length === 1 ? 'it' : 'they'} didn&apos;t fit your data.
+              </p>
+            )}
+            {rejections?.length > 0 && (
+              <details className="mt-1" style={{ color: 'var(--text-muted)' }}>
+                <summary className="cursor-pointer">Technical details</summary>
+                <ul className="mt-1 space-y-0.5">
+                  {rejections.map((reason) => (
+                    <li key={reason}>· {reason}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+        )}
+
+        {draft.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <span style={{ color: 'var(--text-secondary)' }}>
+              {included.length} of {draft.length} selected
+              {heldBack.length > 0 &&
+                ` · ${heldBack.length} that change how values are written ${
+                  heldBack.length === 1 ? 'is' : 'are'
+                } switched off until you tick ${heldBack.length === 1 ? 'it' : 'them'}`}
+            </span>
+            <span className="flex gap-3">
+              <button
+                type="button"
+                className="focus-ring underline"
+                style={{ color: 'var(--series-1)' }}
+                onClick={() => setGroup(draft, true)}
+              >
+                select all
+              </button>
+              <button
+                type="button"
+                className="focus-ring underline"
+                style={{ color: 'var(--series-1)' }}
+                onClick={() => setGroup(draft, false)}
+              >
+                select none
+              </button>
+            </span>
+          </div>
+        )}
+
+        {grouped.map(({ group, steps }) => {
+          const on = steps.filter((step) => !excluded.has(step.id)).length
+          return (
+            <details key={group.title} open={!group.safe || steps.length <= 3} className="panel">
+              <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-2 px-3 py-2.5">
+                <span>
+                  <span className="text-sm font-semibold">{group.title}</span>
+                  <span className="ml-2 text-xs" style={{ color: 'var(--text-muted)' }}>
+                    {on} of {steps.length} selected
+                  </span>
+                  {!group.safe && (
+                    <span className="ml-2">
+                      <Tag muted>take a look</Tag>
+                    </span>
+                  )}
+                </span>
+                <span className="flex gap-3 text-[11px]">
+                  <button
+                    type="button"
+                    className="focus-ring underline"
+                    style={{ color: 'var(--series-1)' }}
+                    onClick={(event) => {
+                      // Inside a <summary>, a click would also fold the group.
+                      event.preventDefault()
+                      setGroup(steps, on !== steps.length)
+                    }}
+                  >
+                    {on === steps.length ? 'untick all' : 'tick all'}
+                  </button>
+                </span>
+              </summary>
+              <div className="border-t px-3 pb-1 pt-2" style={{ borderColor: 'var(--border)' }}>
+                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                  {group.blurb}
+                </p>
+                <ul className="divide-y" style={{ borderColor: 'var(--gridline)' }}>
+                  {steps.map((step) => (
+                    <StepRow
+                      key={step.id}
+                      step={step}
+                      editable
+                      included={!excluded.has(step.id)}
+                      onToggle={() => toggle(step.id)}
+                      onChange={(params) =>
+                        setDraft(draft.map((item) => (item.id === step.id ? { ...item, params } : item)))
+                      }
+                      onDelete={() => setDraft(draft.filter((item) => item.id !== step.id))}
+                    />
+                  ))}
+                </ul>
+              </div>
+            </details>
+          )
+        })}
+
+        {ungrouped.length > 0 && (
+          <details open className="panel">
+            <summary className="cursor-pointer px-3 py-2.5 text-sm font-semibold">
+              Other steps
+            </summary>
+            <ul className="divide-y px-3" style={{ borderColor: 'var(--gridline)' }}>
+              {ungrouped.map((step) => (
+                <StepRow
+                  key={step.id}
+                  step={step}
+                  editable
+                  included={!excluded.has(step.id)}
+                  onToggle={() => toggle(step.id)}
+                  onChange={(params) =>
+                    setDraft(draft.map((item) => (item.id === step.id ? { ...item, params } : item)))
+                  }
+                  onDelete={() => setDraft(draft.filter((item) => item.id !== step.id))}
+                />
+              ))}
+            </ul>
+          </details>
+        )}
+
+        {draft.length === 0 && (
+          <p className="py-4 text-center text-sm" style={{ color: 'var(--text-muted)' }}>
+            Your data looks tidy — nothing needs fixing.
+          </p>
+        )}
+
+        <details>
+          <summary className="cursor-pointer text-xs" style={{ color: 'var(--text-muted)' }}>
+            Add a step of your own
+          </summary>
+          <div className="mt-2">
+            <AddStep
+              tables={tables}
+              stepTypes={stepTypes}
+              onAdd={(step) => setDraft([...draft, step])}
+            />
+          </div>
+        </details>
+
+        <div
+          className="flex flex-wrap items-center justify-between gap-3 border-t pt-3"
+          style={{ borderColor: 'var(--border)' }}
+        >
+          <label className="flex items-center gap-2 text-xs" style={{ color: 'var(--text-secondary)' }}>
+            <input
+              type="checkbox"
+              checked={reviewEach}
+              onChange={(event) => setReviewEach(event.target.checked)}
+            />
+            Pause after each step so I can check it
+          </label>
+          <Button
+            variant="primary"
+            disabled={busy}
+            onClick={() => onSubmit('confirm', included, !reviewEach)}
+          >
+            {draft.length === 0
+              ? 'Continue'
+              : included.length === 0
+                ? 'Continue without changes'
+                : `Apply ${included.length} step${included.length === 1 ? '' : 's'}`}
+          </Button>
+        </div>
       </div>
-
-      <p className="mt-3 text-[11px]" style={{ color: 'var(--text-muted)' }}>
-        No step on this list can write a value into an empty cell. Missing values stay missing —
-        they arrive in the database as NULL, so totals and averages are computed from the rows you
-        actually have, not from filled-in guesses.
-      </p>
     </Panel>
   )
+}
+
+/** Only steps that cannot lose a value start ticked. */
+function initiallyExcluded(plan) {
+  return new Set(plan.filter((step) => groupOf(step)?.safe === false).map((step) => step.id))
 }
 
 export { STEP_FIELDS, STEP_TITLES, toInput, fromInput }

@@ -312,7 +312,7 @@ def prepare_frame(spec: TableSpec, df: pd.DataFrame) -> pd.DataFrame:
     for column in spec.columns:
         if column.source_name not in df.columns:
             continue
-        data[column.name] = coerce_series(df[column.source_name], column.column_type)
+        data[column.name] = coerce_series(df[column.source_name], column.type_plan.storage)
     return pd.DataFrame(data, index=df.index)
 
 

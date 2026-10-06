@@ -42,12 +42,11 @@ STEP_ORDER: dict[StepType, int] = {
     StepType.MERGE_SHEETS: 9,
 }
 
-#: A column this empty is a leftover, and the plan offers to delete it.  Note
-#: what the planner does *not* offer for anything below this line: nothing.  A
-#: gap is reported (triage screen, null-ratio bar in the field semantic view)
-#: and then left alone, because the only way to close it is to invent the value
-#: that is missing.
-HIGH_NULL_RATIO = 0.60
+#: The plan only ever offers to delete a column with **nothing** in it.  A column
+#: that is 88 % empty still holds values somebody typed, and deleting it is a
+#: loss the user did not ask for.  Any gap short of that is reported (triage
+#: screen, null-ratio bar in the field semantic view) and then left alone, because
+#: the only way to close it is to invent the value that is missing.
 
 
 def _new_id() -> str:
@@ -174,27 +173,13 @@ def heuristic_plan(
                         type=StepType.DROP_COLUMN,
                         table=name,
                         description=(
-                            f"'{column}' is completely empty, so it carries no information "
-                            "and would only add noise to the database."
+                            f"The column '{column}' in '{name}' is completely empty — every row "
+                            "is blank. It holds no information, so removing it makes the table "
+                            "tidier and loses nothing."
                         ),
                         params={"column": column},
                         origin="heuristic",
-                    )
-                )
-                continue
-
-            if null_ratio > HIGH_NULL_RATIO:
-                steps.append(
-                    CleaningStep(
-                        id=_new_id(),
-                        type=StepType.DROP_COLUMN,
-                        table=name,
-                        description=(
-                            f"'{column}' is {null_ratio:.0%} empty — usually a leftover column. "
-                            "Delete this step if the few values it does hold matter to you."
-                        ),
-                        params={"column": column},
-                        origin="heuristic",
+                        rationale="no value in any row, so nothing is lost by removing it",
                     )
                 )
                 continue
@@ -217,11 +202,14 @@ def heuristic_plan(
                             type=StepType.STRIP_WHITESPACE,
                             table=name,
                             description=(
-                                f"{stray:,} value(s) in '{column}' start or end with a space, so "
-                                "they look identical on screen but count as different values."
+                                f"{stray:,} value(s) in '{column}' ({name}) have extra spaces at "
+                                "the start or end. They look the same on screen, but a database "
+                                "counts 'Oak ' and 'Oak' as different, so totals and filters would "
+                                "miss some. Trimming the spaces fixes that."
                             ),
                             params={"column": column},
                             origin="heuristic",
+                            rationale="only spaces at the edges are removed; the words are untouched",
                         )
                     )
 
@@ -234,10 +222,11 @@ def heuristic_plan(
                             type=StepType.STANDARDIZE_CASING,
                             table=name,
                             description=(
-                                f"'{column}' writes the same value with different capitalisation "
-                                f"(for example {shown}), which splits one category into "
-                                f"{collisions + 1 if collisions == 1 else 'several'}. Matching the "
-                                f"{casing}case spelling the column already mostly uses merges them."
+                                f"'{column}' ({name}) spells the same value with different "
+                                f"capitalisation (for example {shown}), so one category is counted "
+                                f"as {'two' if collisions == 1 else 'several'}. Using the "
+                                f"{casing}case spelling the column already mostly uses brings them "
+                                "together."
                             ),
                             params={"column": column, "casing": casing},
                             origin="heuristic",
@@ -266,9 +255,11 @@ def heuristic_plan(
                     type=StepType.DEDUPLICATE,
                     table=name,
                     description=(
-                        f"{duplicate_count} row(s) in '{name}' are exact copies of another row, "
-                        "which would double-count them in every total."
+                        f"{duplicate_count:,} row(s) in '{name}' are exact copies of another "
+                        "row. Keeping them would count the same thing twice in every total. "
+                        "One copy of each is kept."
                     ),
+                    rationale="only rows identical in every column are removed",
                     params={"subset": None},
                     origin="heuristic",
                 )
@@ -282,9 +273,9 @@ def heuristic_plan(
                     type=StepType.ADD_SYNTHETIC_KEY,
                     table=name,
                     description=(
-                        f"No column or combination of columns in '{name}' uniquely identifies a "
-                        "row, so the database has no way to reference one. A simple numbered id "
-                        "column fixes that."
+                        f"Nothing in '{name}' uniquely identifies a row, so no other table can "
+                        "point at one. Adding a simple counter column (1, 2, 3, …) fixes that "
+                        "and changes none of your existing data."
                     ),
                     params={"column": "row_id"},
                     origin="heuristic",
@@ -301,24 +292,34 @@ def heuristic_plan(
     # repeated customer columns are what a foreign key is for.  The one case
     # where a join really is the answer is a single table split across two
     # sheets (Q1 and Q2), which is recognisable: the columns are the same.
-    for equivalence in equivalences:
-        if not equivalence.get("confirmed"):
-            continue
+    merged_pairs: set[frozenset[str]] = set()
+    for equivalence in sorted(
+        (e for e in equivalences if e.get("confirmed")),
+        key=lambda e: float(e.get("score") or 0.0),
+        reverse=True,
+    ):
         left_table = equivalence["left_table"]
         right_table = equivalence["right_table"]
         if left_table not in tables or right_table not in tables:
             continue
         if not _same_shape(tables[left_table], tables[right_table]):
             continue
+        # One step per pair of tables, however many of their columns match —
+        # every column of a split table matches its twin.  The strongest pair
+        # is the join key.
+        pair = frozenset((left_table, right_table))
+        if pair in merged_pairs:
+            continue
+        merged_pairs.add(pair)
         steps.append(
             CleaningStep(
                 id=_new_id(),
                 type=StepType.MERGE_SHEETS,
                 table=left_table,
                 description=(
-                    f"'{left_table}' and '{right_table}' hold the same columns and you confirmed "
-                    f"that {equivalence['left_column']} and {equivalence['right_column']} mean the "
-                    "same thing, so they look like one table split in two."
+                    f"'{left_table}' and '{right_table}' have exactly the same columns, and "
+                    f"{equivalence['left_column']} / {equivalence['right_column']} match, so "
+                    "they look like one table that was split in two. This combines them into one."
                 ),
                 params={
                     "left_table": equivalence["left_table"],
@@ -329,6 +330,7 @@ def heuristic_plan(
                     "result_table": f"{equivalence['left_table']}_with_{equivalence['right_table']}",
                 },
                 origin="heuristic",
+                rationale="check this one — it is the only step that joins two tables",
             )
         )
 
@@ -438,6 +440,106 @@ def validate_plan_references(
 # ---------------------------------------------------------------------------
 
 
+#: What each executor in ``steps.py`` refuses to run without.  A model's step
+#: that lacks one of these would parse and validate, then fail on the step
+#: screen — for a plan of dozens of steps, on every one of them.
+REQUIRED_PARAMS: dict[StepType, tuple[str, ...]] = {
+    StepType.RENAME_COLUMN: ("column", "new_name"),
+    StepType.DROP_COLUMN: ("column",),
+    StepType.STANDARDIZE_FORMAT: ("column",),
+    StepType.STANDARDIZE_CASING: ("column",),
+    StepType.STRIP_WHITESPACE: ("column",),
+    StepType.MERGE_SHEETS: ("right_table", "left_key", "right_key"),
+    StepType.SPLIT_COLUMN: ("column",),
+    StepType.TYPE_CAST: ("column", "to"),
+}
+
+#: Steps that act on one column and so can be split from a "columns": [...] list.
+_PER_COLUMN_STEPS = frozenset(
+    {
+        StepType.DROP_COLUMN,
+        StepType.STANDARDIZE_FORMAT,
+        StepType.STANDARDIZE_CASING,
+        StepType.STRIP_WHITESPACE,
+    }
+)
+
+#: Every key a step's ``params`` may hold; a model that puts one at the top
+#: level of the step instead of inside ``params`` is still understood.
+_PARAM_KEYS = (
+    "column", "new_name", "format", "date_format", "casing", "collapse_internal",
+    "left_table", "right_table", "left_key", "right_key", "how", "result_table",
+    "delimiter", "regex", "into", "subset", "keep", "to",
+)  # fmt: skip
+
+_COLUMN_ALIASES = ("column_name", "col", "field", "column_names", "columns")
+
+
+def _params_variants(
+    raw: Mapping[str, Any], step_type: StepType
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Read a model's step into one ``params`` dict per column it acts on.
+
+    Models are loose about where a step's arguments go: inside ``params`` as
+    asked, at the top level of the step, under another name for the column, or
+    as a ``columns`` list for several at once.  Reading all of them is cheaper
+    than rejecting a step whose meaning is plain.  The second value is the
+    reason the step cannot be read at all.
+    """
+
+    holder = next(
+        (raw[key] for key in ("params", "parameters", "arguments", "args") if raw.get(key)),
+        {},
+    )
+    if not isinstance(holder, Mapping):
+        return [], "params must be an object"
+    params = dict(holder)
+
+    for key in _PARAM_KEYS:
+        if params.get(key) in (None, "") and raw.get(key) not in (None, ""):
+            params[key] = raw[key]
+
+    if "column" not in REQUIRED_PARAMS.get(step_type, ()):
+        # deduplicate names its columns as ``subset``; merge_sheets and
+        # add_synthetic_key have no column to find.
+        if step_type is StepType.DEDUPLICATE and not params.get("subset"):
+            listed = next(
+                (v for k in ("columns", "column_names") if (v := params.get(k, raw.get(k)))),
+                None,
+            )
+            params["subset"] = listed if isinstance(listed, list) else None
+        for key in ("columns", "column_names"):
+            params.pop(key, None)
+        return [params], None
+
+    columns: list[Any] = []
+    if params.get("column") not in (None, ""):
+        columns = params["column"] if isinstance(params["column"], list) else [params["column"]]
+    else:
+        for key in _COLUMN_ALIASES:
+            value = params.get(key, raw.get(key))
+            if value not in (None, "", []):
+                columns = value if isinstance(value, list) else [value]
+                break
+    columns = [str(c) for c in columns if c not in (None, "")]
+    for key in _COLUMN_ALIASES:
+        params.pop(key, None)
+
+    if not columns:
+        params.pop("column", None)
+        return [params], None
+    if len(columns) > 1 and step_type in _PER_COLUMN_STEPS:
+        return [{**params, "column": column} for column in columns], None
+    return [{**params, "column": columns[0]}], None
+
+
+def _missing_params(step_type: StepType, params: Mapping[str, Any]) -> list[str]:
+    return [
+        key for key in REQUIRED_PARAMS.get(step_type, ()) if params.get(key) in (None, "")
+    ]
+
+
+
 def normalize_claude_plan(
     raw_steps: Iterable[Mapping[str, Any]],
     tables: Mapping[str, pd.DataFrame],
@@ -455,11 +557,6 @@ def normalize_claude_plan(
         label = f"step {index + 1}"
         step_type = str(raw.get("type", "")).strip()
         table = str(raw.get("table", "")).strip()
-        params = raw.get("params") or {}
-        if not isinstance(params, dict):
-            rejected.append(f"{label}: params must be an object")
-            continue
-
         try:
             parsed_type = StepType(step_type)
         except ValueError:
@@ -473,22 +570,48 @@ def normalize_claude_plan(
                 rejected.append(f"{label}: unknown step type {step_type!r}")
             continue
 
-        reason = _validate_references(parsed_type, table, params, tables)
-        if reason:
-            rejected.append(f"{label} ({step_type}): {reason}")
+        variants, unreadable = _params_variants(raw, parsed_type)
+        if unreadable:
+            rejected.append(f"{label}: {unreadable}")
             continue
 
-        accepted.append(
-            CleaningStep(
-                id=_new_id(),
-                type=parsed_type,
-                table=table,
-                description=str(raw.get("description", "")).strip()
-                or f"{step_type.replace('_', ' ')} on {table}",
-                params=params,
-                origin="agent",
+        for params in variants:
+            missing = _missing_params(parsed_type, params)
+            if missing:
+                rejected.append(
+                    f"{label} ({step_type}): no {' or '.join(repr(m) for m in missing)} "
+                    f"was given for {table}, so it could not be run"
+                )
+                continue
+
+            reason = _validate_references(parsed_type, table, params, tables)
+            if reason:
+                rejected.append(f"{label} ({step_type}): {reason}")
+                continue
+
+            if (
+                parsed_type is StepType.DROP_COLUMN
+                and not tables[table][str(params.get("column"))].isna().all()
+            ):
+                # The planner's own rule, applied to the model too: a column that
+                # holds any value at all is the user's data, however sparse.
+                rejected.append(
+                    f"{label}: '{params.get('column')}' in {table} still holds values, so it was "
+                    "kept — only completely empty columns are ever dropped"
+                )
+                continue
+
+            accepted.append(
+                CleaningStep(
+                    id=_new_id(),
+                    type=parsed_type,
+                    table=table,
+                    description=str(raw.get("description", "")).strip()
+                    or f"{step_type.replace('_', ' ')} on {table}",
+                    params=params,
+                    origin="agent",
+                )
             )
-        )
 
     return sort_plan(accepted), rejected
 

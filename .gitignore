@@ -11,6 +11,12 @@ backend/tests/fixtures/*.xlsx
 .env.local
 !.env.example
 
+# BIRD benchmark harness — downloaded dataset and run outputs
+backend/evaluation/bird/data/
+backend/evaluation/bird/schema_cache/
+backend/evaluation/bird/results/
+backend/evaluation/bird/work/
+
 # node
 node_modules/
 frontend/dist/

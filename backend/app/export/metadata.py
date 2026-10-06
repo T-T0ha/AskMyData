@@ -47,6 +47,7 @@ from app.core.config import get_settings
 from app.db.models import EmbeddingVector
 from app.export.naming import is_managed_schema
 from app.export.schema import ColumnSpec, ExportPlan, TableSpec
+from app.semantics.descriptions import is_template_description
 from app.semantics.embeddings import get_embedder
 
 logger = logging.getLogger(__name__)
@@ -111,12 +112,22 @@ def describe(column: ColumnSpec, table: TableSpec) -> str:
     # embedded for retrieval, and "unknown table" is worse than silence at both.
     table_type = table.table_type if table.table_type != "unknown" else "data"
 
+    # "(unknown, VARCHAR(50))" tells a reader and an embedder nothing but noise.
+    kind = column.type_plan.render()
+    if column.taxonomy_label and column.taxonomy_label != "unknown":
+        kind = f"{column.taxonomy_label.replace('_', ' ')}, {kind}"
     head = (
         f"{column.name.replace('_', ' ')} in {table.name.replace('_', ' ')} "
-        f"({column.taxonomy_label.replace('_', ' ')}, {column.type_plan.render()})"
-        f" — {table_type.replace('_', ' ')} table"
+        f"({kind}) — {table_type.replace('_', ' ')} table"
     )
     clauses: list[str] = []
+    # What the column *means*, in words a question would use.  A name like
+    # ``avgscrwrite`` carries almost nothing for a sentence embedder; the
+    # sentence written for it in Phase 1 ("the average SAT writing score …")
+    # carries what the question will say.  The deterministic template is just
+    # the name again, so it is left out.
+    if not is_template_description(column.description):
+        clauses.append(column.description.strip().rstrip("."))
     if column.is_primary_key:
         clauses.append("identifies the row")
     if column.is_foreign_key and column.references_table:

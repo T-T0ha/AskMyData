@@ -198,7 +198,18 @@ function DatabaseTab({ vocabulary, busy, onInspect, onConnect }) {
   )
 }
 
-export function SourcePicker({ vocabulary, session, busy, onUpload, onInspect, onConnect }) {
+export function SourcePicker({
+  vocabulary,
+  session,
+  busy,
+  onUpload,
+  onInspect,
+  onConnect,
+  pendingSource,
+  onConfirmAdd,
+  onConfirmNewSession,
+  onCancelPending,
+}) {
   const [tab, setTab] = useState('file')
 
   return (
@@ -227,6 +238,33 @@ export function SourcePicker({ vocabulary, session, busy, onUpload, onInspect, o
         </div>
       }
     >
+      {pendingSource && (
+        <div
+          className="mb-4 rounded-md border p-3"
+          style={{ borderColor: 'var(--status-warning)', background: 'var(--surface-2)' }}
+        >
+          <p className="text-xs" style={{ color: 'var(--text-primary)' }}>
+            <strong>{session?.name}</strong> already has {session?.sheets?.length ?? 0} table
+            {session?.sheets?.length === 1 ? '' : 's'}. Add{' '}
+            {pendingSource.type === 'files'
+              ? `${pendingSource.files.length} file${pendingSource.files.length === 1 ? '' : 's'}`
+              : 'this connection'}{' '}
+            to it, or keep it as a separate database?
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <Button variant="primary" disabled={busy} onClick={onConfirmAdd}>
+              Add to "{session?.name}"
+            </Button>
+            <Button disabled={busy} onClick={onConfirmNewSession}>
+              Keep separate — start a new database
+            </Button>
+            <Button variant="ghost" disabled={busy} onClick={onCancelPending}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+
       {tab === 'file' ? (
         <FileTab vocabulary={vocabulary} session={session} busy={busy} onUpload={onUpload} />
       ) : (

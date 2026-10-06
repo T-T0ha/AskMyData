@@ -486,6 +486,11 @@ class EquivalenceCandidateRecord(Base):
     explanation: Mapped[str] = mapped_column(Text, default="")
     #: ``None`` = undecided, ``True`` = confirmed, ``False`` = rejected.
     confirmed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    #: Who made the call: ``"auto"`` when the evidence was decisive and the
+    #: platform decided, ``"user"`` once a person did.  ``None`` for a pair that
+    #: is still waiting — and for one answered before this was recorded, which
+    #: can only have been answered by a person.
+    decided_by: Mapped[str | None] = mapped_column(String(10), nullable=True)
     #: The two column-name embeddings ``embedding_similarity`` was computed
     #: from — a real ``vector(n)`` column on PostgreSQL (JSON elsewhere), the
     #: same dialect-aware type as ``ColumnSemantics.embedding``.  Scoring
@@ -515,6 +520,8 @@ class EquivalenceCandidateRecord(Base):
             "type_compatible": self.type_compatible,
             "explanation": self.explanation,
             "confirmed": self.confirmed,
+            "decided_by": self.decided_by
+            or ("user" if self.confirmed is not None else None),
         }
         if include_embedding:
             payload["left_embedding"] = self.left_embedding
@@ -573,6 +580,10 @@ class QueryExample(Base):
         EmbeddingVector(get_settings().embedding_dim), nullable=True
     )
     verified: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: The one-sentence reading the answer was shown with, kept so a question
+    #: answered straight from this example (:func:`app.api.services.answer_question`)
+    #: explains itself the same way it did when the user verified it.
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     session: Mapped[IngestionSession] = relationship(back_populates="query_examples")
@@ -582,6 +593,7 @@ class QueryExample(Base):
             "id": self.id,
             "question": self.question,
             "sql": self.sql,
+            "explanation": self.explanation or "",
             "verified": self.verified,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
@@ -629,6 +641,11 @@ class RelationshipRecord(Base):
     #: what decides how it is drawn and how far up the list it sits.
     origin: Mapped[str] = mapped_column(String(20), default="detected")
     status: Mapped[str] = mapped_column(String(20), default="proposed", index=True)
+    #: ``"auto"`` when the evidence was decisive and the platform settled the
+    #: verdict, ``"user"`` once a person did.  ``None`` while it is only
+    #: proposed.  Re-running detection may revisit an ``"auto"`` verdict and
+    #: never a ``"user"`` one.
+    decided_by: Mapped[str | None] = mapped_column(String(10), nullable=True)
     #: The arithmetic behind the score: the two ratios, the name similarity,
     #: the unmatched values.  Kept so the panel can explain a proposal months
     #: later without re-running detection.
@@ -657,6 +674,8 @@ class RelationshipRecord(Base):
             "score": round(self.score, 4),
             "origin": self.origin,
             "status": self.status,
+            "decided_by": self.decided_by
+            or ("user" if self.status != "proposed" else None),
             "uncertain": self.origin == "fuzzy" or self.rel_type == "approximate_dependency",
             "evidence": self.evidence or {},
             "explanation": self.explanation,
@@ -904,12 +923,30 @@ class QueryHistoryRecord(Base):
     #: caller already reads (``ok == (outcome == "answered")``); ``outcome`` is
     #: what tells abstention and rejection apart, which ``ok`` alone cannot.
     outcome: Mapped[str] = mapped_column(String(20), default="rejected")
+    #: The turn as a complete, standalone question — what "and by month?" meant
+    #: once the turns before it were taken into account.  ``None`` when the
+    #: question was already standalone.
+    resolved_question: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: What the answer said it computed, and the tables it read: together with
+    #: ``sql`` this is everything a later turn is shown of this one — never a
+    #: result row, the same boundary every other model call holds.
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tables_used: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    #: The rephrasings offered when the question was held back as ambiguous, so
+    #: the turn that answers it can be recognised as the answer.
+    clarification_options: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    #: The earlier, ambiguous question this turn settled, when it did.
+    clarifies: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: "saved_example" when the SQL came straight from a verified example
+    #: rather than from generation.
+    source: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "question": self.question,
+            "resolved_question": self.resolved_question,
             "ok": self.ok,
             "sql": self.sql,
             "error": self.error,

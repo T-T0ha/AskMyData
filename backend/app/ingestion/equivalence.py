@@ -28,6 +28,16 @@ from app.semantics.embeddings import cosine_matrix, embed_column_names, get_embe
 EMBEDDING_WEIGHT = 0.55
 LEXICAL_WEIGHT = 0.45
 TYPE_MISMATCH_PENALTY = 0.15
+#: A pair this similar in name, with compatible types and at least some values
+#: in common, is the same column showing up in two tables.  It is linked without
+#: asking: confirming it is the answer in every case worth the trouble.
+AUTO_CONFIRM_SCORE = 0.90
+#: Below this a pair shares too little to be worth a person's attention.  Between
+#: the two, shared values decide; only a pair they cannot decide is asked about.
+AUTO_REJECT_SCORE = 0.80
+#: In the middle band, this much of the smaller column's values appearing in the
+#: other is evidence enough that they hold the same thing.
+AUTO_CONFIRM_OVERLAP = 0.50
 #: Weak disconfirmation: two same-typed columns that genuinely mean the same
 #: thing inside one workbook usually share at least a few values.
 DISJOINT_VALUES_PENALTY = 0.08
@@ -203,6 +213,29 @@ def detect_equivalences(
 
     candidates.sort(key=lambda c: c.score, reverse=True)
     return candidates
+
+
+def auto_verdict(candidate: EquivalenceCandidate) -> bool | None:
+    """Decide a pair from its evidence: ``True`` link, ``False`` unrelated.
+
+    ``None`` means the evidence does not settle it and a person should look.
+    Nothing downstream is blocked by an unanswered pair — it is treated as "not
+    the same" — so the cost of asking is a question, never a stalled workflow.
+    """
+
+    if not candidate.type_compatible:
+        return False
+    overlap = candidate.value_overlap
+    if overlap is not None and overlap == 0.0:
+        # Same name, no value in common: ``orders.name`` and ``products.name``.
+        return False
+    if candidate.score >= AUTO_CONFIRM_SCORE:
+        return True
+    if candidate.score < AUTO_REJECT_SCORE:
+        return False
+    if overlap is not None and overlap >= AUTO_CONFIRM_OVERLAP:
+        return True
+    return None
 
 
 def suggestion_text(candidate: EquivalenceCandidate) -> str:

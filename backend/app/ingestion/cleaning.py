@@ -109,6 +109,11 @@ class ColumnCleanReport:
     retyped_to: str | None = None
     parse_success_ratio: float | None = None
     coerced_to_null: int = 0
+    #: Values that read like a missing-data marker (``-``, ``na``, ``unknown``)
+    #: and were left exactly as the source stored them.  Only a source that
+    #: arrives with a schema reports this: a spreadsheet's markers are
+    #: normalised to blanks, a database's are data it chose to hold.
+    null_like_kept: int = 0
     detected_currency_symbol: str | None = None
     date_format: str | None = None
     mixed_type_ratio: float = 0.0
@@ -144,6 +149,7 @@ class ColumnCleanReport:
                 round(self.parse_success_ratio, 4) if self.parse_success_ratio is not None else None
             ),
             "coerced_to_null": self.coerced_to_null,
+            "null_like_kept": self.null_like_kept,
             "detected_currency_symbol": self.detected_currency_symbol,
             "date_format": self.date_format,
             "mixed_type_ratio": round(self.mixed_type_ratio, 4),
@@ -306,16 +312,25 @@ def _dominant_python_type(series: pd.Series) -> tuple[str, float]:
 
 
 def clean_series(
-    series: pd.Series, name: str, retype: bool = True
+    series: pd.Series, name: str, retype: bool = True, rewrite_values: bool = True
 ) -> tuple[pd.Series, ColumnCleanReport]:
     """Normalise one column and report every transformation applied.
 
-    ``retype=False`` keeps the null-marker and whitespace normalisation but
-    leaves the column's type alone.  That is what relational sources want: a
-    database has already committed to a type, and converting one side of a
-    declared foreign key from text to numeric would break the join the source
-    itself documented.  Phase 1 reads semantic types from values, not dtypes,
-    so nothing downstream is weakened by it.
+    ``retype=False`` leaves the column's type alone.  That is what relational
+    sources want: a database has already committed to a type, and converting
+    one side of a declared foreign key from text to numeric would break the
+    join the source itself documented.  Phase 1 reads semantic types from
+    values, not dtypes, so nothing downstream is weakened by it.
+
+    ``rewrite_values=False`` leaves the *values* alone as well: no marker is
+    turned into a blank and no whitespace is trimmed.  A spreadsheet writes
+    ``N/A`` where it means "not known", so reading it as a blank is cleaning.
+    A database distinguishes NULL from the text ``'-'`` or ``'unknown'`` and
+    stored the text on purpose — a bond type, a survey answer, a status — so
+    reading it as a blank would assert something the source never said, and a
+    question about those rows would come back empty.  Markers are counted and
+    reported instead, and the reviewed cleaning step (``strip_whitespace``,
+    ``standardize_format``) is where a person decides to change them.
     """
 
     settings = get_settings()
@@ -327,7 +342,19 @@ def clean_series(
 
     working = series.copy()
 
-    if working.dtype == object or pd.api.types.is_string_dtype(working):
+    if not rewrite_values and (working.dtype == object or pd.api.types.is_string_dtype(working)):
+        kept = sum(
+            1 for value in working if isinstance(value, str) and value.strip().lower() in NULL_TOKENS
+        )
+        report.null_like_kept = kept
+        # Same container the rewriting path hands back; only the values differ.
+        working = working.astype(object)
+        if kept:
+            report.notes.append(
+                f"{kept} value(s) read like a missing-data marker and were kept as the source "
+                "stored them"
+            )
+    elif working.dtype == object or pd.api.types.is_string_dtype(working):
         trimmed = 0
         nulls = 0
         values: list[Any] = []
@@ -483,14 +510,16 @@ def clean_series(
 
 
 def clean_dataframe(
-    df: pd.DataFrame, retype: bool = True
+    df: pd.DataFrame, retype: bool = True, rewrite_values: bool = True
 ) -> tuple[pd.DataFrame, list[ColumnCleanReport]]:
     """Run :func:`clean_series` across every column of a sheet."""
 
     cleaned: dict[str, pd.Series] = {}
     reports: list[ColumnCleanReport] = []
     for column in df.columns:
-        series, report = clean_series(df[column], str(column), retype=retype)
+        series, report = clean_series(
+            df[column], str(column), retype=retype, rewrite_values=rewrite_values
+        )
         cleaned[str(column)] = series
         reports.append(report)
     out = pd.DataFrame(cleaned, index=df.index)

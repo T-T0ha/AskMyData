@@ -24,6 +24,27 @@ through the type system instead of through a cleaning step — so every type her
 is *checked against the column* and widened if it does not fit, with a note
 saying so.
 
+**A type the source declared is kept.**  A spreadsheet has no types, so the
+mapping above is the only voice the column has.  A database or SQL dump has
+one: ``height INTEGER`` is a number that gets compared, sorted and summed, and
+exporting it as ``VARCHAR(50)`` because few of its values are distinct makes
+``WHERE height > 200`` compare text and ``ORDER BY height`` put 99 after 100.
+So when the source declared a numeric type and every value fits it, a column
+Phase 1 read as a nominal code or an identifier keeps that type; a column the
+source declared ``DATE``, and whose values are whole days, stays a ``DATE``.
+The same goes for the other direction: a column the source declared ``TEXT``
+stays text however Phase 1 reads what is in it.  ``'218.300'`` in a ``TEXT``
+column sorts as text, ``'2019-09-14'`` is compared with ``'2019-09-14'``, and
+``'true'`` is what a ``WHERE approved = 'true'`` is written against — a
+database that stored them that way is queried that way, and rewriting them as
+a float, a timestamp (``'2019-09-14 00:00:00.000000'`` on SQLite) or a ``1``
+silently changes the answer to questions the source answered correctly.
+Turning such a column into a number or a date is a cleaning decision, and
+Phase 2's reviewed ``type_cast`` is where it is made.
+The *semantic* type is untouched — ``sem_metadata`` still says
+``integer_nominal`` or ``date`` — only the storage follows the declaration,
+and a type the user corrected by hand is never overridden.
+
 The types are SQLAlchemy's rather than literal SQL, so the same plan renders as
 PostgreSQL DDL and executes against the SQLite the test suite runs on.
 """
@@ -38,6 +59,7 @@ import pandas as pd
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Double,
     Integer,
@@ -102,10 +124,22 @@ class TypePlan:
     #: Empty when the declared mapping was used unchanged.  Every entry is
     #: something the user should see in the export report.
     notes: list[str] = field(default_factory=list)
+    #: The type whose coercion fills the column, when it is not ``column_type``:
+    #: a nominal code the source declared ``INTEGER`` is *read* as a code but
+    #: *stored* as the integer it was.
+    stored_as: ColumnType | None = None
+    #: The source's own declaration, when it was kept over the default mapping.
+    kept_source_type: str | None = None
 
     @property
     def widened(self) -> bool:
         return bool(self.notes)
+
+    @property
+    def storage(self) -> ColumnType:
+        """The column type whose :func:`coerce_series` rules produce the stored values."""
+
+        return self.stored_as or self.column_type
 
     def render(self) -> str:
         """The type as PostgreSQL would spell it, for the DDL preview."""
@@ -118,6 +152,7 @@ class TypePlan:
             "sql_type": self.render(),
             "widened": self.widened,
             "notes": self.notes,
+            "kept_source_type": self.kept_source_type,
         }
 
 
@@ -125,17 +160,130 @@ def render_type(sql_type: TypeEngine) -> str:
     return str(sql_type.compile(dialect=postgresql.dialect()))
 
 
-def plan_type(column_type: ColumnType, series: pd.Series | None = None) -> TypePlan:
-    """Pick the column's type, widening the default if the values need it."""
+def declared_family(data_type: str | None) -> str | None:
+    """What kind of column a source's declaration describes.
+
+    Reads the type the way SQLite's affinity rules do, which is also how
+    ``INT``, ``BIGINT`` and ``UNSIGNED BIG INT`` are told from ``VARCHAR(20)``
+    on PostgreSQL and MySQL.  ``None`` means the source said nothing usable —
+    a spreadsheet, or a SQLite column declared with no type — and the mapping
+    by semantic type applies unchanged.
+    """
+
+    text = str(data_type or "").upper()
+    if not text or text == "NULL":
+        return None
+    if any(word in text for word in ("CHAR", "CLOB", "TEXT", "STRING", "UUID", "JSON")):
+        return "text"
+    if "DATETIME" in text or "TIMESTAMP" in text:
+        return "datetime"
+    if "DATE" in text:
+        return "date"
+    if "INT" in text and not any(word in text for word in ("INTERVAL", "POINT")):
+        return "integer"
+    if any(word in text for word in ("REAL", "FLOA", "DOUB")):
+        return "float"
+    if any(word in text for word in ("NUMERIC", "DECIMAL", "NUMBER", "MONEY")):
+        return "numeric"
+    return None
+
+
+#: Readings Phase 1 gives a column whose *contents* look like numbers, days or
+#: truth values.  Over a ``TEXT`` declaration the source has already said what
+#: the column is, so none of them changes how it is stored.
+_READ_BEYOND_TEXT = frozenset(
+    {
+        ColumnType.INTEGER_ORDINAL,
+        ColumnType.INTEGER_CONTINUOUS,
+        ColumnType.CURRENCY,
+        ColumnType.FLOAT,
+        ColumnType.DATE,
+        ColumnType.BOOLEAN,
+    }
+)
+
+
+def _keep_declared(
+    column_type: ColumnType, values: pd.Series, family: str
+) -> tuple[TypeEngine, ColumnType] | None:
+    """The source's own numeric or date type, if it applies and every value fits it.
+
+    Only the readings that *change what kind of thing is stored* are
+    overridden: a code or identifier over a numeric declaration, and a
+    timestamp over a ``DATE`` declaration.  Anything else is the ordinary
+    mapping, and a value that does not fit the declaration (a stray ``'n/a'``
+    in an ``INTEGER`` column, which SQLite allows) sends the column back to it.
+    (A ``TEXT`` declaration needs no check of the values and is handled in
+    :func:`plan_type`.)
+    """
+
+
+    if column_type in (ColumnType.INTEGER_NOMINAL, ColumnType.IDENTIFIER) and family in {
+        "integer",
+        "float",
+        "numeric",
+    }:
+        numbers = pd.to_numeric(values, errors="coerce")
+        if bool(numbers.isna().any()):
+            return None
+        if family == "integer":
+            if not bool((numbers % 1 == 0).all()):
+                return None
+            largest = _max_absolute(numbers)
+            return (
+                BigInteger() if largest is not None and largest > INT32_MAX else Integer(),
+                ColumnType.INTEGER_ORDINAL,
+            )
+        if family == "float":
+            return Double(), ColumnType.FLOAT
+        return Numeric(), ColumnType.INTEGER_CONTINUOUS
+
+    if column_type is ColumnType.DATE and family == "date":
+        parsed = pd.to_datetime(values, errors="coerce")
+        if bool(parsed.notna().all()) and bool((parsed == parsed.dt.normalize()).all()):
+            return Date(), ColumnType.DATE
+    return None
+
+
+def plan_type(
+    column_type: ColumnType,
+    series: pd.Series | None = None,
+    declared: str | None = None,
+) -> TypePlan:
+    """Pick the column's type, widening the default if the values need it.
+
+    ``declared`` is the type the *source* gave the column, when it had one.  Pass
+    ``None`` for a spreadsheet, and for any column whose type the user chose.
+    """
 
     sql_type = default_sql_type(column_type)
     notes: list[str] = []
+    family = declared_family(declared)
+
+    if family == "text" and column_type in _READ_BEYOND_TEXT:
+        # The source said text.  Nothing in the values can contradict that, so
+        # this is decided before they are looked at — a column of only blanks
+        # is as much a text column as any other.
+        return TypePlan(
+            column_type,
+            Text(),
+            notes,
+            stored_as=ColumnType.TEXT,
+            kept_source_type=str(declared),
+        )
+
     if series is None or series.empty:
         return TypePlan(column_type, sql_type, notes)
 
     values = series.dropna()
     if values.empty:
         return TypePlan(column_type, sql_type, notes)
+
+    kept = _keep_declared(column_type, values, family) if family else None
+    if kept is not None:
+        return TypePlan(
+            column_type, kept[0], notes, stored_as=kept[1], kept_source_type=str(declared)
+        )
 
     if column_type in DEFAULT_WIDTHS:
         width = DEFAULT_WIDTHS[column_type]

@@ -23,6 +23,8 @@ from app.export.runner import read_back
 from app.query.guard import QueryRejected, validate_select_only
 from app.query.retrieval import (
     TableScore,
+    columns_named_in,
+    examples_worth_showing,
     expand_by_references,
     rank_tables,
     retrieve_business_rules,
@@ -368,6 +370,65 @@ def test_examples_are_capped_at_max_examples():
     assert len(retrieve_examples([1.0, 0.0], examples, max_examples=2)) == 2
 
 
+def test_an_example_less_similar_than_the_floor_is_not_returned_however_few_there_are():
+    examples = [
+        {"question": "same kind of question", "sql": "SELECT 1", "embedding": [1.0, 0.1]},
+        {"question": "about something else", "sql": "SELECT 2", "embedding": [0.1, 1.0]},
+    ]
+    # Without a floor the two nearest are returned, the unrelated one included.
+    assert [e["question"] for e in retrieve_examples([1.0, 0.0], examples)] == [
+        "same kind of question",
+        "about something else",
+    ]
+    # With one, only what resembles the question is.
+    assert [e["question"] for e in retrieve_examples([1.0, 0.0], examples, min_similarity=0.6)] == [
+        "same kind of question"
+    ]
+    assert retrieve_examples([0.0, 1.0], examples[:1], min_similarity=0.6) == []
+
+
+def test_examples_worth_showing_keeps_the_ranking_the_cap_and_the_similarity():
+    ranked = [
+        {"question": "a", "similarity": 0.95},
+        {"question": "b", "similarity": 0.7},
+        {"question": "c", "similarity": 0.65},
+        {"question": "d", "similarity": 0.2},
+    ]
+    assert [e["question"] for e in examples_worth_showing(ranked, 3, 0.6)] == ["a", "b", "c"]
+    assert [e["question"] for e in examples_worth_showing(ranked, 2, 0.6)] == ["a", "b"]
+    assert [e["question"] for e in examples_worth_showing(ranked, 4, 0.6)] == ["a", "b", "c"]
+    assert examples_worth_showing(ranked, 3, 0.99) == []
+    # The floor is inclusive: an example exactly that similar is shown.
+    assert [e["question"] for e in examples_worth_showing(ranked, 4, 0.7)] == ["a", "b"]
+
+
+def test_the_default_cap_sends_every_column_of_an_ordinary_sized_schema():
+    """Ranking exists to protect the prompt budget; below the budget nothing is cut."""
+
+    from app.core.config import get_settings
+
+    columns = 90
+    rows = [
+        {
+            "table_name": "wide",
+            "column_name": f"c{i}",
+            "is_primary_key": i == 0,
+            "is_foreign_key": False,
+            "embedding": [0.0, 1.0],
+        }
+        for i in range(columns)
+    ]
+    kept = select_columns([1.0, 0.0], rows, ["wide"], get_settings().query_max_ranked_columns)
+    assert len(kept) == columns
+    # ...and a table wider than the budget is still cut down to it.
+    wide = [dict(rows[0])] + [
+        {**rows[1], "column_name": f"w{i}"} for i in range(get_settings().query_max_ranked_columns + 50)
+    ]
+    assert len(select_columns([1.0, 0.0], wide, ["wide"], get_settings().query_max_ranked_columns)) == (
+        1 + get_settings().query_max_ranked_columns
+    )
+
+
 # ---------------------------------------------------------------------------
 # service orchestration, against the real relational fixture
 # ---------------------------------------------------------------------------
@@ -418,6 +479,7 @@ class _ScriptedClaude:
         prior_error=None,
         business_rules=None,
         examples=None,
+        conversation=None,
     ):
         self.calls.append(
             {
@@ -428,6 +490,7 @@ class _ScriptedClaude:
                 "prior_error": prior_error,
                 "business_rules": business_rules,
                 "examples": examples,
+                "conversation": conversation,
             }
         )
         if not self._answers:
@@ -487,6 +550,72 @@ def test_a_rejected_first_attempt_is_retried_with_the_error(client, relational_w
     # The retry saw what went wrong, not just a second blind guess.
     assert fake.calls[1]["prior_sql"] == "DELETE FROM orders"
     assert fake.calls[1]["prior_error"]
+
+
+def test_a_query_that_fails_only_at_execution_is_retried_with_the_error(
+    client, relational_workbook, monkeypatch
+):
+    """``EXPLAIN`` plans a query without evaluating it, so a value-dependent
+    failure — a CAST that only breaks on one row's data, a date parse that
+    only breaks on a "TOTAL" footer row — only ever surfaces once the
+    statement actually runs.  That has to be retryable too, exactly like a
+    guard rejection or an ``EXPLAIN`` failure, not an unhandled 500."""
+
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    fake = _ScriptedClaude(
+        [
+            {"sql": "SELECT COUNT(*) AS n FROM orders", "explanation": "first try"},
+            {"sql": "SELECT COUNT(*) AS n FROM orders", "explanation": "second try"},
+        ]
+    )
+
+    real_run_readonly = services.run_readonly
+    calls = {"n": 0}
+
+    def flaky_run_readonly(session_id_, sql, row_cap):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError('invalid input syntax for type numeric: ""')
+        return real_run_readonly(session_id_, sql, row_cap)
+
+    monkeypatch.setattr(services, "run_readonly", flaky_run_readonly)
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        result = services.answer_question(db, record, "how many orders are there?", claude=fake)
+
+    assert result["ok"] is True
+    assert len(result["attempts"]) == 2
+    assert result["attempts"][0]["error"] and "numeric" in result["attempts"][0]["error"]
+    assert result["attempts"][1]["error"] is None
+    assert fake.calls[1]["prior_sql"] == "SELECT COUNT(*) AS n FROM orders"
+    assert fake.calls[1]["prior_error"]
+
+
+def test_a_query_that_always_fails_at_execution_still_returns_a_normal_result(
+    client, relational_workbook, monkeypatch
+):
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    fake = _ScriptedClaude(
+        [{"sql": "SELECT COUNT(*) AS n FROM orders", "explanation": "x"}] * 5
+    )
+
+    def always_fails(session_id_, sql, row_cap):
+        raise RuntimeError('invalid value "TOTAL" for "Mon"')
+
+    monkeypatch.setattr(services, "run_readonly", always_fails)
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        result = services.answer_question(db, record, "how many orders?", claude=fake)
+
+    assert result["ok"] is False
+    assert "TOTAL" in result["error"]
+    assert len(result["attempts"]) == db_settings_max_attempts()
 
 
 def test_giving_up_after_every_attempt_still_returns_a_normal_result(client, relational_workbook):
@@ -683,8 +812,10 @@ class _AmbiguousClaude(_ScriptedClaude):
     def __init__(self, answers, options):
         super().__init__(answers)
         self._options = options
+        self.ambiguity_checks: list[str] = []
 
-    def check_ambiguity(self, question, tables):
+    def check_ambiguity(self, question, tables, business_rules=None):
+        self.ambiguity_checks.append(question)
         return {"ambiguous": True, "reason": "could mean several things", "options": self._options}
 
 
@@ -809,9 +940,15 @@ def test_a_business_rule_is_retrieved_into_generation(client, relational_workboo
     ]
 
 
-def test_a_saved_example_is_retrieved_into_a_later_generation(client, relational_workbook):
+def test_a_saved_example_is_retrieved_into_a_later_generation(
+    client, relational_workbook, monkeypatch
+):
     from app.api import services
+    from app.core.config import get_settings
 
+    # Which embedder the suite runs on decides how alike two wordings score; what is
+    # under test is that an example that clears the floor reaches the model.
+    monkeypatch.setattr(get_settings(), "query_example_min_similarity", 0.0)
     session_id = _exported(client, relational_workbook)
     with _db() as db:
         record = db.get(IngestionSession, session_id)
@@ -830,6 +967,61 @@ def test_a_saved_example_is_retrieved_into_a_later_generation(client, relational
     assert fake.calls[0]["examples"] == [
         {"question": "how many orders are there?", "sql": "SELECT COUNT(*) AS n FROM orders"}
     ]
+
+
+def test_an_example_below_the_similarity_floor_is_not_sent_to_the_model(
+    client, relational_workbook, monkeypatch
+):
+    from app.api import services
+    from app.core.config import get_settings
+
+    session_id = _exported(client, relational_workbook)
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        services.save_query_example(
+            db, record, "how many orders are there?", "SELECT COUNT(*) AS n FROM orders"
+        )
+        db.commit()
+
+    # Nothing can be more similar than 1.0: the one saved example is, by construction,
+    # never similar enough, so the prompt carries no examples at all.
+    monkeypatch.setattr(get_settings(), "query_example_min_similarity", 1.01)
+    monkeypatch.setattr(get_settings(), "query_example_match_threshold", 1.01)
+    fake = _ScriptedClaude(
+        [{"sql": "SELECT COUNT(*) AS n FROM orders", "explanation": "counts orders"}]
+    )
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        result = services.answer_question(db, record, "how many orders total?", claude=fake)
+
+    assert result["ok"] is True
+    assert fake.calls[0]["examples"] == []
+
+
+def test_a_close_example_is_shown_even_when_the_floor_is_set_above_it(
+    client, relational_workbook, monkeypatch
+):
+    from app.api import services
+    from app.core.config import get_settings
+
+    session_id = _exported(client, relational_workbook)
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        services.save_query_example(
+            db, record, "how many orders are there?", "SELECT COUNT(*) AS n FROM orders"
+        )
+        db.commit()
+
+    monkeypatch.setattr(get_settings(), "query_example_min_similarity", 1.01)
+    monkeypatch.setattr(get_settings(), "query_example_match_threshold", 0.0)
+    fake = _ScriptedClaude(
+        [{"sql": "SELECT COUNT(*) AS n FROM orders", "explanation": "counts orders"}]
+    )
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        services.answer_question(db, record, "how many orders total?", claude=fake)
+
+    assert [e["question"] for e in fake.calls[0]["examples"]] == ["how many orders are there?"]
 
 
 def test_business_rule_and_example_routes_round_trip(client, relational_workbook):
@@ -876,3 +1068,463 @@ def test_an_example_with_sql_outside_the_export_is_rejected(client, relational_w
     )
 
     assert response.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# conversation memory, one clarification at most, and verified examples that
+# actually reproduce their SQL
+# ---------------------------------------------------------------------------
+
+ORDERS_SQL = "SELECT COUNT(*) AS n FROM orders"
+
+
+class _ConversationalClaude(_ScriptedClaude):
+    """Reads a follow-up the way a model would: rewrites it, and records what it was shown."""
+
+    def __init__(self, answers, rewrites):
+        super().__init__(answers)
+        self._rewrites = list(rewrites)
+        self.rewrite_calls: list[dict] = []
+
+    def rewrite_question(self, question, conversation):
+        self.rewrite_calls.append({"question": question, "conversation": conversation})
+        return self._rewrites.pop(0) if self._rewrites else None
+
+
+def _ask(session_id, question, claude):
+    from app.api import services
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        result = services.answer_question(db, record, question, claude=claude)
+        db.commit()
+    return result
+
+
+def _save(session_id, question, sql=ORDERS_SQL, **kwargs):
+    from app.api import services
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        example = services.save_query_example(db, record, question, sql, **kwargs)
+        db.commit()
+        return example.id
+
+
+def test_a_saved_question_is_answered_from_its_saved_sql_without_asking_the_model(
+    client, relational_workbook
+):
+    session_id = _exported(client, relational_workbook)
+    _save(session_id, "how many orders are there?", explanation="counts every order")
+
+    # A model that would both flag ambiguity and write different SQL — neither
+    # may be consulted for a question the user already verified.
+    fake = _AmbiguousClaude(
+        [{"sql": "SELECT 1 AS n", "explanation": "wrong"}], ["a?", "b?"]
+    )
+    result = _ask(session_id, "How many orders are there", fake)
+
+    assert result["ok"] is True
+    assert result["source"] == "saved_example"
+    assert result["sql"].upper().startswith("SELECT COUNT(*)")
+    assert result["explanation"] == "counts every order"
+    assert result["confidence"] == 1.0
+    assert result["row_count"] == 1 and result["columns"] == ["n"]
+    assert fake.calls == []
+    assert fake.ambiguity_checks == []
+
+
+def test_only_the_same_question_reuses_saved_sql_not_a_similar_one(client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+    _save(session_id, "top 5 customers by orders", "SELECT customer_id FROM orders LIMIT 5")
+
+    fake = _ScriptedClaude(
+        [{"sql": "SELECT customer_id FROM orders LIMIT 10", "explanation": "ten"}]
+    )
+    result = _ask(session_id, "top 10 customers by orders", fake)
+
+    assert result["ok"] is True
+    assert result.get("source") != "saved_example"
+    assert len(fake.calls) == 1
+
+
+def test_saved_sql_that_no_longer_runs_falls_back_to_generation(client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+    example_id = _save(session_id, "how many orders are there?")
+    from app.db.models import QueryExample
+
+    with _db() as db:
+        db.get(QueryExample, example_id).sql = "SELECT COUNT(*) AS n FROM no_such_table"
+        db.commit()
+
+    fake = _ScriptedClaude([{"sql": ORDERS_SQL, "explanation": "counts orders"}])
+    result = _ask(session_id, "how many orders are there?", fake)
+
+    assert result["ok"] is True
+    assert result.get("source") != "saved_example"
+    assert len(fake.calls) == 1
+
+
+def test_saving_the_same_question_again_replaces_the_sql_instead_of_duplicating(
+    client, relational_workbook
+):
+    from app.api import services
+
+    session_id = _exported(client, relational_workbook)
+    first = _save(session_id, "how many orders are there?")
+    second = _save(
+        session_id, "How many orders are there", "SELECT COUNT(order_id) AS n FROM orders"
+    )
+
+    assert first == second
+    with _db() as db:
+        examples = services.list_query_examples(db, session_id)
+    assert len(examples) == 1
+    assert "order_id" in examples[0].sql
+
+
+def test_an_ambiguous_question_the_user_settled_is_remembered_under_both_wordings(
+    client, relational_workbook
+):
+    session_id = _exported(client, relational_workbook)
+    vague, settled = "how many orders?", "how many orders are there in total?"
+
+    ambiguous = _AmbiguousClaude([{"sql": ORDERS_SQL, "explanation": "all"}], [settled])
+    asked = _ask(session_id, vague, ambiguous)
+    assert asked["outcome"] == "abstained" and asked["ambiguous"] is True
+
+    # Picking the offered reading answers it — and is not itself second-guessed.
+    answered = _ask(session_id, settled, ambiguous)
+    assert answered["ok"] is True
+    assert answered["clarifies"] == vague
+    assert ambiguous.ambiguity_checks == [vague]
+
+    _save(
+        session_id,
+        answered["resolved_question"],
+        answered["sql"],
+        also_asked_as=[answered["clarifies"]],
+    )
+
+    # The vague wording alone now lands on the verified SQL, with no question back.
+    again = _ask(session_id, vague, _AmbiguousClaude([], [settled]))
+    assert again["ok"] is True
+    assert again["source"] == "saved_example"
+
+
+def test_a_free_text_reply_to_a_clarification_is_not_asked_about_again(
+    client, relational_workbook
+):
+    session_id = _exported(client, relational_workbook)
+
+    class _Claude(_AmbiguousClaude):
+        rewrite_calls: list = []
+
+        def rewrite_question(self, question, conversation):
+            self.rewrite_calls.append({"question": question, "conversation": conversation})
+            return {"question": "how many orders are there in total?", "follow_up": True}
+
+    fake = _Claude(
+        [{"sql": ORDERS_SQL, "explanation": "all orders"}], ["by status", "by city"]
+    )
+    fake.rewrite_calls = []
+    first = _ask(session_id, "how many orders?", fake)
+    assert first["ambiguous"] is True
+
+    reply = _ask(session_id, "just the total", fake)
+
+    assert reply["ok"] is True
+    assert reply["resolved_question"] == "how many orders are there in total?"
+    assert reply["clarifies"] == "how many orders?"
+    assert fake.ambiguity_checks == ["how many orders?"]  # never asked a second time
+    assert fake.calls[0]["question"] == "how many orders are there in total?"
+    # The model was shown the clarification it had asked, to make sense of the reply.
+    shown = fake.rewrite_calls[0]["conversation"]
+    assert shown[-1]["outcome"] == "clarification requested"
+    assert shown[-1]["options_offered"] == ["by status", "by city"]
+
+
+def test_a_follow_up_is_made_whole_from_the_previous_answer(client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+    fake = _ConversationalClaude(
+        [
+            {"sql": ORDERS_SQL, "explanation": "counts orders"},
+            {
+                "sql": "SELECT status, COUNT(*) AS n FROM orders GROUP BY status",
+                "explanation": "orders per status",
+            },
+        ],
+        rewrites=[{"question": "how many orders are there by status?", "follow_up": True}],
+    )
+
+    first = _ask(session_id, "how many orders are there?", fake)
+    assert first["ok"] is True
+    assert fake.rewrite_calls == []  # nothing came before the first question
+
+    second = _ask(session_id, "and by status?", fake)
+
+    assert second["ok"] is True
+    assert second["follow_up"] is True
+    assert second["resolved_question"] == "how many orders are there by status?"
+    # The model is shown the previous question, what it computed and its SQL — no rows.
+    shown = fake.rewrite_calls[0]["conversation"]
+    assert shown == [
+        {
+            "question": "how many orders are there?",
+            "outcome": "answered",
+            "computed": "counts orders",
+            "sql": first["sql"],
+        }
+    ]
+    assert fake.calls[1]["question"] == "how many orders are there by status?"
+    assert fake.calls[1]["conversation"] == shown
+    # The follow-up reads the table its predecessor read.
+    assert "orders" in second["tables_used"]
+
+
+def test_a_question_that_stands_alone_is_not_treated_as_a_follow_up(client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+    fake = _ConversationalClaude(
+        [
+            {"sql": ORDERS_SQL, "explanation": "counts orders"},
+            {"sql": "SELECT city, COUNT(*) AS n FROM customers GROUP BY city", "explanation": "x"},
+        ],
+        rewrites=[{"question": "something else entirely", "follow_up": False}],
+    )
+    _ask(session_id, "how many orders are there?", fake)
+    second = _ask(session_id, "how many customers per city?", fake)
+
+    assert second["follow_up"] is False
+    # A rewrite the model did not call for never replaces what the user typed.
+    assert second["resolved_question"] == "how many customers per city?"
+    assert fake.calls[1]["question"] == "how many customers per city?"
+    assert fake.calls[1]["conversation"] is None
+
+
+def test_a_close_saved_example_skips_the_ambiguity_check(client, relational_workbook, monkeypatch):
+    from app.core.config import get_settings
+
+    session_id = _exported(client, relational_workbook)
+    _save(session_id, "how many orders are there?")
+    monkeypatch.setattr(get_settings(), "query_example_match_threshold", 0.0)
+
+    fake = _AmbiguousClaude([{"sql": ORDERS_SQL, "explanation": "counts orders"}], ["a", "b"])
+    result = _ask(session_id, "number of orders overall", fake)
+
+    assert result["ok"] is True
+    assert fake.ambiguity_checks == []
+    assert len(fake.calls) == 1
+
+
+def test_the_ambiguity_check_is_shown_the_columns_not_only_the_table_names(
+    client, relational_workbook
+):
+    session_id = _exported(client, relational_workbook)
+    seen: dict = {}
+
+    class _Spy(_ScriptedClaude):
+        def check_ambiguity(self, question, tables, business_rules=None):
+            seen["tables"] = tables
+            return {"ambiguous": False, "reason": "", "options": []}
+
+    _ask(session_id, "how many orders are there?", _Spy([{"sql": ORDERS_SQL, "explanation": "x"}]))
+
+    orders = next(t for t in seen["tables"] if t["name"] == "orders")
+    assert any(entry.startswith("total_amount") for entry in orders["columns"])
+
+
+def test_example_routes_carry_the_explanation_and_the_settled_wording(client, relational_workbook):
+    session_id = _exported(client, relational_workbook)
+
+    saved = client.post(
+        f"/api/sessions/{session_id}/examples",
+        json={
+            "question": "how many orders are there in total?",
+            "sql": ORDERS_SQL,
+            "explanation": "counts every order",
+            "also_asked_as": ["how many orders?"],
+        },
+    )
+    assert saved.status_code == 201, saved.text
+    assert saved.json()["explanation"] == "counts every order"
+
+    questions = {
+        e["question"] for e in client.get(f"/api/sessions/{session_id}/examples").json()["examples"]
+    }
+    assert questions == {"how many orders are there in total?", "how many orders?"}
+
+
+# -- pure helpers ----------------------------------------------------------
+
+
+def test_normalize_question_ignores_case_and_punctuation_but_not_numbers():
+    from app.query.retrieval import normalize_question
+
+    assert normalize_question("  How many Orders?! ") == normalize_question("how many orders")
+    assert normalize_question("top 5 customers") != normalize_question("top 10 customers")
+
+
+def test_rank_examples_reports_similarity_and_drops_the_embedding():
+    from app.query.retrieval import rank_examples
+
+    ranked = rank_examples(
+        [1.0, 0.0],
+        [
+            {"question": "far", "sql": "SELECT 1", "embedding": [0.0, 1.0]},
+            {"question": "near", "sql": "SELECT 2", "embedding": [1.0, 0.0]},
+        ],
+    )
+    assert [row["question"] for row in ranked] == ["near", "far"]
+    assert ranked[0]["similarity"] == pytest.approx(1.0)
+    assert "embedding" not in ranked[0]
+
+
+def test_select_columns_keeps_the_columns_an_example_uses_however_they_score():
+    rows = [
+        {"table_name": "t", "column_name": f"c{i}", "embedding": [0.0, 1.0]} for i in range(5)
+    ] + [{"table_name": "t", "column_name": "rare_metric", "embedding": [0.0, 1.0]}]
+
+    without = select_columns([1.0, 0.0], rows, ["t"], max_ranked=2)
+    with_it = select_columns(
+        [1.0, 0.0], rows, ["t"], max_ranked=2, include_columns={"rare_metric"}
+    )
+
+    assert "rare_metric" not in {r["column_name"] for r in without}
+    assert "rare_metric" in {r["column_name"] for r in with_it}
+
+
+def test_referenced_names_lists_tables_and_columns_but_not_ctes():
+    from app.query.guard import referenced_names
+
+    tables, columns = referenced_names(
+        "WITH big AS (SELECT order_id, total_amount FROM orders) "
+        "SELECT c.city, b.total_amount FROM customers c JOIN big b ON b.order_id = c.customer_id",
+        "postgresql",
+    )
+    assert tables == {"orders", "customers"}
+    assert {"city", "total_amount", "order_id"} <= columns
+    assert referenced_names("not sql at all (", "postgresql") == (set(), set())
+
+
+# ---------------------------------------------------------------------------
+# a column a rule names is a column the question needs
+# ---------------------------------------------------------------------------
+
+
+def _columns(*pairs):
+    """``sem_metadata`` rows: (exported name, the source's spelling)."""
+
+    return [
+        {"table_name": "t", "column_name": name, "source_column": source} for name, source in pairs
+    ]
+
+
+def test_a_rule_names_a_column_by_its_exported_or_its_original_spelling():
+    rows = _columns(
+        ("t_bil", "T-BIL"),
+        ("admission", "Admission"),
+        ("examination_date", "Examination Date"),
+        ("notes", "Notes"),
+    )
+
+    named = columns_named_in(
+        ["followed up at the outpatient clinic refers to Admission = '-'; T-BIL < 2.0"],
+        rows,
+        {"t"},
+    )
+    assert named == {"admission", "t_bil"}
+    assert columns_named_in(["`Examination Date` > '1997-01-01'"], rows, {"t"}) == {"examination_date"}
+    assert columns_named_in(["order by examination_date"], rows, {"t"}) == {"examination_date"}
+
+
+def test_a_name_may_be_written_run_together_or_apart():
+    rows = _columns(("fastestlapspeed", "fastestLapSpeed"))
+
+    assert columns_named_in(["refers to (MAX) fastestLapSpeed"], rows, {"t"}) == {"fastestlapspeed"}
+    assert columns_named_in(["the fastest lap speed is what counts"], rows, {"t"}) == {"fastestlapspeed"}
+
+
+def test_a_name_inside_a_longer_word_is_not_a_mention_of_it():
+    rows = _columns(("sex", "Sex"), ("date", "Date"))
+
+    assert columns_named_in(["sexual health and data quality"], rows, {"t"}) == set()
+    assert columns_named_in(["split by sex and date"], rows, {"t"}) == {"sex", "date"}
+
+
+def test_a_name_too_short_to_mean_anything_is_never_matched():
+    rows = _columns(("id", "ID"), ("no", "No"), ("age", "Age"))
+
+    assert columns_named_in(["the id is no good for the age"], rows, {"t"}) == {"age"}
+
+
+def test_only_the_columns_of_the_given_tables_are_named():
+    rows = [
+        {"table_name": "a", "column_name": "status", "source_column": "Status"},
+        {"table_name": "b", "column_name": "status", "source_column": "Status"},
+        {"table_name": "b", "column_name": "region", "source_column": "Region"},
+    ]
+
+    assert columns_named_in(["status and region"], rows, {"a"}) == {"status"}
+    assert columns_named_in([], rows, {"a", "b"}) == set()
+    assert columns_named_in(["status"], [], {"a"}) == set()
+
+
+def test_a_non_latin_name_is_matched_too():
+    rows = _columns(("prenom", "Prénom"), ("মূল্য", "মূল্য"))
+
+    assert columns_named_in(["le prénom est requis"], rows, {"t"}) == {"prenom"}
+
+
+def test_a_column_a_stored_rule_names_is_sent_to_the_model_however_it_scores(
+    client, relational_workbook, monkeypatch
+):
+    from app.api import services
+    from app.core.config import get_settings
+
+    session_id = _exported(client, relational_workbook)
+    monkeypatch.setattr(get_settings(), "query_max_ranked_columns", 0)  # keys, and what a rule names
+
+    def sent(fake):
+        return {column["name"] for table in fake.calls[0]["schema"] for column in table["columns"]}
+
+    plain = _ScriptedClaude([{"sql": ORDERS_SQL, "explanation": "counts orders"}])
+    _ask(session_id, "how many orders are there?", plain)
+    assert "total_amount" not in sent(plain), "ranked columns were capped at none"
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        services.add_business_rule(db, record, "revenue is the total_amount of the orders")
+        db.commit()
+    ruled = _ScriptedClaude([{"sql": ORDERS_SQL, "explanation": "counts orders"}])
+    _ask(session_id, "how many orders are there?", ruled)
+
+    assert "total_amount" in sent(ruled)
+    assert ruled.calls[0]["business_rules"] == ["revenue is the total_amount of the orders"]
+
+
+def test_a_rule_given_with_one_question_is_read_like_a_recorded_one_and_not_kept(
+    client, relational_workbook, monkeypatch
+):
+    from app.api import services
+    from app.core.config import get_settings
+
+    session_id = _exported(client, relational_workbook)
+    monkeypatch.setattr(get_settings(), "query_max_ranked_columns", 0)
+    fake = _ScriptedClaude([{"sql": ORDERS_SQL, "explanation": "counts orders"}])
+
+    with _db() as db:
+        record = db.get(IngestionSession, session_id)
+        services.answer_question(
+            db,
+            record,
+            "how many orders are there?",
+            claude=fake,
+            extra_rules=["the amount to use is total_amount"],
+        )
+        db.commit()
+
+    call = fake.calls[0]
+    assert call["business_rules"] == ["the amount to use is total_amount"]
+    assert "total_amount" in {c["name"] for t in call["schema"] for c in t["columns"]}
+    with _db() as db:
+        assert services.list_business_rules(db, session_id) == []

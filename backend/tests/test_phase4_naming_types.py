@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-from sqlalchemy import Integer, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Double, Integer, Numeric, String, Text
 
 from app.core.schemas import ColumnType
 from app.export.naming import (
@@ -25,6 +25,7 @@ from app.export.types import (
     CURRENCY_SCALE,
     INT32_MAX,
     coerce_series,
+    declared_family,
     default_sql_type,
     plan_type,
     render_type,
@@ -290,3 +291,196 @@ def test_records_carry_none_and_never_a_floating_point_nan():
     assert records[1]["b"] is None
     assert records[1]["d"] is None
     assert records[0]["a"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# a type the source declared
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "declared, family",
+    [
+        ("INTEGER", "integer"),
+        ("BIGINT", "integer"),
+        ("UNSIGNED BIG INT", "integer"),
+        ("TINYINT(1)", "integer"),
+        ("REAL", "float"),
+        ("DOUBLE PRECISION", "float"),
+        ("NUMERIC(10, 2)", "numeric"),
+        ("DECIMAL(5,0)", "numeric"),
+        ("VARCHAR(20)", "text"),
+        ("TEXT", "text"),
+        ("DATE", "date"),
+        ("DATETIME", "datetime"),
+        ("TIMESTAMP WITHOUT TIME ZONE", "datetime"),
+        ("INTERVAL", None),
+        ("NULL", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_a_declared_type_is_read_the_way_the_database_reads_it(declared, family):
+    assert declared_family(declared) == family
+
+
+def test_a_code_the_source_declared_as_a_number_stays_a_number():
+    """``height INTEGER`` has 3 distinct values here, so Phase 1 reads it as a
+    category code.  Storing it as VARCHAR makes ``height > 200`` compare text."""
+
+    heights = pd.Series([180, 200, 180, 200, 175, 180])
+
+    kept = plan_type(ColumnType.INTEGER_NOMINAL, heights, declared="INTEGER")
+
+    assert isinstance(kept.sql_type, Integer) and not isinstance(kept.sql_type, BigInteger)
+    assert kept.column_type is ColumnType.INTEGER_NOMINAL, "it is still *read* as a code"
+    assert kept.storage is ColumnType.INTEGER_ORDINAL, "but stored as the number it is"
+    assert kept.kept_source_type == "INTEGER"
+    assert not kept.widened, "keeping the source's type is not a widening"
+    assert coerce_series(heights, kept.storage).tolist() == [180, 200, 180, 200, 175, 180]
+
+
+def test_a_spreadsheet_column_has_no_declaration_and_is_typed_by_the_mapping():
+    heights = pd.Series([180, 200, 180, 200])
+
+    planned = plan_type(ColumnType.INTEGER_NOMINAL, heights)
+
+    assert isinstance(planned.sql_type, String)
+    assert planned.kept_source_type is None
+    assert planned.storage is ColumnType.INTEGER_NOMINAL
+
+
+def test_a_column_the_source_declared_as_text_stays_text():
+    zips = pd.Series(["02134", "02139", "02134"])
+
+    planned = plan_type(ColumnType.INTEGER_NOMINAL, zips, declared="TEXT")
+
+    assert isinstance(planned.sql_type, String)
+    assert planned.kept_source_type is None
+
+
+def test_a_numeric_declaration_does_not_survive_a_value_that_is_not_a_number():
+    """SQLite lets a stray ``'n/a'`` into an INTEGER column.  The declaration
+    cannot hold the column then, so the ordinary mapping applies."""
+
+    messy = pd.Series([1, 2, "n/a", 2, 1])
+
+    planned = plan_type(ColumnType.INTEGER_NOMINAL, messy, declared="INTEGER")
+
+    assert isinstance(planned.sql_type, String)
+    assert planned.kept_source_type is None
+
+
+def test_an_identifier_the_source_declared_as_an_integer_stays_an_integer():
+    ids = pd.Series([1, 2, 3, 4])
+
+    planned = plan_type(ColumnType.IDENTIFIER, ids, declared="INTEGER")
+
+    assert isinstance(planned.sql_type, Integer)
+
+
+def test_a_declared_integer_past_the_32_bit_limit_is_a_bigint():
+    planned = plan_type(
+        ColumnType.INTEGER_NOMINAL, pd.Series([INT32_MAX + 5, 7, 7]), declared="BIGINT"
+    )
+
+    assert isinstance(planned.sql_type, BigInteger)
+
+
+def test_a_declared_real_and_a_declared_numeric_keep_their_own_kind():
+    values = pd.Series([2.0, 3.0, 2.0])
+
+    assert isinstance(plan_type(ColumnType.INTEGER_NOMINAL, values, declared="REAL").sql_type, Double)
+    assert isinstance(
+        plan_type(ColumnType.INTEGER_NOMINAL, values, declared="NUMERIC(6,1)").sql_type, Numeric
+    )
+
+
+def test_a_declared_integer_holding_fractions_is_not_forced_to_an_integer():
+    planned = plan_type(ColumnType.INTEGER_NOMINAL, pd.Series([1.5, 1.5, 2.5]), declared="INTEGER")
+
+    assert isinstance(planned.sql_type, String)
+
+
+def test_a_declared_date_of_whole_days_stays_a_date():
+    days = pd.Series(["2015-11-29", "2016-03-20"])
+
+    planned = plan_type(ColumnType.DATE, days, declared="DATE")
+
+    assert isinstance(planned.sql_type, Date)
+    assert render_type(planned.sql_type) == "DATE"
+
+
+def test_a_declared_date_that_carries_a_time_keeps_it():
+    stamped = pd.Series(["2015-11-29 08:30:00", "2016-03-20 00:00:00"])
+
+    assert isinstance(plan_type(ColumnType.DATE, stamped, declared="DATE").sql_type, DateTime)
+
+
+def test_a_date_with_no_declaration_is_still_a_timestamp():
+    days = pd.Series(["2015-11-29", "2016-03-20"])
+
+    assert isinstance(plan_type(ColumnType.DATE, days).sql_type, DateTime)
+
+
+@pytest.mark.parametrize(
+    "column_type, values",
+    [
+        (ColumnType.DATE, ["2019-09-14", "2019-10-17"]),
+        (ColumnType.FLOAT, ["218.300", "91.610", "257.320"]),
+        (ColumnType.INTEGER_CONTINUOUS, ["1200", "40", "7"]),
+        (ColumnType.INTEGER_ORDINAL, ["1", "2", "3"]),
+        (ColumnType.CURRENCY, ["10.25", "3.5"]),
+        (ColumnType.BOOLEAN, ["true", "false", "true"]),
+    ],
+)
+def test_a_column_the_source_declared_as_text_is_not_stored_as_what_it_looks_like(
+    column_type, values
+):
+    """``'218.300'`` in a TEXT column sorts as text (``'91.610'`` is the largest),
+    and the question the source answers that way must be answered the same way
+    from the export.  Phase 1's reading of the contents is a description of the
+    column, not an instruction to rewrite it."""
+
+    series = pd.Series(values)
+
+    planned = plan_type(column_type, series, declared="TEXT")
+
+    assert isinstance(planned.sql_type, Text)
+    assert planned.column_type is column_type, "it is still *read* as a number, day or flag"
+    assert planned.storage is ColumnType.TEXT
+    assert planned.kept_source_type == "TEXT"
+    assert not planned.widened
+    assert coerce_series(series, planned.storage).tolist() == values, "byte for byte"
+
+
+@pytest.mark.parametrize("declared", ["VARCHAR(20)", "CHAR(3)", "TEXT", "character varying"])
+def test_every_spelling_of_a_text_declaration_keeps_the_column_text(declared):
+    planned = plan_type(ColumnType.DATE, pd.Series(["2019-09-14"]), declared=declared)
+
+    assert isinstance(planned.sql_type, Text)
+
+
+def test_a_text_column_with_nothing_in_it_is_still_a_text_column():
+    assert isinstance(plan_type(ColumnType.DATE, pd.Series([None, None]), declared="TEXT").sql_type, Text)
+    assert isinstance(plan_type(ColumnType.FLOAT, None, declared="TEXT").sql_type, Text)
+
+
+def test_a_spreadsheet_column_read_as_a_number_or_a_day_is_still_typed_by_the_mapping():
+    """No declaration, no override: a spreadsheet's only voice is the mapping."""
+
+    assert isinstance(plan_type(ColumnType.FLOAT, pd.Series(["1.5", "2.5"])).sql_type, Double)
+    assert isinstance(plan_type(ColumnType.DATE, pd.Series(["2019-09-14"])).sql_type, DateTime)
+    assert isinstance(plan_type(ColumnType.BOOLEAN, pd.Series(["true", "false"])).sql_type, Boolean)
+
+
+def test_the_declaration_only_replaces_the_reading_that_changes_what_is_stored():
+    """A currency or a float keeps the mapping — only code/identifier and date do
+    anything with a declaration."""
+
+    amounts = pd.Series([10.25, 3.5])
+
+    planned = plan_type(ColumnType.CURRENCY, amounts, declared="REAL")
+
+    assert render_type(planned.sql_type) == "NUMERIC(15, 2)"
+    assert planned.kept_source_type is None

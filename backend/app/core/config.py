@@ -76,10 +76,17 @@ class Settings(BaseSettings):
     #: "all of them" so a wide database cannot blow the prompt budget; a
     #: business dataset's table count rarely reaches it.
     query_max_tables: int = 8
-    #: Non-key columns kept by embedding similarity, at most — SemTabla's "top
-    #: 15 most relevant column metadata records".  Key columns are never
-    #: subject to this cap; see app.query.retrieval.
-    query_max_ranked_columns: int = 15
+    #: Non-key columns kept by relevance, at most (SemTabla uses 15).  Key
+    #: columns are never subject to this cap; see app.query.retrieval.  Set well
+    #: above 15 because wording is a poor guide to which column a *query* needs:
+    #: "writing score" has to find ``avgscrwrite`` among a hundred columns, and a
+    #: column left out of the prompt cannot be selected however good the model is.
+    #: The cap protects the prompt budget, not accuracy, so it sits above the size
+    #: of an ordinary business database: below it every column of the chosen tables
+    #: is sent, and ranking only decides what to drop from a table too wide to send.
+    #: (At forty, 5 of the 27 sampled questions on an 89-column schema lost a column
+    #: their query needed.)  An 89-column schema sent whole is about 4,500 tokens.
+    query_max_ranked_columns: int = 100
     #: generate → validate → EXPLAIN attempts before giving up and reporting
     #: the last error to the user instead of a fifth guess.
     query_max_attempts: int = 3
@@ -96,6 +103,26 @@ class Settings(BaseSettings):
     query_max_business_rules: int = 5
     #: Verified question/SQL examples retrieved into the SQL prompt, at most.
     query_max_examples: int = 3
+    #: Earlier turns of the same session shown to the model so a follow-up
+    #: ("and by month?") or the answer to a clarification is read in context.
+    query_conversation_turns: int = 4
+    #: A verified example this similar to the question means the user already
+    #: settled what it means, so the ambiguity check is skipped.  (The tables and
+    #: columns of every example shown are guaranteed a place in the schema the
+    #: model sees — see ``query_example_min_similarity``.)  Reusing its SQL
+    #: outright needs more than similarity — see ``app.api.services.answer_question``.
+    query_example_match_threshold: float = 0.9
+    #: An example less similar to the question than this is not shown to the model
+    #: at all.  Ranking only orders the examples; with a handful saved, "the three
+    #: nearest" are three questions about something else, and the model is told to
+    #: follow an example's pattern when the question resembles one.  Cosine of the
+    #: MiniLM question embeddings: unrelated questions about one database score
+    #: 0.1-0.5, the same pattern about another measure ("average height of female
+    #: heroes" / "average weight of male heroes") 0.8, a rewording of the same
+    #: question 0.85-0.95.  The scale belongs to the embedding model; this and
+    #: ``query_example_match_threshold`` are tuned together and move together if
+    #: the model is ever replaced.
+    query_example_min_similarity: float = 0.6
     #: Below this, a generated query is withheld rather than shown — an
     #: abstention, not an answer.  Same shape as the taxonomy classifier's own
     #: confidence floor (0.5): a written-down number a caller can reason about,

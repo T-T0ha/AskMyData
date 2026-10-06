@@ -238,6 +238,8 @@ function SheetCard({ sheet, onPreview, preview, onDecideKey, busy }) {
   const [open, setOpen] = useState(false)
   const meta = TRIAGE_META[sheet.triage] ?? TRIAGE_META.clean
   const sourceLabel = SOURCE_LABELS[sheet.source_kind] ?? sheet.source_kind
+  // The same data arrived twice; the copy is set aside, which is not a fault.
+  const isCopy = sheet.skipped && sheet.skip_reason?.startsWith('Identical copy of')
 
   return (
     <article className="panel p-4">
@@ -252,9 +254,15 @@ function SheetCard({ sheet, onPreview, preview, onDecideKey, busy }) {
           <Tag muted title="where this table came from">
             {sourceLabel}
           </Tag>
-          <StatusBadge status={meta.status} title={meta.blurb}>
-            {meta.label}
-          </StatusBadge>
+          {isCopy ? (
+            <StatusBadge status="neutral" title="Left out so the same data is not analysed twice">
+              Duplicate
+            </StatusBadge>
+          ) : (
+            <StatusBadge status={meta.status} title={meta.blurb}>
+              {meta.label}
+            </StatusBadge>
+          )}
         </div>
       </div>
 
@@ -263,8 +271,11 @@ function SheetCard({ sheet, onPreview, preview, onDecideKey, busy }) {
       </p>
 
       {sheet.skipped && (
-        <p className="mt-2 text-xs" style={{ color: 'var(--status-critical)' }}>
-          Skipped: {sheet.skip_reason}
+        <p
+          className="mt-2 text-xs"
+          style={{ color: isCopy ? 'var(--text-secondary)' : 'var(--status-critical)' }}
+        >
+          {isCopy ? sheet.skip_reason : `Skipped: ${sheet.skip_reason}`}
         </p>
       )}
 

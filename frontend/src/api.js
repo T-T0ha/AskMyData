@@ -180,8 +180,16 @@ export const api = {
     request(`/sessions/${id}/business-rules/${ruleId}`, { method: 'DELETE' }),
 
   examples: (id) => request(`/sessions/${id}/examples`),
-  saveExample: (id, question, sql) =>
-    request(`/sessions/${id}/examples`, { method: 'POST', body: JSON.stringify({ question, sql }) }),
+  saveExample: (id, { question, sql, explanation, alsoAskedAs }) =>
+    request(`/sessions/${id}/examples`, {
+      method: 'POST',
+      body: JSON.stringify({
+        question,
+        sql,
+        explanation: explanation || '',
+        also_asked_as: alsoAskedAs || [],
+      }),
+    }),
   deleteExample: (id, exampleId) =>
     request(`/sessions/${id}/examples/${exampleId}`, { method: 'DELETE' }),
 
@@ -207,8 +215,11 @@ export const api = {
 
   startCleaning: (id) => request(`/sessions/${id}/cleaning/start`, { method: 'POST' }),
   cleaningState: (id) => request(`/sessions/${id}/cleaning/state`),
-  submitPlan: (id, action, plan) =>
-    request(`/sessions/${id}/cleaning/plan`, { method: 'POST', body: JSON.stringify({ action, plan }) }),
+  submitPlan: (id, action, plan, autoApprove = false) =>
+    request(`/sessions/${id}/cleaning/plan`, {
+      method: 'POST',
+      body: JSON.stringify({ action, plan, auto_approve: autoApprove }),
+    }),
   submitStep: (id, action, params) =>
     request(`/sessions/${id}/cleaning/step`, { method: 'POST', body: JSON.stringify({ action, params }) }),
 }

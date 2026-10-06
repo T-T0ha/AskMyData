@@ -160,9 +160,11 @@ def _standardize_format(store: TableStore, step: CleaningStep, limit: int) -> St
     if fmt == "date":
         target = str(step.params.get("date_format", "%Y-%m-%d"))
         ranked = rank_date_formats(series.dropna())
-        parsed = series.map(lambda v: try_parse_date(v, ranked)[0] if pd.notna(v) else None)
+        # A plain list, not Series.map: pandas turns the None results of a map
+        # into NaT as soon as the rest are datetimes, and NaT has no strftime.
+        parsed = [try_parse_date(v, ranked)[0] if pd.notna(v) else None for v in series]
         result = pd.Series(
-            [v.strftime(target) if v is not None else np.nan for v in parsed],
+            [v.strftime(target) if v is not None and not pd.isna(v) else np.nan for v in parsed],
             index=series.index,
             name=series.name,
         )

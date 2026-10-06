@@ -1,14 +1,31 @@
 /** Phase 2 view — co-execution.
  *
- *  After every executed step the graph pauses here. The user sees exactly what
- *  changed — the affected rows before and after, side by side — and decides:
- *  approve, revert, or retry with different parameters. Nothing moves on
- *  without that decision.
+ *  When the user asked to check each step, the graph pauses here after every
+ *  one. The user sees what changed in plain words and the affected rows before
+ *  and after, side by side, and decides: continue, undo, or retry with different
+ *  settings — or approve everything that is left in one click.
  */
 
 import { useState } from 'react'
 import { STEP_FIELDS, STEP_TITLES, fromInput, toInput } from './PlanBoard'
 import { Button, DataTable, Panel, StatusBadge, Tag } from './ui'
+
+/** One sentence on what a step just did, from the counts it reported. */
+function plainOutcome(outcome) {
+  const removed = outcome.rows_removed ?? 0
+  const changed = outcome.cells_changed ?? 0
+  const columns = outcome.affected_columns ?? []
+  if (removed > 0) {
+    return `${removed.toLocaleString()} row${removed === 1 ? ' was' : 's were'} removed — the table went from ${(outcome.rows_before ?? 0).toLocaleString()} to ${(outcome.rows_after ?? 0).toLocaleString()} rows.`
+  }
+  if (changed > 0) {
+    return `${changed.toLocaleString()} value${changed === 1 ? ' was' : 's were'} rewritten${columns.length ? ` in ${columns.join(', ')}` : ''}. No rows were removed.`
+  }
+  if (columns.length) {
+    return `The table's structure changed (${columns.join(', ')}). No rows were removed and no values were rewritten.`
+  }
+  return 'Nothing in the table needed to change.'
+}
 
 function Delta({ label, value, tone }) {
   return (
@@ -35,7 +52,7 @@ function RetryForm({ step, onRetry, busy }) {
       className="mt-3 rounded-md border p-3"
       style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
     >
-      <p className="text-xs font-medium">Change the parameters and run this step again</p>
+      <p className="text-xs font-medium">Change this step's settings and run it again</p>
       <div className="mt-2 grid gap-2 sm:grid-cols-2">
         {fields.map((field) => (
           <label key={field.key} className="text-[11px]">
@@ -68,7 +85,7 @@ function RetryForm({ step, onRetry, busy }) {
       </div>
       <div className="mt-3">
         <Button variant="primary" disabled={busy} onClick={() => onRetry(params)}>
-          Undo and retry
+          Undo and run again
         </Button>
       </div>
     </div>
@@ -78,11 +95,12 @@ function RetryForm({ step, onRetry, busy }) {
 export function StepValidation({ pending, progress, onDecide, busy }) {
   const [retrying, setRetrying] = useState(false)
   const step = pending.step ?? {}
+  const remaining = Math.max(0, progress.total - pending.cursor - 1)
 
   if (pending.kind === 'step_failed') {
     return (
       <Panel
-        title={`Step ${pending.cursor + 1} could not run`}
+        title={`Step ${pending.cursor + 1} couldn't be applied`}
         subtitle={STEP_TITLES[step.type] ?? step.type}
         actions={
           <div className="flex gap-2">
@@ -99,13 +117,14 @@ export function StepValidation({ pending, progress, onDecide, busy }) {
           className="rounded-md border px-3 py-2 text-sm"
           style={{ borderColor: 'var(--status-critical)' }}
         >
-          <StatusBadge status="critical">error</StatusBadge>
+          <StatusBadge status="critical">problem</StatusBadge>
           <p className="mt-1" style={{ color: 'var(--text-secondary)' }}>
             {pending.error}
           </p>
         </div>
         <p className="mt-3 text-xs" style={{ color: 'var(--text-muted)' }}>
-          Your data was not changed. Fix the parameters and retry, or skip the step and continue.
+          Your data was not changed by this step. You can skip it and carry on with the rest, stop
+          here, or change its settings and try again.
         </p>
         <RetryForm step={step} busy={busy} onRetry={(params) => onDecide('retry', params)} />
       </Panel>
@@ -117,18 +136,23 @@ export function StepValidation({ pending, progress, onDecide, busy }) {
 
   return (
     <Panel
-      title={`Step ${pending.cursor + 1} of ${progress.total} — check the result`}
-      subtitle={outcome.summary}
+      title={`Step ${pending.cursor + 1} of ${progress.total}: ${STEP_TITLES[step.type] ?? step.type}`}
+      subtitle="This step has been applied. Check the result, then continue."
       actions={
-        <div className="flex gap-2">
+        <div className="flex flex-wrap justify-end gap-2">
           <Button disabled={busy} onClick={() => setRetrying((value) => !value)}>
-            Retry with changes
+            Change settings
           </Button>
           <Button disabled={busy} onClick={() => onDecide('revert')}>
-            Revert
+            Undo this step
           </Button>
+          {remaining > 0 && (
+            <Button disabled={busy} onClick={() => onDecide('approve_all')}>
+              Approve this and the other {remaining}
+            </Button>
+          )}
           <Button variant="primary" disabled={busy} onClick={() => onDecide('approve')}>
-            Approve
+            Looks good — continue
           </Button>
         </div>
       }
@@ -142,8 +166,9 @@ export function StepValidation({ pending, progress, onDecide, busy }) {
         ))}
       </div>
 
-      <p className="mt-2 text-xs" style={{ color: 'var(--text-secondary)' }}>
-        {step.description}
+      <p className="mt-2 text-sm">{plainOutcome(outcome)}</p>
+      <p className="mt-1 text-xs" style={{ color: 'var(--text-secondary)' }}>
+        Why: {step.description}
       </p>
 
       <div className="mt-3 grid grid-cols-2 gap-4 sm:grid-cols-4">
@@ -154,7 +179,7 @@ export function StepValidation({ pending, progress, onDecide, busy }) {
           value={rowsRemoved.toLocaleString()}
           tone={rowsRemoved > 0 ? 'warn' : undefined}
         />
-        <Delta label="Cells changed" value={(outcome.cells_changed ?? 0).toLocaleString()} />
+        <Delta label="Values rewritten" value={(outcome.cells_changed ?? 0).toLocaleString()} />
       </div>
 
       {outcome.notes?.length > 0 && (
@@ -171,7 +196,7 @@ export function StepValidation({ pending, progress, onDecide, busy }) {
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
         <div>
           <p className="mb-1 text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>
-            Before — affected rows
+            Before — the rows this touched
           </p>
           <div className="rounded border" style={{ borderColor: 'var(--border)' }}>
             <DataTable
@@ -236,14 +261,30 @@ export function CleaningProgress({ plan, cursor }) {
   )
 }
 
+const SUMMARY_WORDS = { approved: 'done', skipped: 'skipped', reverted: 'undone' }
+
 export function CleaningSummary({ state, onRestart }) {
   const history = (state.history ?? []).filter((entry) => entry.action !== 'finalized')
+  const done = history.filter((entry) => entry.action === 'approved').length
+  const title =
+    state.status === 'cancelled'
+      ? 'Cleaning skipped'
+      : state.status === 'aborted'
+        ? 'Cleaning stopped'
+        : 'Cleaning finished'
+  const subtitle =
+    state.status === 'cancelled'
+      ? 'No changes were made to your tables.'
+      : `${done} change${done === 1 ? ' was' : 's were'} applied to a working copy of your data. Your uploaded file is untouched.`
   return (
     <Panel
-      title="Cleaning complete"
-      subtitle={`Session ${state.status}. Every change below was approved by you.`}
-      actions={<Button onClick={onRestart}>Start a new cleaning run</Button>}
+      title={title}
+      subtitle={subtitle}
+      actions={<Button onClick={onRestart}>Check again for problems</Button>}
     >
+      <p className="mb-2 text-xs font-medium" style={{ color: 'var(--text-muted)' }}>
+        What was done
+      </p>
       <ol className="space-y-1.5 text-xs">
         {history.map((entry, index) => (
           <li key={index} className="flex items-start gap-2">
@@ -252,19 +293,19 @@ export function CleaningSummary({ state, onRestart }) {
                 entry.action === 'approved' ? 'good' : entry.action === 'skipped' ? 'neutral' : 'serious'
               }
             >
-              {entry.action}
+              {SUMMARY_WORDS[entry.action] ?? entry.action}
             </StatusBadge>
             <span style={{ color: 'var(--text-secondary)' }}>{entry.summary ?? `step ${entry.cursor + 1}`}</span>
           </li>
         ))}
         {history.length === 0 && (
-          <li style={{ color: 'var(--text-muted)' }}>No steps were executed.</li>
+          <li style={{ color: 'var(--text-muted)' }}>No changes were needed or made.</li>
         )}
       </ol>
 
       <div className="mt-4">
         <p className="mb-1 text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>
-          Resulting tables
+          Your tables now
         </p>
         <DataTable
           columns={['name', 'row_count', 'column_count']}
