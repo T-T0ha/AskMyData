@@ -157,7 +157,7 @@ def triage_sheet(
     # broken, but not usable as a relational table until a human decides.
     # Nothing is raised for a table whose key is obvious — a green sheet stays
     # green, and the key it does have is shown on the triage card regardless.
-    issues.extend(_key_issues(keys))
+    issues.extend(key_issues(keys))
 
     mixed = [r.column for r in reports if r.mixed_type_ratio > MIXED_TYPE_RATIO and not r.retyped_to]
     if mixed:
@@ -230,7 +230,7 @@ def triage_sheet(
     return classify_issues(issues), issues
 
 
-def _key_issues(keys: KeyAnalysis | None) -> list[SheetIssue]:
+def key_issues(keys: KeyAnalysis | None) -> list[SheetIssue]:
     """Everything the user has to decide about this table's identity."""
 
     if keys is None:

@@ -1,0 +1,477 @@
+{
+  "primary_metric": "relaxed",
+  "max_extra_columns_override": null,
+  "records": 1716,
+  "arms": {
+    "raw": {
+      "n": 858,
+      "primary_metric": "relaxed",
+      "accuracy": 0.4277,
+      "accuracy_ci95": [
+        0.395,
+        0.4611
+      ],
+      "correct": 367,
+      "by_metric": {
+        "strict": 0.3986,
+        "normalized": 0.3998,
+        "relaxed": 0.4277
+      },
+      "rescued_by_value_normalisation": 1,
+      "rescued_by_extra_columns": 24,
+      "answered_rate": 0.9988,
+      "no_sql_rate": 0.0012,
+      "valid_sql_rate": 0.9988,
+      "accuracy_when_answered": 0.4282,
+      "first_attempt_valid_rate": 0.9534,
+      "avg_attempts": 1.05,
+      "latency_seconds": {
+        "avg": 1.61,
+        "median": 1.36,
+        "p90": 1.97
+      },
+      "tokens": {
+        "calls_total": 904,
+        "prompt_tokens_total": 1029259,
+        "completion_tokens_total": 87950,
+        "reasoning_tokens_total": 0,
+        "cached_tokens_total": 0,
+        "total_tokens_total": 1117209,
+        "calls_avg": 1.1,
+        "prompt_tokens_avg": 1199.6,
+        "completion_tokens_avg": 102.5,
+        "reasoning_tokens_avg": 0.0,
+        "cached_tokens_avg": 0.0,
+        "total_tokens_avg": 1302.1,
+        "cost_usd_total": 0.528642,
+        "cost_usd_avg": 0.000616
+      },
+      "tokens_per_correct": 3044.2,
+      "cost_usd_per_correct": 0.00144,
+      "finish_reasons": {
+        "stop": 901,
+        "error": 3
+      },
+      "by_difficulty": {
+        "challenging": {
+          "n": 102,
+          "strict": 0.2451,
+          "normalized": 0.2451,
+          "relaxed": 0.2549
+        },
+        "moderate": {
+          "n": 277,
+          "strict": 0.2996,
+          "normalized": 0.3032,
+          "relaxed": 0.3213
+        },
+        "simple": {
+          "n": 479,
+          "strict": 0.4885,
+          "normalized": 0.4885,
+          "relaxed": 0.5261
+        }
+      },
+      "by_database": {
+        "california_schools": {
+          "n": 89,
+          "strict": 0.4157,
+          "normalized": 0.4157,
+          "relaxed": 0.5169
+        },
+        "formula_1": {
+          "n": 174,
+          "strict": 0.454,
+          "normalized": 0.4598,
+          "relaxed": 0.5057
+        },
+        "student_club": {
+          "n": 158,
+          "strict": 0.5633,
+          "normalized": 0.5633,
+          "relaxed": 0.5823
+        },
+        "superhero": {
+          "n": 129,
+          "strict": 0.7674,
+          "normalized": 0.7674,
+          "relaxed": 0.7752
+        },
+        "thrombosis_prediction": {
+          "n": 163,
+          "strict": 0.1227,
+          "normalized": 0.1227,
+          "relaxed": 0.135
+        },
+        "toxicology": {
+          "n": 145,
+          "strict": 0.1241,
+          "normalized": 0.1241,
+          "relaxed": 0.131
+        }
+      }
+    },
+    "semantic": {
+      "n": 858,
+      "primary_metric": "relaxed",
+      "accuracy": 0.5886,
+      "accuracy_ci95": [
+        0.5553,
+        0.621
+      ],
+      "correct": 505,
+      "by_metric": {
+        "strict": 0.5629,
+        "normalized": 0.5664,
+        "relaxed": 0.5886
+      },
+      "rescued_by_value_normalisation": 3,
+      "rescued_by_extra_columns": 19,
+      "answered_rate": 0.9953,
+      "no_sql_rate": 0.0,
+      "valid_sql_rate": 0.9953,
+      "accuracy_when_answered": 0.5913,
+      "first_attempt_valid_rate": 0.9883,
+      "avg_attempts": 1.005,
+      "latency_seconds": {
+        "avg": 1.64,
+        "median": 1.5,
+        "p90": 1.78
+      },
+      "tokens": {
+        "calls_total": 865,
+        "prompt_tokens_total": 3285702,
+        "completion_tokens_total": 85707,
+        "reasoning_tokens_total": 0,
+        "cached_tokens_total": 0,
+        "total_tokens_total": 3371409,
+        "calls_avg": 1.0,
+        "prompt_tokens_avg": 3829.5,
+        "completion_tokens_avg": 99.9,
+        "reasoning_tokens_avg": 0.0,
+        "cached_tokens_avg": 0.0,
+        "total_tokens_avg": 3929.4,
+        "cost_usd_total": 1.199973,
+        "cost_usd_avg": 0.001399
+      },
+      "tokens_per_correct": 6676.1,
+      "cost_usd_per_correct": 0.002376,
+      "finish_reasons": {
+        "stop": 862,
+        "error": 3
+      },
+      "by_difficulty": {
+        "challenging": {
+          "n": 102,
+          "strict": 0.4412,
+          "normalized": 0.4412,
+          "relaxed": 0.4608
+        },
+        "moderate": {
+          "n": 277,
+          "strict": 0.4765,
+          "normalized": 0.4838,
+          "relaxed": 0.5018
+        },
+        "simple": {
+          "n": 479,
+          "strict": 0.6388,
+          "normalized": 0.6409,
+          "relaxed": 0.666
+        }
+      },
+      "by_database": {
+        "california_schools": {
+          "n": 89,
+          "strict": 0.4831,
+          "normalized": 0.4831,
+          "relaxed": 0.5056
+        },
+        "formula_1": {
+          "n": 174,
+          "strict": 0.5172,
+          "normalized": 0.523,
+          "relaxed": 0.5747
+        },
+        "student_club": {
+          "n": 158,
+          "strict": 0.7342,
+          "normalized": 0.7342,
+          "relaxed": 0.7468
+        },
+        "superhero": {
+          "n": 129,
+          "strict": 0.8295,
+          "normalized": 0.8295,
+          "relaxed": 0.8295
+        },
+        "thrombosis_prediction": {
+          "n": 163,
+          "strict": 0.227,
+          "normalized": 0.227,
+          "relaxed": 0.2454
+        },
+        "toxicology": {
+          "n": 145,
+          "strict": 0.6207,
+          "normalized": 0.6345,
+          "relaxed": 0.6552
+        }
+      },
+      "pipeline": {
+        "table_recall_avg": 1.0,
+        "column_recall_avg": 0.9974,
+        "context_tables_avg": 7.15,
+        "context_columns_avg": 55.7,
+        "questions_reading_a_changed_column": 0,
+        "gold_on_export": {
+          "same": 771,
+          "not_runnable": 87
+        },
+        "answered_from_saved_example": 1,
+        "questions_shown_examples": 534,
+        "examples_saved": 504,
+        "accuracy_by_examples_in_store": {
+          "0": {
+            "n": 10,
+            "accuracy": 0.6
+          },
+          "1-5": {
+            "n": 62,
+            "accuracy": 0.4839
+          },
+          "6-20": {
+            "n": 211,
+            "accuracy": 0.4265
+          },
+          "21+": {
+            "n": 575,
+            "accuracy": 0.6591
+          }
+        },
+        "selective_accuracy": [
+          {
+            "min_confidence": 0.3,
+            "coverage": 0.9953,
+            "accuracy_of_kept": 0.5913
+          },
+          {
+            "min_confidence": 0.45,
+            "coverage": 0.9942,
+            "accuracy_of_kept": 0.592
+          },
+          {
+            "min_confidence": 0.6,
+            "coverage": 0.9907,
+            "accuracy_of_kept": 0.5929
+          },
+          {
+            "min_confidence": 0.75,
+            "coverage": 0.9662,
+            "accuracy_of_kept": 0.6055
+          },
+          {
+            "min_confidence": 0.9,
+            "coverage": 0.8112,
+            "accuracy_of_kept": 0.6882
+          }
+        ],
+        "withheld_by_product_gate": 1
+      }
+    }
+  },
+  "paired": {
+    "n_paired": 858,
+    "by_metric": {
+      "strict": {
+        "n": 858,
+        "both_correct": 313,
+        "semantic_only": 170,
+        "raw_only": 29,
+        "neither": 346,
+        "mcnemar_p": 0.0,
+        "semantic_minus_raw": 0.1643
+      },
+      "normalized": {
+        "n": 858,
+        "both_correct": 315,
+        "semantic_only": 171,
+        "raw_only": 28,
+        "neither": 344,
+        "mcnemar_p": 0.0,
+        "semantic_minus_raw": 0.1667
+      },
+      "relaxed": {
+        "n": 858,
+        "both_correct": 336,
+        "semantic_only": 169,
+        "raw_only": 31,
+        "neither": 322,
+        "mcnemar_p": 0.0,
+        "semantic_minus_raw": 0.1608
+      }
+    },
+    "by_data_drift": {
+      "gold_reads_no_changed_column": {
+        "n": 858,
+        "both_correct": 336,
+        "semantic_only": 169,
+        "raw_only": 31,
+        "neither": 322,
+        "mcnemar_p": 0.0,
+        "semantic_minus_raw": 0.1608
+      },
+      "gold_reads_a_changed_column": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      },
+      "gold_reads_a_values_column": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      },
+      "gold_reads_a_retyped_column": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      },
+      "gold_reads_a_reformatted_column": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      }
+    },
+    "by_gold_on_export": {
+      "answer_preserved": {
+        "n": 771,
+        "both_correct": 313,
+        "semantic_only": 159,
+        "raw_only": 26,
+        "neither": 273,
+        "mcnemar_p": 0.0,
+        "semantic_minus_raw": 0.1725
+      },
+      "answer_changed": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      },
+      "not_runnable_unchanged": {
+        "n": 87,
+        "both_correct": 23,
+        "semantic_only": 10,
+        "raw_only": 5,
+        "neither": 49,
+        "mcnemar_p": 0.3017,
+        "semantic_minus_raw": 0.0575
+      }
+    },
+    "by_difficulty": {
+      "challenging": {
+        "n": 102,
+        "both_correct": 24,
+        "semantic_only": 23,
+        "raw_only": 2,
+        "neither": 53,
+        "mcnemar_p": 6.3e-05,
+        "semantic_minus_raw": 0.2059
+      },
+      "moderate": {
+        "n": 277,
+        "both_correct": 82,
+        "semantic_only": 57,
+        "raw_only": 7,
+        "neither": 131,
+        "mcnemar_p": 0.0,
+        "semantic_minus_raw": 0.1805
+      },
+      "simple": {
+        "n": 479,
+        "both_correct": 230,
+        "semantic_only": 89,
+        "raw_only": 22,
+        "neither": 138,
+        "mcnemar_p": 0.0,
+        "semantic_minus_raw": 0.1399
+      }
+    },
+    "by_database": {
+      "california_schools": {
+        "n": 89,
+        "both_correct": 35,
+        "semantic_only": 10,
+        "raw_only": 11,
+        "neither": 33,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -0.0112
+      },
+      "formula_1": {
+        "n": 174,
+        "both_correct": 81,
+        "semantic_only": 19,
+        "raw_only": 7,
+        "neither": 67,
+        "mcnemar_p": 0.030984,
+        "semantic_minus_raw": 0.069
+      },
+      "student_club": {
+        "n": 158,
+        "both_correct": 88,
+        "semantic_only": 30,
+        "raw_only": 4,
+        "neither": 36,
+        "mcnemar_p": 1.8e-05,
+        "semantic_minus_raw": 0.1646
+      },
+      "superhero": {
+        "n": 129,
+        "both_correct": 96,
+        "semantic_only": 11,
+        "raw_only": 4,
+        "neither": 18,
+        "mcnemar_p": 0.121335,
+        "semantic_minus_raw": 0.0543
+      },
+      "thrombosis_prediction": {
+        "n": 163,
+        "both_correct": 19,
+        "semantic_only": 21,
+        "raw_only": 3,
+        "neither": 120,
+        "mcnemar_p": 0.00052,
+        "semantic_minus_raw": 0.1104
+      },
+      "toxicology": {
+        "n": 145,
+        "both_correct": 17,
+        "semantic_only": 78,
+        "raw_only": 2,
+        "neither": 48,
+        "mcnemar_p": 0.0,
+        "semantic_minus_raw": 0.5241
+      }
+    }
+  },
+  "run_name": "bird858_noevidence"
+}

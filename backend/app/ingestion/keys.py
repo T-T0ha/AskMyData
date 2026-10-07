@@ -101,7 +101,7 @@ class KeyAnalysis:
     """
 
     primary_key: list[str] = field(default_factory=list)
-    source: str = "none"  # declared | detected | confirmed | none
+    source: str = "none"  # declared | detected | confirmed | synthetic | none
     candidates: list[KeyCandidate] = field(default_factory=list)
     duplicate_rows: int = 0
     row_count: int = 0
@@ -483,4 +483,30 @@ def confirm_key(analysis: KeyAnalysis, columns: Sequence[str]) -> KeyAnalysis:
                 evidence="chosen by the user and verified unique over every row",
             ),
         )
+    return analysis
+
+
+def adopt_synthetic_key(analysis: KeyAnalysis, column: str) -> KeyAnalysis:
+    """Record that the cleaning plan added ``column`` as a numbered row id.
+
+    ``candidates`` and ``confirmed`` are left as they were, so that
+    :func:`withdraw_synthetic_key` can put the table back to the question it
+    was asking before the counter existed.
+    """
+
+    analysis.primary_key = [str(column)]
+    analysis.source = "synthetic"
+    analysis.needs_confirmation = False
+    analysis.needs_synthetic_key = False
+    return analysis
+
+
+def withdraw_synthetic_key(analysis: KeyAnalysis) -> KeyAnalysis:
+    """The added row id is gone from the table, and so is the key it was."""
+
+    asking = bool(analysis.candidates) and not analysis.confirmed
+    analysis.primary_key = []
+    analysis.source = "none"
+    analysis.needs_confirmation = asking
+    analysis.needs_synthetic_key = not asking
     return analysis

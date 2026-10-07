@@ -1,0 +1,433 @@
+{
+  "primary_metric": "relaxed",
+  "max_extra_columns_override": null,
+  "records": 21,
+  "arms": {
+    "raw": {
+      "n": 12,
+      "primary_metric": "relaxed",
+      "accuracy": 0.6667,
+      "accuracy_ci95": [
+        0.3906,
+        0.8619
+      ],
+      "correct": 8,
+      "by_metric": {
+        "strict": 0.5833,
+        "normalized": 0.5833,
+        "relaxed": 0.6667
+      },
+      "rescued_by_value_normalisation": 0,
+      "rescued_by_extra_columns": 1,
+      "answered_rate": 1.0,
+      "no_sql_rate": 0.0,
+      "valid_sql_rate": 1.0,
+      "accuracy_when_answered": 0.6667,
+      "first_attempt_valid_rate": 1.0,
+      "avg_attempts": 1.0,
+      "latency_seconds": {
+        "avg": 5.31,
+        "median": 4.46,
+        "p90": 8.34
+      },
+      "tokens": {
+        "calls_total": 12,
+        "prompt_tokens_total": 13130,
+        "completion_tokens_total": 10296,
+        "reasoning_tokens_total": 9040,
+        "cached_tokens_total": 0,
+        "total_tokens_total": 23426,
+        "calls_avg": 1.0,
+        "prompt_tokens_avg": 1094.2,
+        "completion_tokens_avg": 858.0,
+        "reasoning_tokens_avg": 753.3,
+        "cached_tokens_avg": 0.0,
+        "total_tokens_avg": 1952.2,
+        "cost_usd_total": 0.029679,
+        "cost_usd_avg": 0.002473
+      },
+      "tokens_per_correct": 2928.2,
+      "cost_usd_per_correct": 0.00371,
+      "finish_reasons": {
+        "stop": 12
+      },
+      "by_difficulty": {
+        "challenging": {
+          "n": 4,
+          "strict": 0.75,
+          "normalized": 0.75,
+          "relaxed": 1.0
+        },
+        "moderate": {
+          "n": 4,
+          "strict": 0.75,
+          "normalized": 0.75,
+          "relaxed": 0.75
+        },
+        "simple": {
+          "n": 4,
+          "strict": 0.25,
+          "normalized": 0.25,
+          "relaxed": 0.25
+        }
+      },
+      "by_database": {
+        "formula_1": {
+          "n": 3,
+          "strict": 0.6667,
+          "normalized": 0.6667,
+          "relaxed": 0.6667
+        },
+        "student_club": {
+          "n": 2,
+          "strict": 1.0,
+          "normalized": 1.0,
+          "relaxed": 1.0
+        },
+        "superhero": {
+          "n": 2,
+          "strict": 0.0,
+          "normalized": 0.0,
+          "relaxed": 0.5
+        },
+        "thrombosis_prediction": {
+          "n": 2,
+          "strict": 0.5,
+          "normalized": 0.5,
+          "relaxed": 0.5
+        },
+        "toxicology": {
+          "n": 3,
+          "strict": 0.6667,
+          "normalized": 0.6667,
+          "relaxed": 0.6667
+        }
+      }
+    },
+    "semantic": {
+      "n": 9,
+      "primary_metric": "relaxed",
+      "accuracy": 0.3333,
+      "accuracy_ci95": [
+        0.1206,
+        0.6458
+      ],
+      "correct": 3,
+      "by_metric": {
+        "strict": 0.3333,
+        "normalized": 0.3333,
+        "relaxed": 0.3333
+      },
+      "rescued_by_value_normalisation": 0,
+      "rescued_by_extra_columns": 0,
+      "answered_rate": 0.8889,
+      "no_sql_rate": 0.0,
+      "valid_sql_rate": 0.8889,
+      "accuracy_when_answered": 0.375,
+      "first_attempt_valid_rate": 0.8889,
+      "avg_attempts": 1.0,
+      "latency_seconds": {
+        "avg": 6.93,
+        "median": 3.98,
+        "p90": 6.47
+      },
+      "tokens": {
+        "calls_total": 9,
+        "prompt_tokens_total": 28443,
+        "completion_tokens_total": 6042,
+        "reasoning_tokens_total": 5294,
+        "cached_tokens_total": 0,
+        "total_tokens_total": 34485,
+        "calls_avg": 1.0,
+        "prompt_tokens_avg": 3160.3,
+        "completion_tokens_avg": 671.3,
+        "reasoning_tokens_avg": 588.2,
+        "cached_tokens_avg": 0.0,
+        "total_tokens_avg": 3831.7,
+        "cost_usd_total": 0.023637,
+        "cost_usd_avg": 0.002626
+      },
+      "tokens_per_correct": 11495.0,
+      "cost_usd_per_correct": 0.007879,
+      "finish_reasons": {
+        "stop": 8,
+        "error": 1
+      },
+      "by_difficulty": {
+        "challenging": {
+          "n": 3,
+          "strict": 0.6667,
+          "normalized": 0.6667,
+          "relaxed": 0.6667
+        },
+        "moderate": {
+          "n": 3,
+          "strict": 0.3333,
+          "normalized": 0.3333,
+          "relaxed": 0.3333
+        },
+        "simple": {
+          "n": 3,
+          "strict": 0.0,
+          "normalized": 0.0,
+          "relaxed": 0.0
+        }
+      },
+      "by_database": {
+        "formula_1": {
+          "n": 3,
+          "strict": 0.3333,
+          "normalized": 0.3333,
+          "relaxed": 0.3333
+        },
+        "student_club": {
+          "n": 2,
+          "strict": 0.5,
+          "normalized": 0.5,
+          "relaxed": 0.5
+        },
+        "superhero": {
+          "n": 2,
+          "strict": 0.5,
+          "normalized": 0.5,
+          "relaxed": 0.5
+        },
+        "thrombosis_prediction": {
+          "n": 2,
+          "strict": 0.0,
+          "normalized": 0.0,
+          "relaxed": 0.0
+        }
+      },
+      "pipeline": {
+        "table_recall_avg": 1.0,
+        "column_recall_avg": 0.9563,
+        "context_tables_avg": 9.0,
+        "context_columns_avg": 51.3,
+        "questions_reading_a_changed_column": 2,
+        "gold_on_export": {
+          "different": 2,
+          "same": 6,
+          "not_runnable": 1
+        },
+        "answered_from_saved_example": 0,
+        "questions_shown_examples": 3,
+        "examples_saved": 3,
+        "accuracy_by_examples_in_store": {
+          "0": {
+            "n": 6,
+            "accuracy": 0.5
+          },
+          "1-5": {
+            "n": 3,
+            "accuracy": 0.0
+          }
+        },
+        "selective_accuracy": [
+          {
+            "min_confidence": 0.3,
+            "coverage": 0.8889,
+            "accuracy_of_kept": 0.375
+          },
+          {
+            "min_confidence": 0.45,
+            "coverage": 0.8889,
+            "accuracy_of_kept": 0.375
+          },
+          {
+            "min_confidence": 0.6,
+            "coverage": 0.8889,
+            "accuracy_of_kept": 0.375
+          },
+          {
+            "min_confidence": 0.75,
+            "coverage": 0.8889,
+            "accuracy_of_kept": 0.375
+          },
+          {
+            "min_confidence": 0.9,
+            "coverage": 0.7778,
+            "accuracy_of_kept": 0.4286
+          }
+        ],
+        "withheld_by_product_gate": 0
+      }
+    }
+  },
+  "paired": {
+    "n_paired": 9,
+    "by_metric": {
+      "strict": {
+        "n": 9,
+        "both_correct": 2,
+        "semantic_only": 1,
+        "raw_only": 3,
+        "neither": 3,
+        "mcnemar_p": 0.617075,
+        "semantic_minus_raw": -0.2222
+      },
+      "normalized": {
+        "n": 9,
+        "both_correct": 2,
+        "semantic_only": 1,
+        "raw_only": 3,
+        "neither": 3,
+        "mcnemar_p": 0.617075,
+        "semantic_minus_raw": -0.2222
+      },
+      "relaxed": {
+        "n": 9,
+        "both_correct": 3,
+        "semantic_only": 0,
+        "raw_only": 3,
+        "neither": 3,
+        "mcnemar_p": 0.248213,
+        "semantic_minus_raw": -0.3333
+      }
+    },
+    "by_data_drift": {
+      "gold_reads_no_changed_column": {
+        "n": 7,
+        "both_correct": 3,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 3,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -0.1429
+      },
+      "gold_reads_a_changed_column": {
+        "n": 2,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 2,
+        "neither": 0,
+        "mcnemar_p": 0.4795,
+        "semantic_minus_raw": -1.0
+      },
+      "gold_reads_a_values_column": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      },
+      "gold_reads_a_retyped_column": {
+        "n": 1,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -1.0
+      },
+      "gold_reads_a_reformatted_column": {
+        "n": 1,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -1.0
+      }
+    },
+    "by_gold_on_export": {
+      "answer_preserved": {
+        "n": 6,
+        "both_correct": 3,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 3,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": 0.0
+      },
+      "answer_changed": {
+        "n": 2,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 2,
+        "neither": 0,
+        "mcnemar_p": 0.4795,
+        "semantic_minus_raw": -1.0
+      },
+      "not_runnable_unchanged": {
+        "n": 1,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -1.0
+      }
+    },
+    "by_difficulty": {
+      "challenging": {
+        "n": 3,
+        "both_correct": 2,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -0.3333
+      },
+      "moderate": {
+        "n": 3,
+        "both_correct": 1,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 1,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -0.3333
+      },
+      "simple": {
+        "n": 3,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 2,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -0.3333
+      }
+    },
+    "by_database": {
+      "formula_1": {
+        "n": 3,
+        "both_correct": 1,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 1,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -0.3333
+      },
+      "student_club": {
+        "n": 2,
+        "both_correct": 1,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -0.5
+      },
+      "superhero": {
+        "n": 2,
+        "both_correct": 1,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 1,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": 0.0
+      },
+      "thrombosis_prediction": {
+        "n": 2,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 1,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -0.5
+      }
+    }
+  },
+  "run_name": "smoke12"
+}

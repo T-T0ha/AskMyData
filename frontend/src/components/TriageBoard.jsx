@@ -144,6 +144,7 @@ const KEY_SOURCE_LABELS = {
   declared: 'declared by the source database',
   detected: 'detected during ingestion',
   confirmed: 'confirmed by you',
+  synthetic: 'a numbered row_id added by the cleaning plan',
 }
 
 /** What identifies a row — and, when nothing obvious does, the question.

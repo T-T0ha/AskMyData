@@ -1,0 +1,98 @@
+[
+  {
+    "question_id": 1344,
+    "db_id": "student_club",
+    "difficulty": "simple",
+    "question": "What was the notes of the fundraising on 2019/9/14?",
+    "evidence": "fundraising on 2019/9/14 refers to source = 'Fundraising' where date_received = '2019-09-14'",
+    "gold_sql": "SELECT notes FROM income WHERE source = 'Fundraising' AND date_received = '2019-09-14'"
+  },
+  {
+    "question_id": 829,
+    "db_id": "superhero",
+    "difficulty": "challenging",
+    "question": "Which publisher created more superheroes: DC or Marvel Comics? Find the difference in the number of superheroes.",
+    "evidence": "DC refers to publisher_name = 'DC Comics'; Marvel Comics refers to publisher_name = 'Marvel Comics'; difference = SUBTRACT(SUM(publisher_name = 'DC Comics'), SUM(publisher_name = 'Marvel Comics'));",
+    "gold_sql": "SELECT SUM(CASE WHEN T2.publisher_name = 'DC Comics' THEN 1 ELSE 0 END) - SUM(CASE WHEN T2.publisher_name = 'Marvel Comics' THEN 1 ELSE 0 END) FROM superhero AS T1 INNER JOIN publisher AS T2 ON T1.publisher_id = T2.id"
+  },
+  {
+    "question_id": 990,
+    "db_id": "formula_1",
+    "difficulty": "challenging",
+    "question": "What is the constructor reference name of the champion in the 2009 Singapore Grand Prix? Please give its website.",
+    "evidence": "the time of the champion shows in the format of \"minutes: seconds.millionsecond\" in which Max(time); constructor reference name refers to constructorRef; website refers to url",
+    "gold_sql": "SELECT T3.constructorRef, T3.url FROM results AS T1 INNER JOIN races AS T2 on T1.raceId = T2.raceId INNER JOIN constructors AS T3 on T1.constructorId = T3.constructorId WHERE T2.name = 'Singapore Grand Prix' AND T2.year = 2009 AND T1.time LIKE '_:%:__.___'"
+  },
+  {
+    "question_id": 1469,
+    "db_id": "student_club",
+    "difficulty": "moderate",
+    "question": "Which student has the hometown of Lincolnton, North Carolina with the zip code of 28092? List their full name and position.",
+    "evidence": "full name refers to first_name, last_name, hometown of Lincolnton, North Carolina refers to city = 'Lincolnton' AND state = 'North Carolina'",
+    "gold_sql": "SELECT T1.first_name, T1.last_name, T1.position FROM member AS T1 INNER JOIN zip_code AS T2 ON T2.zip_code = T1.zip WHERE T2.city = 'Lincolnton' AND T2.state = 'North Carolina' AND T2.zip_code = 28092"
+  },
+  {
+    "question_id": 1192,
+    "db_id": "thrombosis_prediction",
+    "difficulty": "challenging",
+    "question": "List all patients who were followed up at the outpatient clinic who underwent a laboratory test in October 1991 and had a total blood bilirubin level within the normal range.",
+    "evidence": "followed up at the outpatient clinic refers to Admission = '-'; laboratory test in April 1981 refers to Date like '1991-10%'; blood bilirubin level within the normal range refers to T-BIL < 2.0; ",
+    "gold_sql": "SELECT DISTINCT T1.ID FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T1.Admission = '-' AND T2.`T-BIL` < 2.0 AND T2.Date LIKE '1991-10-%'"
+  },
+  {
+    "question_id": 805,
+    "db_id": "superhero",
+    "difficulty": "simple",
+    "question": "List the full names of superheroes with missing weight.",
+    "evidence": "missing weight refers to weight_kg = 0 OR weight_kg = NULL;",
+    "gold_sql": "SELECT DISTINCT full_name FROM superhero WHERE full_name IS NOT NULL AND (weight_kg IS NULL OR weight_kg = 0)"
+  },
+  {
+    "question_id": 296,
+    "db_id": "toxicology",
+    "difficulty": "simple",
+    "question": "Indicate the molecule id is belonging to the TR000_1_2 bond that has the first atom named TR000_1.",
+    "evidence": "",
+    "gold_sql": "SELECT T2.molecule_id, T2.bond_id, T1.atom_id FROM connected AS T1 INNER JOIN bond AS T2 ON T1.bond_id = T2.bond_id WHERE T1.atom_id = 'TR000_1' AND T2.bond_id = 'TR000_1_2'"
+  },
+  {
+    "question_id": 232,
+    "db_id": "toxicology",
+    "difficulty": "moderate",
+    "question": "Please list top three molecules that have single bonds between two atoms and are not carcinogenic in alphabetical order.",
+    "evidence": "label = '-' means molecules are not carcinogenic; single type bond refers to bond_type = '-'; list top three molecules refers to return molecule_id and order by molecule_id;",
+    "gold_sql": "SELECT DISTINCT T2.molecule_id FROM bond AS T1 INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id WHERE T1.bond_type = '-' AND T2.label = '-' ORDER BY T2.molecule_id LIMIT 3"
+  },
+  {
+    "question_id": 879,
+    "db_id": "formula_1",
+    "difficulty": "moderate",
+    "question": "For the driver who set the fastest lap speed, what is his nationality?",
+    "evidence": "the fastest lap speed refers to (MAX) fastestLapSpeed;",
+    "gold_sql": "SELECT T1.nationality FROM drivers AS T1 INNER JOIN results AS T2 ON T2.driverId = T1.driverId ORDER BY T2.fastestLapSpeed DESC LIMIT 1"
+  },
+  {
+    "question_id": 986,
+    "db_id": "formula_1",
+    "difficulty": "simple",
+    "question": "In which race did the fastest 1st lap time was recorded? Please indicate the time in milliseconds.",
+    "evidence": "fastest refers to Min(time);",
+    "gold_sql": "SELECT T1.milliseconds FROM lapTimes AS T1 INNER JOIN races AS T2 on T1.raceId = T2.raceId WHERE T1.lap = 1 ORDER BY T1.time LIMIT 1"
+  },
+  {
+    "question_id": 304,
+    "db_id": "toxicology",
+    "difficulty": "challenging",
+    "question": "List all carcinogenic molecules and their elements.",
+    "evidence": "label = '+' mean molecules are carcinogenic; element = 'cl' means Chlorine; element = 'c' means Carbon; element = 'h' means Hydrogen; element = 'o' means Oxygen, element = 's' means Sulfur; element = 'n' means Nitrogen, element = 'p' means Phosphorus, element = 'na' means Sodium, element = 'br' means Bromine, element = 'f' means Fluorine; element = 'i' means Iodine; element = 'sn' means Tin; element = 'pb' means Lead; element = 'te' means Tellurium; element = 'ca' means Calcium",
+    "gold_sql": "SELECT DISTINCT T2.molecule_id, T1.element FROM atom AS T1 INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id WHERE T2.label = '+'"
+  },
+  {
+    "question_id": 1245,
+    "db_id": "thrombosis_prediction",
+    "difficulty": "moderate",
+    "question": "For the examinations done after 1997/1/1, how many of them have the result of an inactivated partial prothrom bin time?",
+    "evidence": "examinations done after 1997/1/1 refers to `Examination Date` > '1997-01-01'; normal activated partial prothrom bin time refesr to APTT < 45;",
+    "gold_sql": "SELECT COUNT(T1.ID) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.Date > '1997-01-01' AND T2.APTT >= 45"
+  }
+]

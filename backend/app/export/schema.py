@@ -312,10 +312,27 @@ def build_plan(
             for fact in columns_by_table.get(source_name, ())
         }
         column_names = unique_identifiers([str(c) for c in df.columns], fallback="column")
+        key_analysis = keys.get(source_name) or {}
+        synthetic = (
+            set(key_analysis.get("primary_key") or [])
+            if key_analysis.get("source") == "synthetic"
+            else set()
+        )
 
         columns: list[ColumnSpec] = []
         for source_column in (str(c) for c in df.columns):
             fact = facts.get(source_column, {})
+            if not fact and source_column in synthetic:
+                # The cleaning plan's counter arrived after Phase 1, so nothing
+                # typed it — but what it is was never in doubt.
+                fact = {
+                    "effective_type": ColumnType.INTEGER_ORDINAL.value,
+                    "effective_label": "identifier",
+                    "semantic_description": (
+                        "A counter (1, 2, 3, …) added during cleaning so that each row "
+                        "can be identified; it means nothing about the business."
+                    ),
+                }
             column_type = _column_type(fact)
             series = df[source_column]
             # A type the user chose by hand is a decision; the source's own
@@ -348,7 +365,7 @@ def build_plan(
             ),
             description=str(description_map.get(source_name) or ""),
         )
-        _apply_primary_key(spec, df, keys.get(source_name) or {}, plan)
+        _apply_primary_key(spec, df, key_analysis, plan)
         specs[source_name] = spec
 
     _apply_foreign_keys(specs, exportable, relationships, plan)

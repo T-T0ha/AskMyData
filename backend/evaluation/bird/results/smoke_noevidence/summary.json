@@ -1,0 +1,446 @@
+{
+  "primary_metric": "relaxed",
+  "max_extra_columns_override": null,
+  "records": 24,
+  "arms": {
+    "raw": {
+      "n": 12,
+      "primary_metric": "relaxed",
+      "accuracy": 0.25,
+      "accuracy_ci95": [
+        0.0889,
+        0.5323
+      ],
+      "correct": 3,
+      "by_metric": {
+        "strict": 0.25,
+        "normalized": 0.25,
+        "relaxed": 0.25
+      },
+      "rescued_by_value_normalisation": 0,
+      "rescued_by_extra_columns": 0,
+      "answered_rate": 1.0,
+      "no_sql_rate": 0.0,
+      "valid_sql_rate": 1.0,
+      "accuracy_when_answered": 0.25,
+      "first_attempt_valid_rate": 1.0,
+      "avg_attempts": 1.0,
+      "latency_seconds": {
+        "avg": 5.4,
+        "median": 4.61,
+        "p90": 9.56
+      },
+      "tokens": {
+        "calls_total": 12,
+        "prompt_tokens_total": 12663,
+        "completion_tokens_total": 13840,
+        "reasoning_tokens_total": 12674,
+        "cached_tokens_total": 0,
+        "total_tokens_total": 26503,
+        "calls_avg": 1.0,
+        "prompt_tokens_avg": 1055.2,
+        "completion_tokens_avg": 1153.3,
+        "reasoning_tokens_avg": 1056.2,
+        "cached_tokens_avg": 0.0,
+        "total_tokens_avg": 2208.6,
+        "cost_usd_total": 0.038401,
+        "cost_usd_avg": 0.0032
+      },
+      "tokens_per_correct": 8834.3,
+      "cost_usd_per_correct": 0.0128,
+      "finish_reasons": {
+        "stop": 12
+      },
+      "by_difficulty": {
+        "challenging": {
+          "n": 4,
+          "strict": 0.25,
+          "normalized": 0.25,
+          "relaxed": 0.25
+        },
+        "moderate": {
+          "n": 4,
+          "strict": 0.5,
+          "normalized": 0.5,
+          "relaxed": 0.5
+        },
+        "simple": {
+          "n": 4,
+          "strict": 0.0,
+          "normalized": 0.0,
+          "relaxed": 0.0
+        }
+      },
+      "by_database": {
+        "formula_1": {
+          "n": 3,
+          "strict": 0.6667,
+          "normalized": 0.6667,
+          "relaxed": 0.6667
+        },
+        "student_club": {
+          "n": 2,
+          "strict": 0.5,
+          "normalized": 0.5,
+          "relaxed": 0.5
+        },
+        "superhero": {
+          "n": 2,
+          "strict": 0.0,
+          "normalized": 0.0,
+          "relaxed": 0.0
+        },
+        "thrombosis_prediction": {
+          "n": 2,
+          "strict": 0.0,
+          "normalized": 0.0,
+          "relaxed": 0.0
+        },
+        "toxicology": {
+          "n": 3,
+          "strict": 0.0,
+          "normalized": 0.0,
+          "relaxed": 0.0
+        }
+      }
+    },
+    "semantic": {
+      "n": 12,
+      "primary_metric": "relaxed",
+      "accuracy": 0.5,
+      "accuracy_ci95": [
+        0.2538,
+        0.7462
+      ],
+      "correct": 6,
+      "by_metric": {
+        "strict": 0.5,
+        "normalized": 0.5,
+        "relaxed": 0.5
+      },
+      "rescued_by_value_normalisation": 0,
+      "rescued_by_extra_columns": 0,
+      "answered_rate": 1.0,
+      "no_sql_rate": 0.0,
+      "valid_sql_rate": 1.0,
+      "accuracy_when_answered": 0.5,
+      "first_attempt_valid_rate": 1.0,
+      "avg_attempts": 1.0,
+      "latency_seconds": {
+        "avg": 4.07,
+        "median": 3.76,
+        "p90": 5.6
+      },
+      "tokens": {
+        "calls_total": 12,
+        "prompt_tokens_total": 39755,
+        "completion_tokens_total": 10546,
+        "reasoning_tokens_total": 9279,
+        "cached_tokens_total": 0,
+        "total_tokens_total": 50301,
+        "calls_avg": 1.0,
+        "prompt_tokens_avg": 3312.9,
+        "completion_tokens_avg": 878.8,
+        "reasoning_tokens_avg": 773.2,
+        "cached_tokens_avg": 0.0,
+        "total_tokens_avg": 4191.8,
+        "cost_usd_total": 0.038291,
+        "cost_usd_avg": 0.003191
+      },
+      "tokens_per_correct": 8383.5,
+      "cost_usd_per_correct": 0.006382,
+      "finish_reasons": {
+        "stop": 12
+      },
+      "by_difficulty": {
+        "challenging": {
+          "n": 4,
+          "strict": 0.5,
+          "normalized": 0.5,
+          "relaxed": 0.5
+        },
+        "moderate": {
+          "n": 4,
+          "strict": 0.75,
+          "normalized": 0.75,
+          "relaxed": 0.75
+        },
+        "simple": {
+          "n": 4,
+          "strict": 0.25,
+          "normalized": 0.25,
+          "relaxed": 0.25
+        }
+      },
+      "by_database": {
+        "formula_1": {
+          "n": 3,
+          "strict": 0.3333,
+          "normalized": 0.3333,
+          "relaxed": 0.3333
+        },
+        "student_club": {
+          "n": 2,
+          "strict": 1.0,
+          "normalized": 1.0,
+          "relaxed": 1.0
+        },
+        "superhero": {
+          "n": 2,
+          "strict": 0.0,
+          "normalized": 0.0,
+          "relaxed": 0.0
+        },
+        "thrombosis_prediction": {
+          "n": 2,
+          "strict": 0.5,
+          "normalized": 0.5,
+          "relaxed": 0.5
+        },
+        "toxicology": {
+          "n": 3,
+          "strict": 0.6667,
+          "normalized": 0.6667,
+          "relaxed": 0.6667
+        }
+      },
+      "pipeline": {
+        "table_recall_avg": 1.0,
+        "column_recall_avg": 1.0,
+        "context_tables_avg": 7.75,
+        "context_columns_avg": 50.1,
+        "questions_reading_a_changed_column": 0,
+        "gold_on_export": {
+          "same": 11,
+          "not_runnable": 1
+        },
+        "answered_from_saved_example": 0,
+        "questions_shown_examples": 1,
+        "examples_saved": 6,
+        "accuracy_by_examples_in_store": {
+          "0": {
+            "n": 8,
+            "accuracy": 0.5
+          },
+          "1-5": {
+            "n": 4,
+            "accuracy": 0.5
+          }
+        },
+        "selective_accuracy": [
+          {
+            "min_confidence": 0.3,
+            "coverage": 1.0,
+            "accuracy_of_kept": 0.5
+          },
+          {
+            "min_confidence": 0.45,
+            "coverage": 1.0,
+            "accuracy_of_kept": 0.5
+          },
+          {
+            "min_confidence": 0.6,
+            "coverage": 1.0,
+            "accuracy_of_kept": 0.5
+          },
+          {
+            "min_confidence": 0.75,
+            "coverage": 1.0,
+            "accuracy_of_kept": 0.5
+          },
+          {
+            "min_confidence": 0.9,
+            "coverage": 0.9167,
+            "accuracy_of_kept": 0.5455
+          }
+        ],
+        "withheld_by_product_gate": 0
+      }
+    }
+  },
+  "paired": {
+    "n_paired": 12,
+    "by_metric": {
+      "strict": {
+        "n": 12,
+        "both_correct": 2,
+        "semantic_only": 4,
+        "raw_only": 1,
+        "neither": 5,
+        "mcnemar_p": 0.371093,
+        "semantic_minus_raw": 0.25
+      },
+      "normalized": {
+        "n": 12,
+        "both_correct": 2,
+        "semantic_only": 4,
+        "raw_only": 1,
+        "neither": 5,
+        "mcnemar_p": 0.371093,
+        "semantic_minus_raw": 0.25
+      },
+      "relaxed": {
+        "n": 12,
+        "both_correct": 2,
+        "semantic_only": 4,
+        "raw_only": 1,
+        "neither": 5,
+        "mcnemar_p": 0.371093,
+        "semantic_minus_raw": 0.25
+      }
+    },
+    "by_data_drift": {
+      "gold_reads_no_changed_column": {
+        "n": 12,
+        "both_correct": 2,
+        "semantic_only": 4,
+        "raw_only": 1,
+        "neither": 5,
+        "mcnemar_p": 0.371093,
+        "semantic_minus_raw": 0.25
+      },
+      "gold_reads_a_changed_column": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      },
+      "gold_reads_a_values_column": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      },
+      "gold_reads_a_retyped_column": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      },
+      "gold_reads_a_reformatted_column": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      }
+    },
+    "by_gold_on_export": {
+      "answer_preserved": {
+        "n": 11,
+        "both_correct": 2,
+        "semantic_only": 4,
+        "raw_only": 1,
+        "neither": 4,
+        "mcnemar_p": 0.371093,
+        "semantic_minus_raw": 0.2727
+      },
+      "answer_changed": {
+        "n": 0,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": null
+      },
+      "not_runnable_unchanged": {
+        "n": 1,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 1,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": 0.0
+      }
+    },
+    "by_difficulty": {
+      "challenging": {
+        "n": 4,
+        "both_correct": 1,
+        "semantic_only": 1,
+        "raw_only": 0,
+        "neither": 2,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": 0.25
+      },
+      "moderate": {
+        "n": 4,
+        "both_correct": 1,
+        "semantic_only": 2,
+        "raw_only": 1,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": 0.25
+      },
+      "simple": {
+        "n": 4,
+        "both_correct": 0,
+        "semantic_only": 1,
+        "raw_only": 0,
+        "neither": 3,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": 0.25
+      }
+    },
+    "by_database": {
+      "formula_1": {
+        "n": 3,
+        "both_correct": 1,
+        "semantic_only": 0,
+        "raw_only": 1,
+        "neither": 1,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": -0.3333
+      },
+      "student_club": {
+        "n": 2,
+        "both_correct": 1,
+        "semantic_only": 1,
+        "raw_only": 0,
+        "neither": 0,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": 0.5
+      },
+      "superhero": {
+        "n": 2,
+        "both_correct": 0,
+        "semantic_only": 0,
+        "raw_only": 0,
+        "neither": 2,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": 0.0
+      },
+      "thrombosis_prediction": {
+        "n": 2,
+        "both_correct": 0,
+        "semantic_only": 1,
+        "raw_only": 0,
+        "neither": 1,
+        "mcnemar_p": 1.0,
+        "semantic_minus_raw": 0.5
+      },
+      "toxicology": {
+        "n": 3,
+        "both_correct": 0,
+        "semantic_only": 2,
+        "raw_only": 0,
+        "neither": 1,
+        "mcnemar_p": 0.4795,
+        "semantic_minus_raw": 0.6667
+      }
+    }
+  },
+  "run_name": "smoke_noevidence"
+}

@@ -175,6 +175,21 @@ def test_a_composite_key_is_never_a_target():
     assert not [c for c in candidates if c.to_table == "lines"]
 
 
+def test_a_row_id_the_cleaning_plan_added_is_never_a_target():
+    """A counter 1 … n contains any small integer column by range alone."""
+
+    tables = {
+        "points": pd.DataFrame(
+            {"row_id": list(range(1, 41)), "city": [f"city-{i % 3}" for i in range(40)]}
+        ),
+        "scores": pd.DataFrame({"score": [i % 40 + 1 for i in range(80)]}),
+    }
+    keys = _keys(tables)
+    keys["points"] = KeyAnalysis(primary_key=["row_id"], source="synthetic")
+
+    assert not [c for c in detect_foreign_keys(tables, keys) if c.to_table == "points"]
+
+
 def test_small_tables_are_left_alone(relational_tables):
     """With four rows, values land inside another column's by coincidence often
     enough that any verdict would be noise."""

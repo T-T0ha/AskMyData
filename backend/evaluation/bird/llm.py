@@ -48,6 +48,9 @@ FATAL_STATUSES = frozenset({401, 402})
 PROVIDER_FAULT_RETRIES = 2
 PROVIDER_FAULT_BACKOFF = (2.0, 6.0)
 
+#: Longest reply kept, per call, when a scope captures its replies.
+MAX_CAPTURED_CHARS = 60_000
+
 
 class CreditsExhausted(BaseException):
     """Raised from inside the model call when continuing cannot succeed.
@@ -82,6 +85,8 @@ class Usage:
         "last_api_error",
         "call_seconds",
         "finish_reasons",
+        "capture",
+        "replies",
     )
 
     def __init__(self) -> None:
@@ -95,6 +100,11 @@ class Usage:
         self.last_api_error: str | None = None
         self.call_seconds = 0.0
         self.finish_reasons: Counter[str] = Counter()
+        #: When set, every reply (and error) of this scope is kept in full, in call order —
+        #: for reading *why* a model's answer was unusable.  Off by default: a question's
+        #: replies are not worth holding on to.
+        self.capture = False
+        self.replies: list[dict[str, Any]] = []
 
     def add(self, other: "Usage") -> None:
         self.calls += other.calls
@@ -136,8 +146,9 @@ class UsageMeter:
         self.by_phase: dict[str, Usage] = {}
 
     @contextmanager
-    def scope(self, phase: str) -> Iterator[Usage]:
+    def scope(self, phase: str, capture: bool = False) -> Iterator[Usage]:
         usage = Usage()
+        usage.capture = capture
         stack = getattr(self._local, "stack", None)
         if stack is None:
             stack = self._local.stack = []
@@ -153,7 +164,7 @@ class UsageMeter:
         stack = getattr(self._local, "stack", None)
         return stack[-1][1] if stack else None
 
-    def record_response(self, response: Any, seconds: float) -> None:
+    def record_response(self, response: Any, seconds: float, label: str | None = None) -> None:
         usage = self._current()
         if usage is None:
             return
@@ -179,8 +190,19 @@ class UsageMeter:
         choices = getattr(response, "choices", None) or []
         if choices:
             usage.finish_reasons[str(getattr(choices[0], "finish_reason", None))] += 1
+        if usage.capture:
+            choice = choices[0] if choices else None
+            message = getattr(choice, "message", None)
+            usage.replies.append(
+                {
+                    "call": label,
+                    "finish_reason": str(getattr(choice, "finish_reason", None)),
+                    "completion_tokens": int(_number(getattr(raw, "completion_tokens", 0))),
+                    "text": (getattr(message, "content", None) or "")[:MAX_CAPTURED_CHARS],
+                }
+            )
 
-    def record_error(self, exc: BaseException, seconds: float) -> None:
+    def record_error(self, exc: BaseException, seconds: float, label: str | None = None) -> None:
         usage = self._current()
         if usage is None:
             return
@@ -189,6 +211,8 @@ class UsageMeter:
         usage.api_errors += 1
         usage.last_api_error = f"{type(exc).__name__}: {exc}"[:300]
         self._local.errored = usage
+        if usage.capture:
+            usage.replies.append({"call": label, "error": f"{type(exc).__name__}: {exc}"[:600]})
 
     def record_fault(self, detail: str) -> None:
         """The provider answered, every repeat included, with a failure instead of a reply.
@@ -236,6 +260,15 @@ def provider_fault(response: Any) -> str | None:
     return None
 
 
+def _call_label(kwargs: dict[str, Any]) -> str | None:
+    """The start of the system prompt: what a captured reply was a reply *to*."""
+
+    try:
+        return str((kwargs.get("messages") or [{}])[0].get("content", ""))[:70] or None
+    except Exception:
+        return None
+
+
 def install_meter(claude: Any, meter: UsageMeter, reasoning_effort: str | None = None) -> None:
     """Wrap the OpenAI client's ``chat.completions.create`` with metering.
 
@@ -265,13 +298,14 @@ def install_meter(claude: Any, meter: UsageMeter, reasoning_effort: str | None =
         # OpenRouter reports the dollar cost of a call in ``usage`` when asked.
         extra.setdefault("usage", {"include": True})
         kwargs["extra_body"] = extra
+        label = _call_label(kwargs)
         for attempt in range(PROVIDER_FAULT_RETRIES + 1):
             started = time.monotonic()
             try:
                 response = real_create(*args, **kwargs)
             except Exception as exc:
                 elapsed = time.monotonic() - started
-                meter.record_error(exc, elapsed)
+                meter.record_error(exc, elapsed, label)
                 status = getattr(exc, "status_code", None)
                 if status in FATAL_STATUSES:
                     raise CreditsExhausted(
@@ -279,7 +313,7 @@ def install_meter(claude: Any, meter: UsageMeter, reasoning_effort: str | None =
                         "was rejected; progress so far is saved, add credit and re-run the same command"
                     ) from exc
                 raise
-            meter.record_response(response, time.monotonic() - started)
+            meter.record_response(response, time.monotonic() - started, label)
             fault = provider_fault(response)
             if fault is None:
                 return response

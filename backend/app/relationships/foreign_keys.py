@@ -227,11 +227,15 @@ def _single_column_keys(
     are excluded"*.  A two-column key cannot be referenced by a single source
     column, and matching one half of it produces exactly the plausible-looking
     nonsense this phase exists to avoid.
+
+    A ``row_id`` the cleaning plan added is excluded too: no other table's data
+    existed alongside a counter invented after it was loaded, and a run of
+    1 … n contains every small integer column by range alone.
     """
 
     targets: dict[str, str] = {}
     for table, analysis in keys.items():
-        if table not in tables:
+        if table not in tables or analysis.source == "synthetic":
             continue
         primary = list(analysis.primary_key or [])
         if len(primary) != 1:

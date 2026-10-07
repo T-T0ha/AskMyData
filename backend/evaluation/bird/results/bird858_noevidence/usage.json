@@ -1,0 +1,30 @@
+{
+  "raw": {
+    "calls": 584,
+    "prompt_tokens": 671134,
+    "completion_tokens": 53857,
+    "reasoning_tokens": 0,
+    "cached_tokens": 0,
+    "total_tokens": 724991,
+    "cost_usd": 0.335983,
+    "api_errors": 0,
+    "call_seconds": 787.31,
+    "finish_reasons": {
+      "stop": 584
+    }
+  },
+  "semantic": {
+    "calls": 561,
+    "prompt_tokens": 2190482,
+    "completion_tokens": 52459,
+    "reasoning_tokens": 0,
+    "cached_tokens": 0,
+    "total_tokens": 2242941,
+    "cost_usd": 0.788292,
+    "api_errors": 0,
+    "call_seconds": 810.0,
+    "finish_reasons": {
+      "stop": 561
+    }
+  }
+}

@@ -14,7 +14,6 @@ backend/tests/fixtures/*.xlsx
 # BIRD benchmark harness — downloaded dataset and run outputs
 backend/evaluation/bird/data/
 backend/evaluation/bird/schema_cache/
-backend/evaluation/bird/results/
 backend/evaluation/bird/work/
 
 # node

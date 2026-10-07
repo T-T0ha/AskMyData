@@ -1,0 +1,44 @@
+{
+  "arms": {
+    "raw": {
+      "n": 3,
+      "execution_accuracy": 0.3333333333333333,
+      "valid_sql_rate": 0.6666666666666666,
+      "avg_attempts": 1.0,
+      "avg_elapsed_seconds": 319.062,
+      "by_difficulty": {
+        "moderate": {
+          "n": 2,
+          "accuracy": 0.0
+        },
+        "simple": {
+          "n": 1,
+          "accuracy": 1.0
+        }
+      }
+    },
+    "semantic": {
+      "n": 3,
+      "execution_accuracy": 0.3333333333333333,
+      "valid_sql_rate": 0.6666666666666666,
+      "avg_attempts": 1.0,
+      "avg_elapsed_seconds": 425.835,
+      "by_difficulty": {
+        "moderate": {
+          "n": 2,
+          "accuracy": 0.5
+        },
+        "simple": {
+          "n": 1,
+          "accuracy": 0.0
+        }
+      }
+    }
+  },
+  "paired_significance": {
+    "n_paired": 3,
+    "semantic_only_correct": 1,
+    "raw_only_correct": 1,
+    "mcnemar_p_value": 0.4795001221869535
+  }
+}

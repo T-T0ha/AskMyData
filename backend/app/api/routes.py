@@ -1063,6 +1063,9 @@ def _sync_run(db: Session, session_id: str, state: dict[str, Any]) -> CleaningRu
     run.completed_steps = sum(
         1 for s in plan if s.get("status") in {"approved", "skipped", "reverted"}
     )
+    # The graph cannot write to this database, so a row_id it added becomes the
+    # table's key here, on the way back from every cleaning call.
+    services.sync_synthetic_keys(db, session_id, plan)
     db.flush()
     return run
 

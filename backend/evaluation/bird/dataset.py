@@ -6,12 +6,7 @@ each up to ``query_max_attempts`` model calls, so the evaluation uses a sample.
 
 The default sample is **100 simple + 100 moderate + 100 challenging** questions
 drawn from :data:`DEFAULT_DATABASES`.  BIRD dev has only 144 challenging
-questions in total, so 100 of them cannot come from one or two databases; the
-default set is the smallest one that holds them without the databases whose
-largest table is several times the product's per-table ingestion cap (``card_games``,
-``financial``, ``codebase_community``, ``debit_card_specializing``) or whose
-width makes the one-off semantic-layer build very expensive
-(``european_football_2``: 199 columns).
+questions in total, so 100 of them cannot come from one or two databases; 
 """
 
 from __future__ import annotations
@@ -20,6 +15,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable, Sequence
 
 DATA_DIR = Path(__file__).resolve().parent / "data" / "dev_20240627"
 DEV_JSON = DATA_DIR / "dev.json"
@@ -104,16 +100,52 @@ def stratified_sample(
 #: BIRD dev: toxicology 31, thrombosis_prediction 28, superhero 15, formula_1 14,
 #: student_club 9, california_schools 5 — 102 in all, so a 100-question
 #: challenging band takes almost every one of them.
+#:
+#: The order is the order a run asks them in, one database after another.  It is
+#: chosen so that, with 100 questions per invocation, the first batch is exactly
+#: formula_1 (53) + student_club (47) and the third is exactly the tail of
+#: toxicology (56) + superhero (44); only toxicology is split, by four questions.
+#: The order is operational only — it changes neither which questions are drawn
+#: nor any database's result, since every database has its own session.
 DEFAULT_DATABASES: tuple[str, ...] = (
-    "toxicology",
-    "thrombosis_prediction",
-    "superhero",
     "formula_1",
     "student_club",
+    "thrombosis_prediction",
     "california_schools",
+    "toxicology",
+    "superhero",
 )
 
 DIFFICULTIES: tuple[str, ...] = ("simple", "moderate", "challenging")
+
+
+def run_order(
+    examples: Sequence[BirdExample], databases: Sequence[str] = ()
+) -> list[BirdExample]:
+    """``examples`` in the order a run asks them: database by database, simple first.
+
+    Databases come in the order they are listed in ``databases`` (any that are not
+    listed follow, by name); inside one database the bands run simple → moderate →
+    challenging, so the semantic arm's saved examples build up from the easy
+    questions to the hard ones.  Within a (database, difficulty) band the incoming
+    order is kept, so the seeded shuffle done upstream is still the order the band
+    is asked in.  A pure reordering: nothing is added or dropped.
+    """
+
+    database_rank = {db: position for position, db in enumerate(databases)}
+    difficulty_rank = {name: position for position, name in enumerate(DIFFICULTIES)}
+
+    def key(item: tuple[int, BirdExample]) -> tuple[int, str, int, int]:
+        position, example = item
+        listed = example.db_id in database_rank
+        return (
+            database_rank[example.db_id] if listed else len(database_rank),
+            "" if listed else example.db_id,
+            difficulty_rank.get(example.difficulty, len(difficulty_rank)),
+            position,
+        )
+
+    return [example for _, example in sorted(enumerate(examples), key=key)]
 
 
 def _proportional_counts(sizes: dict[str, int], total: int) -> dict[str, int]:
@@ -172,6 +204,34 @@ def sample_by_difficulty(
             chosen.extend(group[: counts[db_id]])
     rng.shuffle(chosen)
     return chosen
+
+
+def rest_of(
+    examples: list[BirdExample],
+    asked: Iterable[tuple[str, int]],
+    databases: Sequence[str] | None = None,
+    seed: int = 0,
+) -> list[BirdExample]:
+    """Every question of ``databases`` that is not in ``asked`` — "the other questions".
+
+    ``asked`` is ``(db_id, question_id)`` pairs, what an earlier run already put to the
+    model.  No difficulty quota here: all of what is left is returned, in a seeded
+    shuffle (the same role the shuffle plays in :func:`sample_by_difficulty`: the order
+    inside a database and difficulty is not the order of ``dev.json``).  Together with
+    that earlier run it is the whole dev set of those databases, each question once.
+    """
+
+    taken = set(asked)
+    pool = sorted(
+        (
+            e
+            for e in examples
+            if (databases is None or e.db_id in databases) and (e.db_id, e.question_id) not in taken
+        ),
+        key=lambda e: e.question_id,
+    )
+    random.Random(seed).shuffle(pool)
+    return pool
 
 
 def available_databases() -> list[str]:

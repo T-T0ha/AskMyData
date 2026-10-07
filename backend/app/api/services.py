@@ -24,6 +24,7 @@ from app.core.schemas import (
     RelationshipOrigin,
     RelationshipStatus,
     RelationshipType,
+    StepType,
     TableType,
     TriageStatus,
 )
@@ -48,10 +49,17 @@ from app.export.schema import build_plan
 from app.ingestion.duplicates import duplicate_reason, find_duplicate_tables, is_duplicate_reason
 from app.ingestion.equivalence import auto_verdict, detect_equivalences
 from app.ingestion.fingerprint import database_fingerprint, file_fingerprint
-from app.ingestion.keys import KeyAnalysis, confirm_key, decline_key, is_unique_key
+from app.ingestion.keys import (
+    KeyAnalysis,
+    adopt_synthetic_key,
+    confirm_key,
+    decline_key,
+    is_unique_key,
+    withdraw_synthetic_key,
+)
 from app.ingestion.loader import load_file_source
 from app.ingestion.relational import display_url, load_relational_tables
-from app.ingestion.triage import classify_issues
+from app.ingestion.triage import classify_issues, key_issues
 from app.query.guard import QueryRejected, referenced_names, validate_select_only
 from app.query.retrieval import (
     columns_named_in,
@@ -407,6 +415,13 @@ def set_table_key(
     else:
         decline_key(analysis)
 
+    _save_key_analysis(db, record, sheet, analysis)
+    return sheet
+
+
+def _save_key_analysis(
+    db: Session, record: IngestionSession, sheet: SheetRecord, analysis: KeyAnalysis
+) -> None:
     sheet.key_analysis = analysis.to_dict()
     # The question has been answered, so the issue that asked it goes away and
     # the sheet is re-classified on what is left.
@@ -415,7 +430,14 @@ def set_table_key(
         for issue in (sheet.issues or [])
         if issue.get("code") not in {"composite_key_candidate", "no_primary_key"}
     ]
-    if analysis.needs_synthetic_key:
+    if analysis.needs_confirmation:
+        # Asked again (a withdrawn row_id): the same question triage asked.
+        issues.extend(
+            issue.to_dict()
+            for issue in key_issues(analysis)
+            if issue.code == "composite_key_candidate"
+        )
+    elif analysis.needs_synthetic_key:
         issues.append(
             {
                 "code": "no_primary_key",
@@ -431,7 +453,43 @@ def set_table_key(
     sheet.triage = classify_issues(issues).value
     record.stats = {**(record.stats or {}), **triage_stats(db, record)}
     db.flush()
-    return sheet
+
+
+def sync_synthetic_keys(db: Session, session_id: str, plan: Sequence[dict[str, Any]]) -> None:
+    """Make a row_id the cleaning plan added the table's key, while it exists.
+
+    ``add_synthetic_key`` runs inside the cleaning graph, which never touches
+    this database, so without this the stored analysis would still say "no
+    key" after the counter column is in the table — and the export, the
+    relationship stage and the planner all read that analysis, not the table.
+
+    Only an *approved* step adopts a key, so a ``row_id`` that arrived with the
+    source data is never mistaken for one the plan added.  The key is withdrawn
+    once its column is gone from the table (a later step dropped or renamed
+    it), which puts the table back to the question it was asking before.
+    """
+
+    added = {
+        str(step.get("table")): str((step.get("params") or {}).get("column") or "row_id")
+        for step in plan
+        if step.get("type") == StepType.ADD_SYNTHETIC_KEY.value
+        and step.get("status") == "approved"
+    }
+    store = get_store(session_id)
+    record: IngestionSession | None = None
+    for name, sheet in _sheets_by_name(db, session_id).items():
+        analysis = KeyAnalysis.from_dict(sheet.key_analysis)
+        columns = {str(c) for c in store.get(name).columns} if store.has(name) else set()
+        if analysis.source == "synthetic":
+            if set(analysis.primary_key) <= columns:
+                continue
+            withdraw_synthetic_key(analysis)
+        elif not analysis.primary_key and added.get(name) in columns:
+            adopt_synthetic_key(analysis, added[name])
+        else:
+            continue
+        record = record or db.get(IngestionSession, session_id)
+        _save_key_analysis(db, record, sheet, analysis)
 
 
 def detect_and_store_equivalences(

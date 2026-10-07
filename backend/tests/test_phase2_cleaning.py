@@ -469,6 +469,22 @@ def test_claude_plan_validation_rejects_hallucinated_references(store):
     assert any("teleport_column" in r for r in rejected)
 
 
+def test_a_synthetic_key_names_the_column_it_creates_not_one_it_finds(store):
+    """Checking that ``row_id`` already exists rejected every row_id step —
+    the model's at proposal time, and the heuristic one at plan review."""
+
+    accepted, rejected = normalize_claude_plan(
+        [
+            {"type": "add_synthetic_key", "table": "orders", "params": {"column": "row_id"}},
+            {"type": "add_synthetic_key", "table": "orders", "params": {"column": "customer"}},
+        ],
+        store.tables(),
+    )
+
+    assert [s.params["column"] for s in accepted] == ["row_id"]
+    assert len(rejected) == 1 and "already has a column named 'customer'" in rejected[0]
+
+
 def test_merge_step_requires_both_sides_to_exist(store):
     accepted, rejected = normalize_claude_plan(
         [

@@ -89,6 +89,69 @@ def check_revision(db_id: str, entry: dict[str, Any]) -> None:
         )
 
 
+#: Smallest share of a layer's column descriptions the model must have written for
+#: the layer to count as the product's.  The rest are the mechanical template.
+DEFAULT_MIN_MODEL_WRITTEN = 0.5
+
+
+def check_model_written(db_id: str, quality: dict[str, Any], minimum: float) -> None:
+    """Refuse a layer whose descriptions are mostly the template, not the model's.
+
+    The description call can *arrive* and still be unusable — a reply cut short, or
+    one that lists only some columns — and the product then keeps the template for
+    every column it did not get, without an error anywhere for the harness to see.
+    Warning only when *none* were written let a layer with 2 of 31 through; what the
+    semantic arm retrieves on is those sentences, so such a layer is not "the semantic
+    layer" and must not be measured as if it were.  ``minimum`` of 0 switches this off.
+    """
+
+    columns = int(quality.get("columns") or 0)
+    if not columns or minimum <= 0:
+        return
+    written = int(quality.get("described_by_model") or 0)
+    if written / columns < minimum:
+        raise BuildDegraded(
+            f"{db_id}: the model wrote only {written} of {columns} column descriptions (under "
+            f"{minimum:.0%}); the rest are the mechanical template, so the semantic arm would be "
+            "measuring a layer that is not the product's. Rebuild it (a few thousand tokens):\n"
+            f"    python -m evaluation.bird.run_eval --databases {db_id} --prepare-only --rebuild-sessions"
+        )
+
+
+def save_replies(work: Path, db_id: str, stage: str, usage: Any) -> Path:
+    """Keep what the model said during a build stage that was then rejected.
+
+    The product logs only the first 200 characters of a reply it cannot use, so a layer
+    that comes out as templates cannot be explained afterwards.  Replies are saved here,
+    in full and in call order, with the error — if any — that preceded each one.
+    """
+
+    folder = work / "build_failures"
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = folder / f"{db_id}-{stage}-{stamp}.json"
+    target.write_text(
+        json.dumps(
+            {"database": db_id, "stage": stage, "calls": usage.calls, "replies": usage.replies},
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        )
+    )
+    return target
+
+
+def check_layer(db_id: str, entry: dict[str, Any], minimum: float = 0.0) -> None:
+    """Everything that makes a *built* session unfit to be measured, without opening it.
+
+    Read from the manifest alone, so it can run before a single question is asked.
+    """
+
+    check_revision(db_id, entry)
+    if entry.get("session_id") and entry.get("stage") == "exported" and entry.get("model_written"):
+        check_model_written(db_id, entry["model_written"], minimum)
+
+
 # ---------------------------------------------------------------------------
 # workspace
 # ---------------------------------------------------------------------------
@@ -135,9 +198,18 @@ def read_manifest(work: Path) -> dict[str, Any]:
         return {}
 
 
-def _update_manifest(work: Path, db_id: str, **fields: Any) -> dict[str, Any]:
+def _update_manifest(work: Path, db_id: str, replace: bool = False, **fields: Any) -> dict[str, Any]:
+    """Merge ``fields`` into ``db_id``'s entry — or, with ``replace``, start the entry afresh.
+
+    A new session is replaced, not merged: what the old one measured (``model_written``,
+    ``drift``, ``build_usage``) says nothing about it, and until its own build finishes
+    the old figures would be read as the new layer's.
+    """
+
     with _manifest_lock:
         manifest = read_manifest(work)
+        if replace:
+            manifest[db_id] = {}
         entry = manifest.setdefault(db_id, {})
         entry.update(fields)
         tmp = _manifest_path(work).with_suffix(".tmp")
@@ -459,8 +531,15 @@ def build_session(
     work: Path,
     log: Callable[[str], None],
     rebuild: bool = False,
+    min_model_written: float = 0.0,
 ) -> EvalSession:
-    """Return the product session for ``db_id``, building or finishing it as needed."""
+    """Return the product session for ``db_id``, building or finishing it as needed.
+
+    ``min_model_written`` is the share of column descriptions the model must have
+    written (:func:`check_model_written`), applied to a layer being built *and* to
+    one being reused.  0 — the default — accepts any layer, which is what a test
+    with a fake model needs.
+    """
 
     source = dataset.DATABASES_DIR / db_id / f"{db_id}.sqlite"
     if not source.exists():
@@ -468,7 +547,7 @@ def build_session(
 
     Session = get_session_factory()
     entry = {} if rebuild else read_manifest(work).get(db_id, {})
-    check_revision(db_id, entry)
+    check_layer(db_id, entry, min_model_written)
     session_id = entry.get("session_id")
 
     with Session() as db:
@@ -492,6 +571,7 @@ def build_session(
             entry = _update_manifest(
                 work,
                 db_id,
+                replace=True,
                 session_id=session_id,
                 stage="created",
                 stages={},
@@ -513,7 +593,7 @@ def build_session(
         if index <= done:
             continue
         started = time.monotonic()
-        with meter.scope("build") as usage, Session() as db:
+        with meter.scope("build", capture=True) as usage, Session() as db:
             record = db.get(IngestionSession, session_id)
             run(db, record)
             if usage.api_errors:
@@ -522,6 +602,14 @@ def build_session(
                     f"({usage.last_api_error}); the layer would silently fall back to templates. "
                     "Nothing was saved for this stage — re-run to retry it."
                 )
+            if name == "semantics":
+                # Judged before the commit, like a failed call: a layer the model barely
+                # wrote is thrown away with the stage, so a re-run asks for it again.
+                try:
+                    check_model_written(db_id, model_written_share(session_id, db), min_model_written)
+                except BuildDegraded as exc:
+                    saved = save_replies(work, db_id, name, usage)
+                    raise BuildDegraded(f"{exc}\n    the model's replies were saved to {saved}") from None
             db.commit()
         stage_info[name] = {
             "seconds": round(time.monotonic() - started, 1),
@@ -568,20 +656,25 @@ def build_session(
     return session
 
 
-def model_written_share(session_id: str) -> dict[str, int]:
+def model_written_share(session_id: str, db: Any = None) -> dict[str, int]:
     """How much of the layer the *model* wrote, as opposed to the rule-based fallback.
 
     The product falls back to rules and templates when a model reply cannot be
     used, without any HTTP error for the harness to see.  A layer with no
     model-written descriptions or labels is the template-only layer, and a
     benchmark of "the semantic layer" must not be quietly measuring that.
+
+    Pass ``db`` to read inside a transaction that has not committed yet (the build
+    judges a stage before it keeps it).
     """
 
-    Session = get_session_factory()
-    with Session() as db:
-        rows = db.execute(
-            select(ColumnSemantics).where(ColumnSemantics.session_id == session_id)
-        ).scalars().all()
+    query = select(ColumnSemantics).where(ColumnSemantics.session_id == session_id)
+    if db is not None:
+        rows = db.execute(query).scalars().all()
+    else:
+        Session = get_session_factory()
+        with Session() as own:
+            rows = own.execute(query).scalars().all()
     return {
         "columns": len(rows),
         "described_by_model": sum(1 for r in rows if not is_template_description(r.semantic_description)),

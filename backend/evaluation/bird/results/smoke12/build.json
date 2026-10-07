@@ -1,0 +1,553 @@
+{
+  "formula_1": {
+    "session_id": "e02fd33f96b348df9e12b9f25770c4ac",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 84.8,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 36.3,
+        "usage": {
+          "calls": 2,
+          "prompt_tokens": 5170,
+          "completion_tokens": 6437,
+          "reasoning_tokens": 2545,
+          "cached_tokens": 0,
+          "total_tokens": 11607,
+          "cost_usd": 0.017643,
+          "api_errors": 0,
+          "call_seconds": 20.05,
+          "finish_reasons": {
+            "stop": 1
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 12.7,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 6.0,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791205265.4546258,
+    "data_revision": 2,
+    "built_at": 1791205413.6834872,
+    "model_written": {
+      "columns": 94,
+      "described_by_model": 94,
+      "labelled_by_model": 70
+    },
+    "drift": {
+      "columns_compared": 94,
+      "columns_drifted": 1,
+      "by_kind": {
+        "values": 0,
+        "retyped": 1,
+        "reformatted": 0
+      },
+      "drifted": [
+        {
+          "table": "results",
+          "column": "fastestlapspeed",
+          "exported_as": "results.fastestlapspeed",
+          "kinds": [
+            "retyped"
+          ],
+          "stored_as": "text -> numeric",
+          "values_lost": 0,
+          "values_gained": 0,
+          "lost_sample": [],
+          "gained_sample": []
+        }
+      ],
+      "drifted_columns": [
+        [
+          "results",
+          "fastestlapspeed",
+          [
+            "retyped"
+          ]
+        ]
+      ]
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 2,
+      "prompt_tokens": 5170,
+      "completion_tokens": 6437,
+      "reasoning_tokens": 2545,
+      "total_tokens": 11607,
+      "cost_usd": 0.017643
+    }
+  },
+  "student_club": {
+    "session_id": "749427497c5a4dc2afe3f23abc8a25a7",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 12.5,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 17.7,
+        "usage": {
+          "calls": 4,
+          "prompt_tokens": 6453,
+          "completion_tokens": 5152,
+          "reasoning_tokens": 2229,
+          "cached_tokens": 2203,
+          "total_tokens": 11605,
+          "cost_usd": 0.014221,
+          "api_errors": 0,
+          "call_seconds": 16.19,
+          "finish_reasons": {
+            "stop": 2
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 54.8,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 47.4,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791205265.4483705,
+    "data_revision": 2,
+    "built_at": 1791205398.6856296,
+    "model_written": {
+      "columns": 48,
+      "described_by_model": 48,
+      "labelled_by_model": 15
+    },
+    "drift": {
+      "columns_compared": 48,
+      "columns_drifted": 3,
+      "by_kind": {
+        "values": 1,
+        "retyped": 1,
+        "reformatted": 2
+      },
+      "drifted": [
+        {
+          "table": "expense",
+          "column": "approved",
+          "exported_as": "expense.approved",
+          "kinds": [
+            "values",
+            "retyped"
+          ],
+          "stored_as": "text -> numeric",
+          "values_lost": 1,
+          "values_gained": 1,
+          "lost_sample": [
+            "true"
+          ],
+          "gained_sample": [
+            "1.0"
+          ]
+        },
+        {
+          "table": "expense",
+          "column": "expense_date",
+          "exported_as": "expense.expense_date",
+          "kinds": [
+            "reformatted"
+          ],
+          "stored_as": "text -> text",
+          "values_lost": 0,
+          "values_gained": 0,
+          "lost_sample": [],
+          "gained_sample": []
+        },
+        {
+          "table": "income",
+          "column": "date_received",
+          "exported_as": "income.date_received",
+          "kinds": [
+            "reformatted"
+          ],
+          "stored_as": "text -> text",
+          "values_lost": 0,
+          "values_gained": 0,
+          "lost_sample": [],
+          "gained_sample": []
+        }
+      ],
+      "drifted_columns": [
+        [
+          "expense",
+          "approved",
+          [
+            "values",
+            "retyped"
+          ]
+        ],
+        [
+          "expense",
+          "expense_date",
+          [
+            "reformatted"
+          ]
+        ],
+        [
+          "income",
+          "date_received",
+          [
+            "reformatted"
+          ]
+        ]
+      ]
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 4,
+      "prompt_tokens": 6453,
+      "completion_tokens": 5152,
+      "reasoning_tokens": 2229,
+      "total_tokens": 11605,
+      "cost_usd": 0.014221
+    }
+  },
+  "superhero": {
+    "session_id": "504fe4dc62a84c8b89d1aeb71e842e83",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 36.7,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 9.1,
+        "usage": {
+          "calls": 4,
+          "prompt_tokens": 3743,
+          "completion_tokens": 1919,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 5662,
+          "cost_usd": 0.00592,
+          "api_errors": 0,
+          "call_seconds": 7.17,
+          "finish_reasons": {
+            "stop": 2
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 1.9,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 0.5,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791205350.490919,
+    "data_revision": 2,
+    "built_at": 1791205399.0386205,
+    "model_written": {
+      "columns": 31,
+      "described_by_model": 31,
+      "labelled_by_model": 17
+    },
+    "drift": {
+      "columns_compared": 31,
+      "columns_drifted": 0,
+      "by_kind": {
+        "values": 0,
+        "retyped": 0,
+        "reformatted": 0
+      },
+      "drifted": [],
+      "drifted_columns": []
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 4,
+      "prompt_tokens": 3743,
+      "completion_tokens": 1919,
+      "reasoning_tokens": 0,
+      "total_tokens": 5662,
+      "cost_usd": 0.00592
+    }
+  },
+  "thrombosis_prediction": {
+    "session_id": "b0f5de3e166448d88fde159368c9bf85",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 4.7,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 20.7,
+        "usage": {
+          "calls": 2,
+          "prompt_tokens": 4232,
+          "completion_tokens": 3085,
+          "reasoning_tokens": 1010,
+          "cached_tokens": 0,
+          "total_tokens": 7317,
+          "cost_usd": 0.008982,
+          "api_errors": 0,
+          "call_seconds": 9.21,
+          "finish_reasons": {
+            "stop": 1
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 0.7,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 1.3,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791205407.3421533,
+    "data_revision": 2,
+    "built_at": 1791205435.1854036,
+    "model_written": {
+      "columns": 64,
+      "described_by_model": 64,
+      "labelled_by_model": 55
+    },
+    "drift": {
+      "columns_compared": 64,
+      "columns_drifted": 1,
+      "by_kind": {
+        "values": 0,
+        "retyped": 1,
+        "reformatted": 0
+      },
+      "drifted": [
+        {
+          "table": "laboratory",
+          "column": "dna",
+          "exported_as": "laboratory.dna",
+          "kinds": [
+            "retyped"
+          ],
+          "stored_as": "text -> numeric",
+          "values_lost": 0,
+          "values_gained": 0,
+          "lost_sample": [],
+          "gained_sample": []
+        }
+      ],
+      "drifted_columns": [
+        [
+          "laboratory",
+          "dna",
+          [
+            "retyped"
+          ]
+        ]
+      ]
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 2,
+      "prompt_tokens": 4232,
+      "completion_tokens": 3085,
+      "reasoning_tokens": 1010,
+      "total_tokens": 7317,
+      "cost_usd": 0.008982
+    }
+  },
+  "toxicology": {
+    "session_id": "0eea41317e5d43eab33212edf650760f",
+    "stage": "relationships",
+    "stages": {
+      "ingested": {
+        "seconds": 1.5,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 8.6,
+        "usage": {
+          "calls": 4,
+          "prompt_tokens": 1716,
+          "completion_tokens": 1293,
+          "reasoning_tokens": 840,
+          "cached_tokens": 0,
+          "total_tokens": 3009,
+          "cost_usd": 0.003747,
+          "api_errors": 0,
+          "call_seconds": 7.01,
+          "finish_reasons": {
+            "stop": 2
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 2.5,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791205265.4516826,
+    "data_revision": 2
+  }
+}

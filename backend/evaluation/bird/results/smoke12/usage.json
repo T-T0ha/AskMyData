@@ -1,0 +1,45 @@
+{
+  "build": {
+    "calls": 16,
+    "prompt_tokens": 21314,
+    "completion_tokens": 17886,
+    "reasoning_tokens": 6624,
+    "cached_tokens": 2203,
+    "total_tokens": 39200,
+    "cost_usd": 0.050514,
+    "api_errors": 0,
+    "call_seconds": 59.63,
+    "finish_reasons": {
+      "stop": 8
+    }
+  },
+  "raw": {
+    "calls": 12,
+    "prompt_tokens": 13130,
+    "completion_tokens": 10296,
+    "reasoning_tokens": 9040,
+    "cached_tokens": 0,
+    "total_tokens": 23426,
+    "cost_usd": 0.029679,
+    "api_errors": 0,
+    "call_seconds": 61.98,
+    "finish_reasons": {
+      "stop": 12
+    }
+  },
+  "semantic": {
+    "calls": 9,
+    "prompt_tokens": 28443,
+    "completion_tokens": 6042,
+    "reasoning_tokens": 5294,
+    "cached_tokens": 0,
+    "total_tokens": 34485,
+    "cost_usd": 0.023638,
+    "api_errors": 0,
+    "call_seconds": 32.41,
+    "finish_reasons": {
+      "stop": 8,
+      "error": 1
+    }
+  }
+}

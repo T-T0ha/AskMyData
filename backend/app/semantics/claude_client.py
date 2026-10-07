@@ -248,7 +248,7 @@ SQL_SYSTEM_PROMPT = """You translate a business question into one read-only SQL 
 You are given the question, the SQL dialect ("postgresql" or "sqlite"), and the schema of \
 the tables that matter for it — grouped by table, with each column's name, SQL type, \
 semantic label, whether it is a primary or foreign key (and what it references), whether \
-it is additive (safe to SUM or AVG), its null ratio, and up to five example values. You may \
+it is additive (safe to SUM), its null ratio, and up to five example values. You may \
 also be given a previous attempt and the error it produced; fix that specific error rather \
 than starting over from a different query.
 
@@ -277,8 +277,11 @@ not a read.
 - Reference only the tables and columns you were given, by the exact names given. Never \
 invent one, and never qualify a name with a schema or database ("public.orders" is wrong — \
 write "orders").
-- Only SUM or AVG a column marked additive. A non-additive numeric column (an id, a year, a \
-rating, a percentage) may be selected, grouped or filtered on, never summed or averaged.
+- Only SUM a column marked additive. Any other numeric column (a rating, a percentage, a \
+duration, a height) may still be selected, grouped, filtered on, ordered by, averaged or given \
+a MIN or MAX — the average of a rating means something even though its sum does not — but it \
+is never summed. An identifier or a code (an id, a zip code) only names something: neither \
+sum nor average it.
 - Join only through the primary/foreign key pairs you were given.
 - When the question is merely loose (no metric or period named, but one reading is the \
 natural default), do not refuse and do not hedge: choose that reading and say in the \
@@ -286,7 +289,7 @@ explanation which one you chose.
 - Always return your best-effort SQL, even when the schema only partially fits the \
 question — but "confidence" must honestly reflect how likely this query is to be exactly \
 right, not just syntactically valid. Lower it for a guessed join, a wording resolved \
-arbitrarily, an aggregate over a column you are unsure is additive, or a schema that only \
+arbitrarily, a SUM over a column you are unsure is additive, or a schema that only \
 partially covers what was asked. Do not inflate it: a caller downstream decides whether to \
 show this answer to the user based on this number alone.
 - No comments, no markdown fencing, no prose outside the JSON object."""

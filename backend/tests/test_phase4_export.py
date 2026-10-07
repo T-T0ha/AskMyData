@@ -105,6 +105,26 @@ def test_the_confirmed_key_becomes_the_primary_key(shop):
     assert customers.column("city").nullable is True
 
 
+def test_the_row_id_the_cleaning_plan_added_is_an_integer_primary_key(shop):
+    """The counter arrived after Phase 1, so it has no semantics of its own —
+    without help it would be exported as a TEXT column of "1", "2", "3"."""
+
+    tables, columns, keys = shop
+    tables["visits"] = pd.DataFrame(
+        {"row_id": [1, 2, 3], "city": ["Dhaka", "Dhaka", "Dhaka"]}
+    )
+    columns["visits"] = [_column("city", "text", "city")]
+    keys["visits"] = {"primary_key": ["row_id"], "source": "synthetic"}
+
+    plan = build_plan(tables, columns, key_analyses=keys)
+
+    visits = plan.table("visits")
+    assert visits.primary_key == ["row_id"]
+    assert visits.column("row_id").type_plan.render() == "INTEGER"
+    assert visits.column("row_id").nullable is False
+    assert not [w for w in plan.warnings if "visits" in w]
+
+
 def test_a_key_that_no_longer_holds_is_dropped_rather_than_declared(shop):
     """Cleaning runs between key discovery and the export.  A key the data no
     longer satisfies would fail at ``CREATE TABLE``, or worse, at insert."""

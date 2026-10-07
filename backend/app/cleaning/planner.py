@@ -382,7 +382,11 @@ def _validate_references(
 
     columns = {str(c) for c in tables[table].columns}
     column = params.get("column")
-    if column is not None and str(column) not in columns:
+    if step_type is StepType.ADD_SYNTHETIC_KEY:
+        # The one step whose column is the one it creates, not one it finds.
+        if column is not None and str(column) in columns:
+            return f"{table} already has a column named {str(column)!r}"
+    elif column is not None and str(column) not in columns:
         return f"{table} has no column {str(column)!r}"
 
     if step_type is StepType.MERGE_SHEETS:

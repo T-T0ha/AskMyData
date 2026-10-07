@@ -257,6 +257,39 @@ def test_schema_context_groups_columns_under_their_table_and_hides_the_vector():
 
 
 # ---------------------------------------------------------------------------
+# the prompt that reads that context
+# ---------------------------------------------------------------------------
+
+
+def _sql_prompt_rule(starting_with: str) -> str:
+    """One bullet of the SQL prompt's rules, its backslash-continued lines already joined."""
+
+    from app.semantics.claude_client import SQL_SYSTEM_PROMPT
+
+    return next(line for line in SQL_SYSTEM_PROMPT.splitlines() if line.startswith(starting_with))
+
+
+def test_the_sql_prompt_limits_sum_to_additive_columns_and_lets_any_numeric_column_be_averaged():
+    # "Additive" means *summable* (``ADDITIVE_LABELS``).  A height, a lap time or a lab value is not
+    # additive, and "what is the average height" is still a question people ask: the flag protects SUM.
+    from app.semantics.claude_client import SQL_SYSTEM_PROMPT
+
+    assert "SUM or AVG" not in SQL_SYSTEM_PROMPT
+    assert "additive (safe to SUM)" in SQL_SYSTEM_PROMPT
+    rule = _sql_prompt_rule("- Only SUM")
+    assert rule.startswith("- Only SUM a column marked additive")
+    assert "averaged" in rule and "is never summed" in rule
+    # ...but an identifier or a code is a name, not a measure.
+    assert "neither sum nor average it" in rule
+
+
+def test_the_sql_prompt_asks_for_less_confidence_on_a_sum_it_is_unsure_of_not_on_every_aggregate():
+    rule = _sql_prompt_rule("- Always return your best-effort SQL")
+    assert "a SUM over a column you are unsure is additive" in rule
+    assert "an aggregate over a column" not in rule
+
+
+# ---------------------------------------------------------------------------
 # shape
 # ---------------------------------------------------------------------------
 

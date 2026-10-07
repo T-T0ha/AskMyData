@@ -850,3 +850,431 @@ def test_a_run_resumed_under_the_same_settings_is_accepted(tmp_path, monkeypatch
     (tmp_path / "earlier" / "questions.json").write_text("[]")
     runner.Run(cfg, object(), tmp_path).prepare()  # does not raise
 
+
+
+# ---------------------------------------------------------------------------
+# asking order, batches, checkpoints, and refusing a layer the model barely wrote
+# ---------------------------------------------------------------------------
+
+
+def _q(db, question_id, difficulty):
+    return dataset.BirdExample(question_id, db, f"question {question_id}", "", "select 1", difficulty)
+
+
+def test_questions_are_asked_database_by_database_simple_first():
+    mixed = [
+        _q("b", 1, "challenging"),
+        _q("a", 2, "moderate"),
+        _q("c", 3, "simple"),
+        _q("a", 4, "simple"),
+        _q("b", 5, "simple"),
+        _q("a", 6, "simple"),
+        _q("z", 7, "simple"),
+        _q("a", 8, "unknown"),
+    ]
+    ordered = dataset.run_order(mixed, ["b", "a"])
+
+    assert [(q.db_id, q.difficulty, q.question_id) for q in ordered] == [
+        ("b", "simple", 5),
+        ("b", "challenging", 1),
+        ("a", "simple", 4),  # 4 before 6: inside a band the incoming (seeded) order is kept
+        ("a", "simple", 6),
+        ("a", "moderate", 2),
+        ("a", "unknown", 8),
+        ("c", "simple", 3),  # databases that are not listed follow, by name
+        ("z", "simple", 7),
+    ]
+    assert sorted(q.question_id for q in ordered) == sorted(q.question_id for q in mixed), "nothing added or dropped"
+
+
+@needs_data
+def test_the_sample_does_not_depend_on_the_order_databases_are_listed():
+    """Listing the databases in another order only changes when each is asked."""
+
+    bands = {"simple": 100, "moderate": 100, "challenging": 100}
+    examples = dataset.load_all()
+    listed = list(dataset.DEFAULT_DATABASES)
+    one = dataset.sample_by_difficulty(examples, bands, listed, seed=0)
+    other = dataset.sample_by_difficulty(examples, bands, list(reversed(listed)), seed=0)
+    assert [e.question_id for e in one] == [e.question_id for e in other]
+
+
+@needs_data
+def test_the_default_order_lines_three_batches_of_100_up_with_the_databases():
+    """The numbers the run's commands promise: what each invocation of 100 covers."""
+
+    bands = {"simple": 100, "moderate": 100, "challenging": 100}
+    sample = dataset.run_order(
+        dataset.sample_by_difficulty(dataset.load_all(), bands, dataset.DEFAULT_DATABASES, seed=0),
+        dataset.DEFAULT_DATABASES,
+    )
+    first, second, third = sample[:100], sample[100:200], sample[200:]
+
+    per_database = {db: sum(1 for q in sample if q.db_id == db) for db in dataset.DEFAULT_DATABASES}
+    assert per_database == {
+        "formula_1": 53,
+        "student_club": 47,
+        "thrombosis_prediction": 69,
+        "california_schools": 27,
+        "toxicology": 60,
+        "superhero": 44,
+    }
+    assert {q.db_id for q in first} == {"formula_1", "student_club"}
+    assert {q.db_id for q in second} == {"thrombosis_prediction", "california_schools", "toxicology"}
+    assert {q.db_id for q in third} == {"toxicology", "superhero"}
+    assert sum(1 for q in second if q.db_id == "toxicology") == 4, "the only database split between batches"
+
+
+def test_an_invocation_asks_the_next_n_unfinished_questions_in_asking_order(tmp_path, monkeypatch):
+    from evaluation.bird import runner
+
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    questions = dataset.run_order(
+        [_q("b", 4, "challenging"), _q("a", 1, "moderate"), _q("b", 3, "simple"), _q("a", 2, "simple"), _q("a", 5, "challenging")],
+        ["a", "b"],
+    )
+    run = runner.Run(runner.RunConfig(run_name="r", model="m", batch_size=2), object(), tmp_path)
+    run.questions = questions
+    assert [q.question_id for q in questions] == [2, 1, 5, 3, 4]
+    assert run.database_order == ["a", "b"]
+    assert [q.question_id for q in run.batch()] == [2, 1]
+
+    # question 2 has both arms' answers; question 1 only the raw arm's, so it is still owed one
+    run.done = {("raw", "a", 2): {}, ("semantic", "a", 2): {}, ("raw", "a", 1): {}}
+    assert [q.question_id for q in run.batch()] == [1, 5]
+
+    run.cfg.batch_size = None
+    assert [q.question_id for q in run.batch()] == [1, 5, 3, 4], "no batch size: everything that is left"
+    run.cfg.batch_size = 0
+    assert len(run.batch()) == 4
+
+    run.cfg.arms = ["raw"]
+    assert [q.question_id for q in run.outstanding()] == [5, 3, 4], "judged by the arms of this run"
+
+
+@needs_data
+def test_the_order_databases_are_listed_in_is_not_part_of_the_experiment(tmp_path, monkeypatch):
+    """Each database has its own session, so no answer depends on which one went first."""
+
+    from evaluation.bird import runner
+
+    listed = list(runner.RunConfig().databases)
+    reordered, narrower = tmp_path / "reordered", tmp_path / "narrower"
+    reordered.mkdir()
+    narrower.mkdir()
+
+    cfg = _started_under(reordered, monkeypatch, databases=list(reversed(listed)))
+    runner.Run(cfg, object(), reordered).prepare()  # accepted
+
+    cfg = _started_under(narrower, monkeypatch, databases=listed[:-1])
+    with pytest.raises(SystemExit) as refused:
+        runner.Run(cfg, object(), narrower).prepare()
+    assert "databases" in str(refused.value), "but drawing from other databases is a different experiment"
+
+
+def test_the_other_questions_are_every_question_the_earlier_run_did_not_ask():
+    pool = (
+        [_q("a", i, "simple") for i in range(1, 7)]
+        + [_q("b", i, "moderate") for i in range(7, 11)]
+        + [_q("c", 11, "simple")]
+    )
+    asked = {("a", 1), ("a", 3), ("b", 8)}
+
+    rest = dataset.rest_of(pool, asked, ["a", "b"], seed=0)
+
+    assert sorted((q.db_id, q.question_id) for q in rest) == [
+        ("a", 2), ("a", 4), ("a", 5), ("a", 6), ("b", 7), ("b", 9), ("b", 10),
+    ], "all that is left of the chosen databases, nothing of database c, nothing that was asked"
+    assert [q.question_id for q in dataset.rest_of(pool, asked, ["a", "b"], seed=0)] == [q.question_id for q in rest]
+    assert {q.question_id for q in dataset.rest_of(pool, asked, ["a", "b"], seed=1)} == {q.question_id for q in rest}
+    assert len(dataset.rest_of(pool, asked)) == len(pool) - len(asked), "no database list: every database"
+
+
+def _earlier_run(tmp_path, questions, records=(), **config):
+    """A run directory ``tmp_path/first`` that a later run can continue."""
+
+    from dataclasses import asdict
+
+    from evaluation.bird import runner
+
+    cfg = runner.RunConfig(run_name="first", model="m", **config)
+    first = tmp_path / "first"
+    first.mkdir()
+    (first / "questions.json").write_text(json.dumps([{"db_id": d, "question_id": q} for d, q in questions]))
+    (first / "config.json").write_text(
+        json.dumps(
+            {"config": asdict(cfg), "system_prompt_sha": runner._prompt_sha(), "question_count": len(questions)}
+        )
+    )
+    (first / "records.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+    return cfg
+
+
+def test_a_continuation_is_the_earlier_questions_followed_by_every_other_one(tmp_path, monkeypatch):
+    from evaluation.bird import runner
+
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    _earlier_run(tmp_path, [("a", 3), ("a", 1)])
+    pool = [_q("a", i, "simple") for i in range(1, 6)] + [_q("z", 9, "simple")]
+
+    cfg = runner.RunConfig(run_name="more", model="m", databases=["a"], continue_from="first")
+    drawn = runner.draw_questions(cfg, pool)
+    assert [q.question_id for q in drawn[:2]] == [3, 1], "the earlier run's questions, in the order it stored them"
+    assert sorted(q.question_id for q in drawn[2:]) == [2, 4, 5], "then every other question of the database, none of z"
+
+    cfg.limit = 1
+    assert len(runner.draw_questions(cfg, pool)) == 3, "limit keeps only the first N added questions"
+
+
+@needs_data
+def test_continuing_the_default_sample_gives_the_whole_dev_set_of_the_six_databases(tmp_path, monkeypatch):
+    from evaluation.bird import runner
+
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    examples = dataset.load_all()
+    bands = {"simple": 100, "moderate": 100, "challenging": 100}
+    sample = dataset.sample_by_difficulty(examples, bands, dataset.DEFAULT_DATABASES, seed=0)
+    _earlier_run(tmp_path, [(q.db_id, q.question_id) for q in sample])
+
+    drawn = runner.draw_questions(runner.RunConfig(run_name="more", model="m", continue_from="first"), examples)
+
+    assert len(drawn) == len({(q.db_id, q.question_id) for q in drawn}) == 858
+    assert [(q.db_id, q.question_id) for q in drawn[:300]] == [(q.db_id, q.question_id) for q in sample]
+
+
+@needs_data
+def test_a_continuation_needs_the_earlier_runs_settings_and_a_refused_one_leaves_nothing_behind(tmp_path, monkeypatch):
+    from evaluation.bird import runner
+
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    _earlier_run(tmp_path, [], use_evidence=False)
+
+    cfg = runner.RunConfig(run_name="more", model="m", continue_from="first")  # evidence on: not that run's
+    with pytest.raises(SystemExit) as refused:
+        runner.Run(cfg, object(), tmp_path).prepare()
+    assert "use_evidence" in str(refused.value) and "--no-evidence" in str(refused.value)
+    assert not (tmp_path / "more").exists(), "a refused continuation creates nothing"
+
+    cfg = runner.RunConfig(run_name="more", model="m", continue_from="never_started")
+    with pytest.raises(SystemExit) as refused:
+        runner.Run(cfg, object(), tmp_path).prepare()
+    assert "never_started" in str(refused.value) and not (tmp_path / "more").exists()
+
+
+@needs_data
+def test_a_continuation_and_a_resume_both_refuse_another_sql_prompt(tmp_path, monkeypatch):
+    """The two parts of a run are one experiment only if both arms were given the same prompt."""
+
+    from evaluation.bird import runner
+
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    _earlier_run(tmp_path, [])
+    stored = json.loads((tmp_path / "first" / "config.json").read_text())
+    stored["system_prompt_sha"] = "000000000000"
+    (tmp_path / "first" / "config.json").write_text(json.dumps(stored))
+
+    cfg = runner.RunConfig(run_name="more", model="m", continue_from="first")
+    with pytest.raises(SystemExit) as refused:
+        runner.Run(cfg, object(), tmp_path).prepare()
+    assert "SQL prompt" in str(refused.value) and not (tmp_path / "more").exists()
+
+    with pytest.raises(SystemExit) as refused:  # resuming "first" itself, begun under that other prompt
+        runner.Run(runner.RunConfig(run_name="first", model="m"), object(), tmp_path).prepare()
+    assert "another SQL prompt" in str(refused.value)
+
+
+@needs_data
+def test_a_continuation_carries_the_answers_in_and_leaves_the_earlier_run_untouched(tmp_path, monkeypatch):
+    import hashlib
+    import types
+
+    from evaluation.bird import runner
+
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(runner, "get_embedder", lambda: types.SimpleNamespace(name="stub"))
+    db = "superhero"
+    two = [e for e in dataset.load_all() if e.db_id == db][:2]
+    records = [
+        {"arm": arm, "db_id": db, "question_id": e.question_id, "correct": True, "example_saved": False}
+        for e in two
+        for arm in ("raw", "semantic")
+    ]
+    _earlier_run(tmp_path, [(db, e.question_id) for e in two], records, databases=[db])
+
+    def fingerprint():
+        return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((tmp_path / "first").iterdir())}
+
+    before = fingerprint()
+
+    run = runner.Run(
+        runner.RunConfig(run_name="more", model="m", databases=[db], continue_from="first", limit=3),
+        object(),
+        tmp_path,
+    )
+    run.prepare()
+
+    assert fingerprint() == before, "the earlier run's directory is not touched"
+    assert len(run.questions) == 5 and len(run.done) == 4, "its questions and its answers are both carried in"
+    owed = {q.question_id for q in run.outstanding()}
+    assert len(owed) == 3 and not owed & {e.question_id for e in two}, "only the added questions are still owed"
+    stored = json.loads((tmp_path / "more" / "config.json").read_text())
+    assert (stored["continued_from"], stored["carried_records"], stored["question_count"]) == ("first", 4, 5)
+
+    # resumed later without repeating --limit: the continuation's own quota flags are not part of its contract
+    again = runner.Run(runner.RunConfig(run_name="more", model="m", databases=[db]), object(), tmp_path)
+    again.prepare()
+    assert len(again.questions) == 5 and len(again.done) == 4
+
+
+@needs_data
+def test_the_default_sample_and_the_other_questions_are_the_whole_dev_set_of_the_six_databases():
+    from collections import Counter
+
+    examples = dataset.load_all()
+    databases = list(dataset.DEFAULT_DATABASES)
+    bands = {"simple": 100, "moderate": 100, "challenging": 100}
+    sample = dataset.sample_by_difficulty(examples, bands, databases, seed=0)
+    taken = {(q.db_id, q.question_id) for q in sample}
+    rest = dataset.rest_of(examples, taken, databases, seed=0)
+
+    assert len(sample) + len(rest) == len([e for e in examples if e.db_id in databases]) == 858
+    assert not taken & {(q.db_id, q.question_id) for q in rest}
+    assert dict(Counter(q.difficulty for q in rest)) == {"simple": 379, "moderate": 177, "challenging": 2}, (
+        "the 100 challenging questions of the sample are nearly all that these databases hold"
+    )
+    assert dict(Counter(q.db_id for q in rest)) == {
+        "formula_1": 121,
+        "student_club": 111,
+        "thrombosis_prediction": 94,
+        "california_schools": 62,
+        "toxicology": 85,
+        "superhero": 85,
+    }
+
+
+def test_a_layer_the_model_barely_wrote_is_refused_and_a_written_one_is_not():
+    from evaluation.bird import session_build
+
+    superhero = {"columns": 31, "described_by_model": 2, "labelled_by_model": 0}
+    with pytest.raises(session_build.BuildDegraded, match=r"only 2 of 31") as refused:
+        session_build.check_model_written("superhero", superhero, 0.5)
+    assert "--databases superhero --prepare-only --rebuild-sessions" in str(refused.value)
+    assert not isinstance(refused.value, session_build.StaleSession)
+
+    session_build.check_model_written("formula_1", {"columns": 94, "described_by_model": 94}, 0.5)
+    session_build.check_model_written("x", {"columns": 31, "described_by_model": 16}, 0.5)  # just over half
+    with pytest.raises(session_build.BuildDegraded):
+        session_build.check_model_written("x", {"columns": 31, "described_by_model": 15}, 0.5)
+    session_build.check_model_written("superhero", superhero, 0.0)  # switched off
+    session_build.check_model_written("empty", {"columns": 0, "described_by_model": 0}, 0.5)
+
+
+def test_a_degraded_or_stale_layer_stops_the_run_before_anything_is_asked(tmp_path, monkeypatch):
+    from evaluation.bird import runner, session_build
+
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path / "results")
+    work = tmp_path / "work"
+    work.mkdir()
+    good = {
+        "session_id": "s1",
+        "stage": "exported",
+        "data_revision": session_build.DATA_REVISION,
+        "model_written": {"columns": 94, "described_by_model": 94, "labelled_by_model": 70},
+    }
+    degraded = {**good, "session_id": "s2", "model_written": {"columns": 31, "described_by_model": 2, "labelled_by_model": 0}}
+    stale = {**good, "session_id": "s3", "data_revision": session_build.DATA_REVISION - 1}
+    unfinished = {"session_id": "s4", "stage": "ingested", "data_revision": session_build.DATA_REVISION}
+    (work / "sessions.json").write_text(
+        json.dumps({"formula_1": good, "superhero": degraded, "toxicology": stale, "thrombosis_prediction": unfinished})
+    )
+
+    run = runner.Run(runner.RunConfig(run_name="r", model="m"), object(), work)
+    run.questions = [
+        _q("formula_1", 1, "simple"),
+        _q("superhero", 2, "simple"),
+        _q("toxicology", 3, "simple"),
+        _q("thrombosis_prediction", 5, "simple"),
+        _q("student_club", 4, "simple"),
+    ]
+    problems = run.preflight()  # student_club has no layer yet: it is built, and judged, when its turn comes
+
+    assert len(problems) == 3
+    assert any("superhero" in p and "only 2 of 31" in p and "--rebuild-sessions" in p for p in problems)
+    assert any("toxicology" in p and "data revision" in p for p in problems)
+    assert any("thrombosis_prediction" in p and "never finished" in p and "'ingested'" in p for p in problems)
+
+    run.cfg.min_model_written = 0.0
+    assert len(run.preflight()) == 2, "the share check can be switched off; a stale or half-built layer cannot"
+    run.cfg.arms = ["raw"]
+    assert run.preflight() == [], "the raw arm uses no layer"
+
+
+def test_a_copy_of_the_records_is_kept_beside_them(tmp_path, monkeypatch):
+    from evaluation.bird import runner
+
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    run = runner.Run(runner.RunConfig(run_name="r", model="m"), object(), tmp_path)
+    run.dir.mkdir(parents=True)
+    assert run._snapshot("formula_1") is None, "nothing to copy before the first answer"
+
+    whole = [{"arm": "raw", "db_id": "a", "question_id": 1}, {"arm": "semantic", "db_id": "a", "question_id": 1}]
+    run.records_path.write_text("".join(json.dumps(r) + "\n" for r in whole) + '{"arm": "ra')  # last line cut short
+    run.done = {("raw", "a", 1): {}, ("semantic", "a", 1): {}}
+    copy = run._snapshot("formula_1")
+
+    assert copy.parent == run.dir / "checkpoints"
+    assert copy.read_text() == run.records_path.read_text()
+    assert "0002answers" in copy.name and copy.name.endswith("-formula_1.jsonl")
+    assert not list((run.dir / "checkpoints").glob("*.tmp")), "written whole or not at all"
+    assert len(report.load_records(copy)) == 2, "and a copy with a cut-short line still loads"
+
+
+def test_a_scope_can_keep_the_replies_and_errors_it_saw_in_full():
+    """The product logs the first 200 characters of a reply it cannot use; a build scope keeps all of it."""
+
+    meter = llm.UsageMeter()
+    system = [{"role": "system", "content": "You write one-sentence semantic descriptions of spreadsheet columns."}]
+    claude = _client(_Boom(400), _reply(content='{"columns": [{"table": "t", "name": "id", "description": "The "Good" one"}]}'), _reply())
+    llm.install_meter(claude, meter)
+
+    with meter.scope("build", capture=True) as kept:
+        with pytest.raises(_Boom):
+            claude._client.chat.completions.create(model="m", messages=system)
+        claude._client.chat.completions.create(model="m", messages=system)
+    with meter.scope("raw") as plain:
+        claude._client.chat.completions.create(model="m", messages=system)
+
+    assert [("error" in r) for r in kept.replies] == [True, False]
+    assert kept.replies[0]["error"].startswith("_Boom") and kept.replies[0]["call"].startswith("You write one-sentence")
+    assert kept.replies[1]["text"].endswith('"The "Good" one"}]}') and kept.replies[1]["finish_reason"] == "stop"
+    assert plain.replies == [], "nothing is kept unless the scope asks for it"
+    assert "replies" not in kept.to_dict(), "and the totals never carry them"
+
+
+def test_a_rejected_layer_leaves_the_models_replies_to_read(tmp_path):
+    from evaluation.bird import session_build
+
+    usage = llm.Usage()
+    usage.calls = 2
+    usage.replies = [{"call": "x", "error": "boom"}, {"call": "x", "finish_reason": "stop", "text": '{"columns": ['}]
+    path = session_build.save_replies(tmp_path, "superhero", "semantics", usage)
+
+    saved = json.loads(path.read_text())
+    assert path.parent == tmp_path / "build_failures" and path.name.startswith("superhero-semantics-")
+    assert saved["database"] == "superhero" and saved["calls"] == 2
+    assert saved["replies"][1]["text"] == '{"columns": ['
+
+
+def test_a_new_session_does_not_inherit_what_the_old_one_measured(tmp_path):
+    from evaluation.bird import session_build
+
+    session_build._update_manifest(
+        tmp_path, "superhero", session_id="old", stage="exported",
+        model_written={"columns": 31, "described_by_model": 2}, drift={"columns_drifted": 0}, build_usage={"total_tokens": 5},
+    )
+    entry = session_build._update_manifest(tmp_path, "superhero", replace=True, session_id="new", stage="created")
+
+    assert entry == {"session_id": "new", "stage": "created"}
+    assert session_build.read_manifest(tmp_path)["superhero"] == entry
+    merged = session_build._update_manifest(tmp_path, "superhero", stage="ingested")
+    assert merged == {"session_id": "new", "stage": "ingested"}, "later stages still merge"

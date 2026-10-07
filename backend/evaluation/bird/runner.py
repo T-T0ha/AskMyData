@@ -13,11 +13,25 @@ Re-running the same command resumes: finished (question, arm) pairs are skipped,
 and each database's saved-example store is rebuilt from ``records.jsonl`` so the
 semantic arm continues in exactly the state it stopped in.
 
+Order.  Questions are asked **database by database** — in the order the databases
+are listed — and inside a database **simple, then moderate, then challenging**.
+Both arms follow that order; a database is finished (and a copy of
+``records.jsonl`` kept under ``checkpoints/``) before the next one starts.  With
+``batch_size`` an invocation asks only the next ``batch_size`` unfinished questions
+and stops; the same command, run again, asks the next ones.
+
+Continuing.  ``continue_from="bird300"`` makes a new run that *is* that run, carried on: its
+results are copied in, every other question of the chosen databases is added (no difficulty
+quota), and the semantic arm's example store is rebuilt from the carried answers before the
+first added question — the same restore a resume does — so the added questions are asked
+with everything the earlier ones taught it.  The earlier run's directory is not touched.
+Together they are the whole dev set of those databases, each question once, in one run.
+
 Concurrency.  The raw arm's questions are independent and run across
 ``raw_workers`` threads.  The semantic arm is **stateful** — a question answered
-correctly becomes an example for the questions after it — so each database is
-one sequential lane in a fixed order (reproducible), and ``db_workers`` lanes run
-at once.
+correctly becomes an example for the questions after it — so a database is one
+sequential lane in that fixed order (reproducible).  ``db_workers`` databases are
+in flight at once; the default, 1, is strictly one database after another.
 """
 
 from __future__ import annotations
@@ -28,6 +42,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import threading
@@ -123,6 +138,12 @@ class RunConfig:
     max_extra_columns: int = metric.DEFAULT_MAX_EXTRA_COLUMNS
     sql_timeout: float = 30.0
     limit: int | None = None
+    #: The earlier run this one continues (not a setting of the experiment: how this run began,
+    #: and only read when it begins).  Its results are carried in and every other question of
+    #: ``databases`` is asked after them, with the examples its answers saved put back, so the two
+    #: are one run.  The experiment's settings must be the earlier run's; ``per_difficulty`` is
+    #: then taken from it, and ``limit`` keeps only the first N *added* questions (smoke tests).
+    continue_from: str | None = None
     #: What the pipeline does to the data (``session_build.DATA_REVISION``).  Part of
     #: the experiment: answers measured on one export are not comparable with answers
     #: measured on another, so a run is never resumed across a change to it.
@@ -134,8 +155,16 @@ class RunConfig:
     retrieval: dict[str, Any] = field(default_factory=retrieval_settings)
     # -- not part of the experiment's definition --
     raw_workers: int = 4
-    db_workers: int = 3
+    #: Databases in flight at once.  1 = one database finishes before the next starts.
+    db_workers: int = 1
     max_infra_failures: int = 6
+    #: Ask at most this many more questions in this invocation (both arms each), then
+    #: stop; ``None`` asks everything that is left.  Where one invocation stops and the
+    #: next begins changes no answer, so it is not part of the experiment's definition.
+    batch_size: int | None = None
+    #: Smallest share of a semantic layer's column descriptions the model must have
+    #: written (``session_build.check_model_written``); 0 accepts any layer.
+    min_model_written: float = session_build.DEFAULT_MIN_MODEL_WRITTEN
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +194,58 @@ def _atomic_write(path: Path, payload: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, default=str))
     os.replace(tmp, path)
+
+
+def _comparable(key: str, value: Any) -> Any:
+    """A stored setting in the form the resume contract compares it in.
+
+    Which databases a run draws from is part of the experiment; the *order* they are
+    listed in is not — each has its own session, so no answer depends on which
+    database went first.  Changing the order between two invocations is allowed.
+    """
+
+    if key == "databases" and isinstance(value, list):
+        return sorted(value)
+    return value
+
+
+def _prompt_sha() -> str:
+    """A short fingerprint of the SQL prompt both arms are given."""
+
+    return hashlib.sha256(SQL_SYSTEM_PROMPT.encode()).hexdigest()[:12]
+
+
+def _changed_settings(old: dict[str, Any], new: dict[str, Any], ignore: tuple[str, ...] = ()) -> dict[str, tuple]:
+    """The settings of the experiment on which two configs disagree: ``{key: (old, new)}``."""
+
+    return {
+        k: (old.get(k), new.get(k))
+        for k in CONDITION_KEYS
+        if k not in ignore and _comparable(k, old.get(k)) != _comparable(k, new.get(k))
+    }
+
+
+def _read_questions(run_name: str, examples: list[dataset.BirdExample]) -> list[dataset.BirdExample]:
+    """The questions an earlier run asked, in the order it stored them."""
+
+    by_id = {(e.db_id, e.question_id): e for e in examples}
+    rows = json.loads((RESULTS_DIR / run_name / "questions.json").read_text())
+    return [by_id[(row["db_id"], row["question_id"])] for row in rows]
+
+
+def draw_questions(cfg: RunConfig, examples: list[dataset.BirdExample]) -> list[dataset.BirdExample]:
+    """The questions a new run asks, before the asking order is applied.
+
+    A fresh run draws its quota of each difficulty.  A continuation is the earlier run's
+    questions, as they were stored, followed by every other question of the databases.
+    """
+
+    if cfg.continue_from:
+        earlier = _read_questions(cfg.continue_from, examples)
+        added = dataset.rest_of(examples, {(e.db_id, e.question_id) for e in earlier}, cfg.databases, cfg.seed)
+        return earlier + (added[: cfg.limit] if cfg.limit else added)
+    sample = dataset.sample_by_difficulty(examples, cfg.per_difficulty, cfg.databases, cfg.seed)
+    return sample[: cfg.limit] if cfg.limit else sample  # a random subset: taken before the ordering
 
 
 def _install_query_timeouts(paths: dict[str, Path], timeout: float) -> None:
@@ -264,16 +345,74 @@ class Run:
             self.stop.set()
 
     # -- setup ---------------------------------------------------------------
+    def _check_continuation(self, name: str) -> dict[str, Any]:
+        """The earlier run's ``config.json`` if this run may continue it; otherwise ``SystemExit``.
+
+        Everything is judged before anything is created, so a refused continuation leaves no
+        half-made run behind.  The two parts are one experiment only if every setting that
+        decides what an answer means is the same, including the SQL prompt.
+        """
+
+        source = RESULTS_DIR / name
+        if not ((source / "config.json").exists() and (source / "questions.json").exists()):
+            raise SystemExit(
+                f"--continue-from {name!r}: {source} has no config.json and questions.json, so there is "
+                "nothing to continue. Name a run that has been started."
+            )
+        earlier = json.loads((source / "config.json").read_text())
+        old = earlier["config"]
+        changed = _changed_settings(old, asdict(self.cfg), ignore=("per_difficulty", "limit"))
+        if changed:
+            lines = "\n".join(f"  {k}: '{name}' has {a!r}, this command gives {b!r}" for k, (a, b) in changed.items())
+            hint = ""
+            if {"data_revision", "retrieval"} & set(changed):
+                hint = (
+                    "\nThe pipeline itself changed since that run (data revision or retrieval settings): "
+                    "its answers cannot be continued, start a fresh run instead."
+                )
+            raise SystemExit(
+                f"--continue-from {name!r}: a continuation is one run, so it needs that run's settings, "
+                f"and these differ:\n{lines}{hint}\n"
+                "Give the flags that run was started with (for one made with --no-evidence, add --no-evidence)."
+            )
+        then = earlier.get("system_prompt_sha")
+        if then and then != _prompt_sha():
+            raise SystemExit(
+                f"--continue-from {name!r}: the SQL prompt has changed since that run (then {then}, now "
+                f"{_prompt_sha()}), so the two parts would not be one experiment. Start a fresh run."
+            )
+        self.cfg.per_difficulty = dict(old.get("per_difficulty") or {})  # that run's quota; it draws nothing here
+        return earlier
+
+    def _carry_records(self, name: str) -> int:
+        """Put the earlier run's results into this run's ``records.jsonl``: clean lines, written atomically."""
+
+        records = report.load_records(RESULTS_DIR / name / "records.jsonl")
+        tmp = self.records_path.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for record in records:
+                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.records_path)
+        return len(records)
+
     def prepare(self) -> None:
-        self.dir.mkdir(parents=True, exist_ok=True)
         config_path = self.dir / "config.json"
         questions_path = self.dir / "questions.json"
         stored = json.loads(config_path.read_text()) if config_path.exists() else None
+        earlier = (
+            self._check_continuation(self.cfg.continue_from)
+            if stored is None and self.cfg.continue_from
+            else None
+        )
+        self.dir.mkdir(parents=True, exist_ok=True)
 
         if stored is not None:
             old = stored["config"]
-            new = asdict(self.cfg)
-            changed = {k: (old.get(k), new.get(k)) for k in CONDITION_KEYS if old.get(k) != new.get(k)}
+            changed = _changed_settings(
+                old, asdict(self.cfg), ignore=("per_difficulty", "limit") if old.get("continue_from") else ()
+            )
             if changed:
                 lines = "\n".join(f"  {k}: stored {a!r}, now {b!r}" for k, (a, b) in changed.items())
                 hint = ""
@@ -294,18 +433,28 @@ class Run:
                     f"run '{self.cfg.run_name}' already exists with different settings:\n{lines}{hint}\n"
                     "Use the same settings to resume it, or pick a new --run-name."
                 )
+            then = stored.get("system_prompt_sha")
+            if then and then != _prompt_sha():
+                raise SystemExit(
+                    f"run '{self.cfg.run_name}' was begun under another SQL prompt (then {then}, now "
+                    f"{_prompt_sha()}): the answers already on disk and the ones asked now would not be one "
+                    "experiment. Start a new run (a new --run-name), or put the prompt back."
+                )
             sample = json.loads(questions_path.read_text())
             by_id = {(e.db_id, e.question_id): e for e in dataset.load_all()}
-            self.questions = [by_id[(row["db_id"], row["question_id"])] for row in sample]
+            # Ordered afresh: a run begun before questions were asked database by
+            # database stored them in a shuffle, and still finishes in the new order.
+            self.questions = dataset.run_order(
+                [by_id[(row["db_id"], row["question_id"])] for row in sample], self.cfg.databases
+            )
             self.log(f"resuming run '{self.cfg.run_name}' ({len(self.questions)} questions)")
         else:
             examples = dataset.load_all()
-            sample = dataset.sample_by_difficulty(
-                examples, self.cfg.per_difficulty, self.cfg.databases, self.cfg.seed
-            )
-            if self.cfg.limit:
-                sample = sample[: self.cfg.limit]
+            sample = dataset.run_order(draw_questions(self.cfg, examples), self.cfg.databases)
             self.questions = sample
+            # The carried results first and the config last: the config's existence is what
+            # makes this a run, so an interruption before it simply starts the copy again.
+            carried = self._carry_records(self.cfg.continue_from) if earlier is not None else 0
             _atomic_write(
                 questions_path,
                 [
@@ -328,7 +477,7 @@ class Run:
                     "git_commit": _git_commit(),
                     "python": platform.python_version(),
                     "embedder": get_embedder().name,
-                    "system_prompt_sha": hashlib.sha256(SQL_SYSTEM_PROMPT.encode()).hexdigest()[:12],
+                    "system_prompt_sha": _prompt_sha(),
                     "question_count": len(sample),
                     "by_difficulty": {
                         d: sum(1 for e in sample if e.difficulty == d) for d in dataset.DIFFICULTIES
@@ -337,9 +486,25 @@ class Run:
                         db: sum(1 for e in sample if e.db_id == db)
                         for db in sorted({e.db_id for e in sample})
                     },
+                    **(
+                        {
+                            "continued_from": self.cfg.continue_from,
+                            "carried_records": carried,
+                            "carried_questions": earlier.get("question_count"),
+                        }
+                        if earlier is not None
+                        else {}
+                    ),
                 },
             )
-            self.log(f"new run '{self.cfg.run_name}': {len(sample)} questions")
+            if earlier is not None:
+                self.log(
+                    f"new run '{self.cfg.run_name}': the continuation of '{self.cfg.continue_from}' — "
+                    f"{carried} of its answers carried in, {len(sample)} questions in all "
+                    f"({len(sample) - int(earlier.get('question_count') or 0)} added)"
+                )
+            else:
+                self.log(f"new run '{self.cfg.run_name}': {len(sample)} questions, sampled")
 
         self.done = {
             (r["arm"], r["db_id"], r["question_id"]): r for r in report.load_records(self.records_path)
@@ -353,6 +518,61 @@ class Run:
 
     def pending(self, arm: str) -> list[dataset.BirdExample]:
         return [q for q in self.questions if (arm, q.db_id, q.question_id) not in self.done]
+
+    @property
+    def database_order(self) -> list[str]:
+        """The databases of the run, in the order they are asked."""
+
+        return list(dict.fromkeys(q.db_id for q in self.questions))
+
+    def outstanding(self) -> list[dataset.BirdExample]:
+        """Questions some arm has still to answer, in the order they are asked."""
+
+        return [
+            q
+            for q in self.questions
+            if any((arm, q.db_id, q.question_id) not in self.done for arm in self.cfg.arms)
+        ]
+
+    def batch(self) -> list[dataset.BirdExample]:
+        """What this invocation asks: the next ``batch_size`` outstanding questions, or all of them."""
+
+        left = self.outstanding()
+        size = self.cfg.batch_size
+        return left[:size] if size and size > 0 else left
+
+    def preflight(self) -> list[str]:
+        """Reasons not to start, found before a single question is asked or token spent.
+
+        A semantic layer built under an older data revision, or one the model barely
+        wrote, is found here for *every* database of the run — not hours later, when
+        the lane that needs it finally starts.
+        """
+
+        if "semantic" not in self.cfg.arms:
+            return []
+        manifest = session_build.read_manifest(self.work)
+        problems: list[str] = []
+        for db_id in self.database_order:
+            entry = manifest.get(db_id)
+            if not entry:
+                continue  # not built yet: built (and judged) when its lane starts
+            if entry.get("session_id") and entry.get("stage") != "exported":
+                # A build that was interrupted or rejected.  Left to its lane it would be
+                # finished (and could fail again) hours into the run, after the other
+                # databases had been paid for.
+                problems.append(
+                    f"{db_id}: its semantic layer was never finished (built as far as "
+                    f"'{entry.get('stage')}'). Finish it first, so it is judged before any question "
+                    f"is asked:\n    python -m evaluation.bird.run_eval --databases {db_id} "
+                    "--prepare-only --min-model-written 0.9"
+                )
+                continue
+            try:
+                session_build.check_layer(db_id, entry, self.cfg.min_model_written)
+            except session_build.BuildDegraded as exc:
+                problems.append(str(exc))
+        return problems
 
     # -- record assembly -------------------------------------------------
     def _base_record(
@@ -499,9 +719,19 @@ class Run:
             return str(exc)
         return None
 
-    def semantic_lane(self, db_id: str) -> None:
+    def semantic_lane(self, db_id: str, only: list[dataset.BirdExample] | None = None) -> None:
+        """Ask ``only`` (default: everything still unasked) of ``db_id``, one after another.
+
+        ``lane`` is the database's whole share of the run, in asking order: the saved
+        examples of *all* of its earlier answers are put back before the first question,
+        whichever invocation gave them, so a batch boundary never changes what the
+        model is shown.
+        """
+
         lane = [q for q in self.questions if q.db_id == db_id]
-        if not [q for q in lane if ("semantic", db_id, q.question_id) not in self.done]:
+        asked = lane if only is None else only
+        todo = [q for q in asked if ("semantic", db_id, q.question_id) not in self.done]
+        if not todo:
             return
         if self.stop.is_set():
             return
@@ -513,6 +743,7 @@ class Run:
                 work=self.work,
                 log=self.log,
                 rebuild=self.rebuild,
+                min_model_written=self.cfg.min_model_written,
             )
         except CreditsExhausted as exc:
             self.fatal = str(exc)
@@ -528,7 +759,7 @@ class Run:
         if in_store:
             self.log(f"[{db_id}] restored {in_store} saved example(s) from earlier in this run")
 
-        for q in lane:
+        for q in todo:
             if self.stop.is_set():
                 return
             if ("semantic", db_id, q.question_id) in self.done:
@@ -685,32 +916,110 @@ class Run:
         return record
 
     # -- driving ---------------------------------------------------------
+    def _announce(self, batch: list[dataset.BirdExample], outstanding: int) -> None:
+        """What this invocation will ask, database by database, before anything is spent."""
+
+        batch_note = f"batch of {self.cfg.batch_size}" if self.cfg.batch_size else "no batch limit"
+        self.log(
+            f"this invocation asks {len(batch)} of the {outstanding} outstanding questions "
+            f"({batch_note}), both arms, in this order:"
+        )
+        for db_id in dict.fromkeys(q.db_id for q in batch):
+            of_db = [q for q in batch if q.db_id == db_id]
+            bands = ", ".join(
+                f"{sum(1 for q in of_db if q.difficulty == d)} {d}"
+                for d in dataset.DIFFICULTIES
+                if any(q.difficulty == d for q in of_db)
+            )
+            self.log(f"    {db_id:<22} {len(of_db):>3}   ({bands})")
+
+    def run_database(
+        self, db_id: str, todo: dict[str, list[dataset.BirdExample]], raw_pool: ThreadPoolExecutor
+    ) -> None:
+        """Both arms over this invocation's questions of one database, then a checkpoint copy.
+
+        The raw arm's questions are queued in asking order across ``raw_workers``
+        threads while the semantic lane works through the same questions one by one;
+        the unit is over only when both are, so the next database never starts early.
+        """
+
+        raw = [q for q in todo.get("raw", []) if q.db_id == db_id]
+        semantic = [q for q in todo.get("semantic", []) if q.db_id == db_id]
+        self.log(f"[{db_id}] starting — {len(raw)} raw, {len(semantic)} semantic question(s)")
+        raw_futures = [raw_pool.submit(self._guard, self.raw_question, q) for q in raw]
+        try:
+            if semantic:
+                self._guard(self.semantic_lane, db_id, semantic)
+        finally:
+            wait(raw_futures)
+        left = sum(
+            1
+            for arm, questions in todo.items()
+            for q in questions
+            if q.db_id == db_id and (arm, db_id, q.question_id) not in self.done
+        )
+        saved = self._snapshot(db_id)
+        self.log(
+            f"[{db_id}] "
+            + ("finished" if not left else f"stopped with {left} answer(s) still to get")
+            + (f"; records copied to {saved.relative_to(self.dir)}" if saved else "")
+        )
+
+    def _snapshot(self, tag: str) -> Path | None:
+        """A second copy of every answer so far, kept beside ``records.jsonl``.
+
+        ``records.jsonl`` is already durable — each answer is appended and fsynced the
+        moment it exists — so this is not what makes a crash survivable.  It is what
+        makes the *file* survivable: an edit, a bad merge or a deleted line has a copy
+        from the end of the last database to go back to.  ``checkpoints/`` is written
+        atomically and never pruned.
+        """
+
+        if not self.records_path.exists():
+            return None
+        folder = self.dir / "checkpoints"
+        folder.mkdir(exist_ok=True)
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        with self._io_lock:
+            answers = len(self.done)
+            target = folder / f"records-{stamp}-{answers:04d}answers-{tag}.jsonl"
+            tmp = target.with_suffix(".tmp")
+            shutil.copyfile(self.records_path, tmp)
+            os.replace(tmp, target)
+        return target
+
     def run(self) -> int:
         self.prepare()
         arms = self.cfg.arms
-        todo = {arm: self.pending(arm) for arm in arms}
-        self.log("pending: " + ", ".join(f"{arm} {len(todo[arm])}" for arm in arms))
+        batch = self.batch()
+        todo = {
+            arm: [q for q in batch if (arm, q.db_id, q.question_id) not in self.done] for arm in arms
+        }
+        self.log("pending: " + ", ".join(f"{arm} {len(self.pending(arm))}" for arm in arms))
         if not any(todo.values()):
             self.log("nothing left to do")
             return 0
 
-        # Longest lanes first: with fewer workers than databases, the biggest
-        # database must not be the one left to start last.
-        remaining = [q.db_id for q in todo.get("semantic", [])]
-        sem_dbs = sorted(set(remaining), key=lambda db: (-remaining.count(db), db))
+        problems = self.preflight()
+        if problems:
+            self.log("NOT STARTED — nothing was asked and nothing was spent:\n  " + "\n  ".join(problems))
+            return 1
+        self._announce(batch, len(self.outstanding()))
+
+        # One unit per database, in asking order.  With ``db_workers`` = 1 the next
+        # database starts only when the previous one has finished both arms.
+        databases = [db for db in self.database_order if any(q.db_id == db for q in batch)]
         futures = []
-        sem_pool = ThreadPoolExecutor(max_workers=max(1, self.cfg.db_workers), thread_name_prefix="semantic")
+        unit_pool = ThreadPoolExecutor(max_workers=max(1, self.cfg.db_workers), thread_name_prefix="database")
         raw_pool = ThreadPoolExecutor(max_workers=max(1, self.cfg.raw_workers), thread_name_prefix="raw")
         interrupted = False
         try:
-            if sem_dbs:
+            if todo.get("semantic"):
                 # the export path is looked up per question through this map; lanes
                 # fill it in as they finish building their database
                 _install_query_timeouts(self._export_paths, self.cfg.sql_timeout)
-            for db_id in sem_dbs:
-                futures.append(sem_pool.submit(self._guard, self.semantic_lane, db_id))
-            for q in todo.get("raw", []):
-                futures.append(raw_pool.submit(self._guard, self.raw_question, q))
+            for db_id in databases:
+                futures.append(unit_pool.submit(self._guard, self.run_database, db_id, todo, raw_pool))
             pending = set(futures)
             while pending:
                 try:
@@ -726,9 +1035,9 @@ class Run:
                         "immediately). Progress is saved."
                     )
         finally:
-            sem_pool.shutdown(wait=True)
+            unit_pool.shutdown(wait=True)
             raw_pool.shutdown(wait=True)
-        return self.finish(interrupted)
+        return self.finish(interrupted, batch)
 
     def build_only(self) -> int:
         """Build (or finish building) every database's semantic layer and stop.
@@ -749,6 +1058,7 @@ class Run:
                     work=self.work,
                     log=self.log,
                     rebuild=self.rebuild,
+                    min_model_written=self.cfg.min_model_written,
                 ): db_id
                 for db_id in databases
             }
@@ -776,8 +1086,23 @@ class Run:
             self.problems.append(f"{fn.__name__}{args!r}: {type(exc).__name__}: {exc}")
             self.log(f"{fn.__name__}{args!r} failed:\n{traceback.format_exc()}")
 
-    def finish(self, interrupted: bool) -> int:
+    def finish(self, interrupted: bool, batch: list[dataset.BirdExample] | None = None) -> int:
+        """Write the reports and say what is left.
+
+        Exit codes: 0 — everything this invocation set out to ask has an answer (more
+        batches may remain; that is not a failure); 2 — it stopped short (credit, an
+        API failure, an interrupt, a layer that would not build), so the same command
+        should be run again.
+        """
+
+        asked = self.questions if batch is None else batch
         outstanding = {arm: len(self.pending(arm)) for arm in self.cfg.arms}
+        batch_left = sum(
+            1
+            for q in asked
+            for arm in self.cfg.arms
+            if (arm, q.db_id, q.question_id) not in self.done
+        )
         builds = session_build.read_manifest(self.work)
         _atomic_write(
             self.dir / "build.json",
@@ -786,17 +1111,37 @@ class Run:
         _atomic_write(self.dir / "usage.json", self.meter.totals())
         summary = report.write_outputs(self.dir)
         print("\n" + report.render(summary))
+        saved = self._snapshot("interrupted" if interrupted else "end")
         total_left = sum(outstanding.values())
         elapsed = time.monotonic() - self._started
         self.log(f"session wall time {elapsed / 60:.1f} min; results in {self.dir}")
+        if saved:
+            self.log(f"records copied to {saved.relative_to(self.dir)}")
         if self.problems:
             self.log("problems:\n  " + "\n  ".join(self.problems))
         if self.fatal:
             self.log(f"STOPPED: {self.fatal}")
-        if total_left:
+        if batch_left:
             self.log(
-                f"{total_left} (question, arm) pairs still to do ({outstanding}). Re-run the same "
-                f"command to continue from where this stopped."
+                f"{batch_left} (question, arm) pairs of this invocation are still unanswered "
+                f"({outstanding} left in the run). Fix what is reported above, then re-run the "
+                "same command to continue from where this stopped."
             )
             return 2
+        if total_left:
+            by_database = {
+                db: sum(
+                    1
+                    for q in self.outstanding()
+                    if q.db_id == db
+                )
+                for db in self.database_order
+            }
+            self.log(
+                f"this invocation is complete. {len(self.outstanding())} question(s) are still to ask "
+                f"({', '.join(f'{db} {n}' for db, n in by_database.items() if n)}). "
+                "Run the same command again for the next batch."
+            )
+            return 0
+        self.log("the run is complete — every question has an answer from every arm.")
         return 0

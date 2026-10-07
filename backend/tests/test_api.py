@@ -375,6 +375,53 @@ def test_rejecting_every_candidate_falls_back_to_a_synthetic_key(client, messy_w
     assert synthetic[0]["params"]["column"] == "row_id"
 
 
+def test_an_approved_row_id_becomes_the_key_and_stops_being_one_when_it_is_gone(
+    client, messy_workbook
+):
+    """The cleaning graph adds the column; the key the export reads lives here.
+
+    Without the two being joined up, a table that took the row_id offer was
+    still exported with "no primary key".
+    """
+
+    from app.cleaning.store import get_store
+
+    session_id = _create_session(client)
+    _upload(client, session_id, messy_workbook)
+    client.post(f"/api/sessions/{session_id}/tables/line_items/key", json={"columns": []})
+    client.post(f"/api/sessions/{session_id}/semantics")
+    plan = client.post(f"/api/sessions/{session_id}/cleaning/start").json()["pending"]["plan"]
+    synthetic = [s for s in plan if s["type"] == "add_synthetic_key" and s["table"] == "line_items"]
+
+    state = client.post(
+        f"/api/sessions/{session_id}/cleaning/plan",
+        json={"action": "confirm", "plan": synthetic},
+    ).json()
+    assert state["pending"]["kind"] == "step_validation"
+
+    def line_items():
+        sheets = client.get(f"/api/sessions/{session_id}/triage").json()["sheets"]
+        return next(s for s in sheets if s["table_name"] == "line_items")
+
+    # Executed but not yet approved: a revert is still one click away.
+    assert line_items()["key_analysis"]["primary_key"] == []
+
+    client.post(f"/api/sessions/{session_id}/cleaning/step", json={"action": "approve"})
+    adopted = line_items()
+    assert adopted["key_analysis"]["primary_key"] == ["row_id"]
+    assert adopted["key_analysis"]["source"] == "synthetic"
+    assert adopted["key_analysis"]["needs_synthetic_key"] is False
+    assert not [i for i in adopted["issues"] if i["code"] == "no_primary_key"]
+
+    store = get_store(session_id)
+    store.put("line_items", store.get("line_items").drop(columns="row_id"))
+    client.get(f"/api/sessions/{session_id}/cleaning/state")
+    withdrawn = line_items()
+    assert withdrawn["key_analysis"]["primary_key"] == []
+    assert withdrawn["key_analysis"]["needs_synthetic_key"] is True
+    assert [i for i in withdrawn["issues"] if i["code"] == "no_primary_key"]
+
+
 def test_a_confirmed_equivalence_is_a_relationship_not_a_merge(client, messy_workbook):
     """orders.cust_id ~ customers.customer_id is a foreign key, not a join.
 

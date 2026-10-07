@@ -1,0 +1,57 @@
+{
+  "config": {
+    "run_name": "smoke12b",
+    "seed": 0,
+    "per_difficulty": {
+      "simple": 4,
+      "moderate": 4,
+      "challenging": 4
+    },
+    "databases": [
+      "toxicology",
+      "thrombosis_prediction",
+      "superhero",
+      "formula_1",
+      "student_club",
+      "california_schools"
+    ],
+    "arms": [
+      "raw",
+      "semantic"
+    ],
+    "model": "google/gemini-3.5-flash-lite",
+    "max_attempts": 3,
+    "max_tokens": 8192,
+    "reasoning_effort": "medium",
+    "compact": true,
+    "product_gates": false,
+    "save_examples": true,
+    "save_on": "relaxed",
+    "primary_metric": "relaxed",
+    "max_extra_columns": 3,
+    "sql_timeout": 30.0,
+    "limit": null,
+    "data_revision": 3,
+    "raw_workers": 4,
+    "db_workers": 3,
+    "max_infra_failures": 6
+  },
+  "created_at": "2026-10-05T14:00:04+00:00",
+  "git_commit": "9512e25",
+  "python": "3.12.1",
+  "embedder": "sentence-transformers/all-MiniLM-L6-v2",
+  "system_prompt_sha": "ac5c207c7f2a",
+  "question_count": 12,
+  "by_difficulty": {
+    "simple": 4,
+    "moderate": 4,
+    "challenging": 4
+  },
+  "by_database": {
+    "formula_1": 3,
+    "student_club": 2,
+    "superhero": 2,
+    "thrombosis_prediction": 2,
+    "toxicology": 3
+  }
+}
