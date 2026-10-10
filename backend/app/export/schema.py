@@ -407,15 +407,36 @@ def _sql_type_of(spec: TableSpec, column_name: str) -> TypeEngine:
 
 
 def _storage_kind(sql_type: TypeEngine) -> str:
-    """Which family a database sorts a column into when it compares two of them."""
+    """Which family a database sorts a column into when it compares two of them.
+
+    These are the families PostgreSQL has equality operators *across*: SMALLINT,
+    INTEGER and BIGINT compare with one another, and so do the floating-point
+    types, but INTEGER and NUMERIC do not, and a constraint needs that
+    operator.  A ``WHERE`` can still compare them by casting; a foreign key
+    cannot.  (``Float`` is a ``Numeric`` in SQLAlchemy, so it is asked first.)
+    """
 
     if isinstance(sql_type, Boolean):
         return "boolean"
-    if isinstance(sql_type, (Integer, Numeric, Float)):
-        return "number"
+    if isinstance(sql_type, Integer):
+        return "integer"
+    if isinstance(sql_type, Float):
+        return "float"
+    if isinstance(sql_type, Numeric):
+        return "numeric"
     if isinstance(sql_type, (DateTime, Date)):
         return "time"
     return "text"
+
+
+_KIND_NAMES = {
+    "boolean": "a boolean",
+    "integer": "an integer",
+    "numeric": "a decimal",
+    "float": "a float",
+    "time": "a date",
+    "text": "text",
+}
 
 
 def _apply_foreign_keys(
@@ -464,15 +485,16 @@ def _apply_foreign_keys(
                 "a foreign key can only point at a key"
             )
         elif _storage_kind(child_type) != _storage_kind(parent_type):
-            # PostgreSQL refuses to create a constraint between a number and a
-            # text column.  The reference is still true, so it stays in the
-            # semantic layer and Phase 5 can join on it; it just is not a
-            # constraint.
+            # PostgreSQL refuses to create a constraint between an integer and
+            # a decimal, or a number and a text column.  The reference is
+            # still true, so it stays in the semantic layer and Phase 5 can
+            # join on it; it just is not a constraint.
             fk.enforced = False
             fk.reason = (
                 f"{child_spec.name}.{child_column} is {render_type(child_type)} but "
                 f"{parent_spec.name}.{parent_column} is {render_type(parent_type)}, and a "
-                "database cannot enforce a reference between a number and text"
+                f"database cannot enforce a reference between {_KIND_NAMES[_storage_kind(child_type)]} "
+                f"and {_KIND_NAMES[_storage_kind(parent_type)]}"
             )
         else:
             holds, reason = _reference_holds(

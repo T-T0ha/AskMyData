@@ -24,7 +24,13 @@ import pandas as pd
 
 from app.core.config import get_settings
 from app.core.schemas import ColumnType
-from app.ingestion.cleaning import DATE_FORMATS, _to_float, try_parse_date
+from app.ingestion.cleaning import (
+    DATE_FORMATS,
+    ZERO_PADDED_SHARE,
+    _to_float,
+    is_zero_padded,
+    try_parse_date,
+)
 
 BOOLEAN_TRUE = frozenset({"true", "t", "yes", "y", "1", "1.0", "on", "active", "enabled"})
 BOOLEAN_FALSE = frozenset({"false", "f", "no", "n", "0", "0.0", "off", "inactive", "disabled"})
@@ -162,9 +168,12 @@ def _is_identifier(
     total = len(text_values)
 
     # Digit strings that keep a leading zero are codes, not quantities: no one
-    # writes the number 1711223344 as "01711223344".
-    zero_padded = [v for v in text_values if len(v) > 1 and v[0] == "0" and v.isdigit()]
-    if len(zero_padded) / total > 0.5:
+    # writes the number 1711223344 as "01711223344".  The bar is ingestion's,
+    # because ingestion kept these values as text for exactly this reason; a
+    # higher bar here (half the values) once typed zip codes as integers — a
+    # third of them start with 0 — and the export stored them without the zero.
+    zero_padded = [v for v in text_values if is_zero_padded(v)]
+    if len(zero_padded) / total > ZERO_PADDED_SHARE:
         return TypeDecision(
             ColumnType.IDENTIFIER,
             0.9,

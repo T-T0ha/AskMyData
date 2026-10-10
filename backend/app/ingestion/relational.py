@@ -44,6 +44,7 @@ from sqlalchemy import MetaData, Table, UniqueConstraint, create_engine, func, s
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import URL, make_url
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.types import BINARY, VARBINARY, LargeBinary
 
 from app.core.config import get_settings
 from app.core.schemas import SheetIssue, TriageStatus
@@ -380,14 +381,29 @@ def inspect_source(raw_url: str, kind: str | None = None) -> SourceInspection:
 # ---------------------------------------------------------------------------
 
 
+#: Column types that hold files and images (``bytea``, ``BLOB``, ``VARBINARY``).
+BINARY_TYPES = (LargeBinary, BINARY, VARBINARY)
+
+
+def _binary_columns(table: Table) -> list[str]:
+    """Source names of the columns that hold binary data."""
+
+    return [str(c.name) for c in table.columns if isinstance(c.type, BINARY_TYPES)]
+
+
 def _read_table(engine: Engine, table: Table, row_limit: int) -> tuple[pd.DataFrame, bool]:
     """Read up to ``row_limit`` rows.  Returns the frame and a truncation flag.
 
     One row beyond the limit is requested so truncation is *known* rather than
     guessed from a count that may have changed since it was taken.
+
+    Binary columns are not selected: a photo or a PDF cannot be profiled,
+    described, embedded or queried, and pulling every blob across the wire
+    only to discard it would make the read as heavy as the files are large.
     """
 
-    statement = select(table).limit(row_limit + 1)
+    columns = [c for c in table.columns if not isinstance(c.type, BINARY_TYPES)]
+    statement = select(*columns).limit(row_limit + 1)
     with engine.connect() as connection:
         frame = pd.read_sql_query(statement, connection)
     truncated = len(frame) > row_limit
@@ -460,6 +476,9 @@ def _load_one_table(
     from app.ingestion.loader import SheetLoadResult
 
     table, info = _reflect_table(engine, name, schema)
+    binary = set(_binary_columns(table))
+    if binary and len(binary) == len(table.columns):
+        raise SourceError(f"'{name}' holds only binary columns, so there is nothing to analyse")
     frame, truncated = _read_table(engine, table, row_limit)
 
     rename = {
@@ -478,7 +497,7 @@ def _load_one_table(
         header_rows=[],
         data_start_row=1,
         columns=[str(c) for c in cleaned.columns],
-        original_labels=[[c.source_name] for c in info.columns],
+        original_labels=[[c.source_name] for c in info.columns if c.source_name not in binary],
         confidence=1.0,
         notes=[f"column names and types came from the {kind} schema"],
     )
@@ -487,6 +506,17 @@ def _load_one_table(
     # against the rows that arrived, because a dump can lose its constraints.
     keys = discover_keys(cleaned, declared_primary_key=info.primary_key)
     triage, issues = triage_sheet(cleaned, header, reports, keys)
+    if binary:
+        skipped = [c.name for c in info.columns if c.source_name in binary]
+        issues.append(
+            SheetIssue(
+                "binary_columns_skipped",
+                "info",
+                f"Binary column(s) {', '.join(skipped)} in '{name}' were left out: images and "
+                "files cannot be profiled or queried. They stay listed in the source schema.",
+                columns=skipped,
+            )
+        )
     if truncated:
         issues.append(
             SheetIssue(

@@ -48,6 +48,9 @@ def _json_safe(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, float):
         return _clean_number(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        # A blob is not JSON, and its bytes say nothing a reader could use.
+        return f"<binary, {len(value):,} bytes>"
     return value
 
 

@@ -170,6 +170,34 @@ def is_null_token(value: Any) -> bool:
     return False
 
 
+#: Share of zero-padded digit strings above which a column holds codes, not
+#: numbers.  Ingestion keeps such a column as text, and every later phase has
+#: to read it the same way — a type that casts it to a number would undo that.
+ZERO_PADDED_SHARE = 0.10
+
+
+def is_zero_padded(value: Any) -> bool:
+    """``"01711223344"`` is a phone number, not the integer 1711223344.
+
+    Only pure digit strings count, so ``"01/03/2023"`` is still a date.
+    """
+
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return len(text) > 1 and text[0] == "0" and text.isdigit()
+
+
+def zero_padded_share(values: Iterable[Any]) -> float:
+    """The fraction of ``values`` whose leading zero a numeric cast would drop."""
+
+    total = hits = 0
+    for value in values:
+        total += 1
+        hits += is_zero_padded(value)
+    return hits / total if total else 0.0
+
+
 def strip_currency(text: str) -> tuple[str, str | None]:
     """Remove one currency symbol and thousands separators.
 
@@ -422,18 +450,14 @@ def clean_series(
             _, symbol = strip_currency(value)
             if symbol:
                 symbols[symbol] = symbols.get(symbol, 0) + 1
-            text = value.strip()
-            # "01711223344" is a phone number, not the integer 1711223344 —
-            # a leading zero is meaningful and casting would destroy it.  Only
-            # pure digit strings count, so "01/03/2023" still reaches the date
-            # branch below.
-            if len(text) > 1 and text[0] == "0" and text.isdigit():
+            # A leading zero is meaningful and casting would destroy it.
+            if is_zero_padded(value):
                 leading_zero_hits += 1
         if _to_float(value) is not None:
             numeric_hits += 1
 
     numeric_ratio = numeric_hits / total
-    zero_padded = leading_zero_hits / total > 0.10
+    zero_padded = leading_zero_hits / total > ZERO_PADDED_SHARE
     if zero_padded:
         report.notes.append(
             f"{leading_zero_hits / total:.0%} of values are digit strings with a leading zero — "

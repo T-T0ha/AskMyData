@@ -306,9 +306,37 @@ def test_a_reference_between_a_number_and_text_is_recorded_but_not_enforced():
 
     fk = next(fk for table in plan.tables for fk in table.foreign_keys)
     assert fk.enforced is False
-    assert "number and text" in fk.reason
+    assert "an integer and text" in fk.reason
     assert plan.enforced_keys == []
     assert "INTEGER" in fk.reason and "VARCHAR" in fk.reason
+
+
+def test_a_reference_between_an_integer_and_a_decimal_is_not_enforced():
+    """PostgreSQL has no INTEGER = NUMERIC operator, so it refuses the constraint.
+
+    A nullable self-reference (``reports_to``) is read by pandas as floats, and
+    Phase 1 can call whole-number floats continuous, which is stored as NUMERIC.
+    """
+
+    tables = {
+        "staff": pd.DataFrame({"staff_id": [1, 2, 3], "reports_to": [None, 1.0, 1.0]}),
+    }
+    columns = {
+        "staff": [
+            _column("staff_id", "identifier", declared_type="SMALLINT"),
+            _column("reports_to", "integer_continuous", declared_type="SMALLINT"),
+        ],
+    }
+    keys = {"staff": {"primary_key": ["staff_id"]}}
+
+    plan = build_plan(
+        tables, columns, keys, relationships=[_fk("staff", "reports_to", "staff", "staff_id")]
+    )
+
+    fk = plan.tables[0].foreign_keys[0]
+    assert fk.enforced is False
+    assert "a decimal and an integer" in fk.reason
+    assert plan.enforced_keys == []
 
 
 def test_a_reference_between_two_declared_integers_is_still_enforced():
@@ -557,6 +585,28 @@ def test_values_are_prepared_under_their_exported_names(shop):
 
     assert list(frame.columns) == ["order_id", "customer_id", "total"]
     assert frame["total"].tolist() == [1250.0, 37.5]
+
+
+def test_a_numeric_type_never_strips_a_codes_leading_zero(shop):
+    """A session typed before Phase 1 knew better still exports the zip intact."""
+
+    tables, columns, keys = shop
+    tables["sellers"] = pd.DataFrame(
+        {"seller_id": ["S-1", "S-2", "S-3"], "zip": ["01037", "13023", "04195"]}
+    )
+    columns["sellers"] = [
+        _column("seller_id", "identifier", "identifier"),
+        _column("zip", "integer_continuous", "identifier"),
+    ]
+    keys["sellers"] = {"primary_key": ["seller_id"], "source": "detected"}
+
+    plan = build_plan(tables, columns, key_analyses=keys)
+    zip_code = plan.table("sellers").column("zip")
+
+    assert zip_code.type_plan.render() == "TEXT"
+    assert any("leading zero" in note for note in zip_code.type_plan.notes)
+    frame = prepare_frame(plan.table("sellers"), tables["sellers"])
+    assert frame["zip"].tolist() == ["01037", "13023", "04195"]
 
 
 def test_the_whole_relational_fixture_exports_and_answers_a_join(relational_tables):

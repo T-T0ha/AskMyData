@@ -55,6 +55,16 @@ def test_type_cascade(values, name, expected):
     assert _detect(values, name) is expected
 
 
+def test_zip_codes_where_only_some_start_with_zero_are_still_codes():
+    """A third of Brazil's zip prefixes start with 0.  Ingestion keeps such a
+    column as text; calling it an integer here let the export drop the zero,
+    and the zip then matched nothing in the geolocation table."""
+
+    zips = ["01037", "13023", "13844", "20031", "04195", "22790", "01451", "30140", "13023", "20031"]
+
+    assert _detect(zips, "seller_zip_code_prefix") is ColumnType.IDENTIFIER
+
+
 def test_currency_detected_from_stripped_symbol():
     decision = detect_column_type(
         pd.Series([1200.0, 45.5, 2300.0]), "unit_price", currency_symbol="৳"
@@ -241,3 +251,18 @@ def test_pipeline_labels_every_column_of_the_messy_workbook(messy_sheets):
         c.name for table in semantics.values() for c in table.columns if c.taxonomy_label == "unknown"
     ]
     assert unknown == [], f"rule engine left {unknown} unlabelled"
+
+
+def test_binary_values_are_json_safe_in_the_samples():
+    """A bytes cell once reached a JSON column and failed the whole insert."""
+
+    import json
+
+    from app.semantics.profiling import sample_values
+
+    series = pd.Series([b"\x89PNG\r\n", b"", None, bytearray(b"abc"), memoryview(b"xy")])
+
+    samples = sample_values(series, 10)
+
+    assert samples == ["<binary, 6 bytes>", "<binary, 0 bytes>", "<binary, 3 bytes>", "<binary, 2 bytes>"]
+    json.dumps(samples)

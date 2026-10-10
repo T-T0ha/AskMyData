@@ -1,0 +1,578 @@
+{
+  "california_schools": {
+    "session_id": "859cc79d8b16488d9eec0ab27ca6ae7b",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 40.4,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 85.8,
+        "usage": {
+          "calls": 2,
+          "prompt_tokens": 5761,
+          "completion_tokens": 2317,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 8078,
+          "cost_usd": 0.007521,
+          "api_errors": 0,
+          "call_seconds": 6.57,
+          "finish_reasons": {
+            "stop": 1
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 21.0,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 14.3,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791208575.684664,
+    "data_revision": 3,
+    "built_at": 1791208744.8628285,
+    "model_written": {
+      "columns": 89,
+      "described_by_model": 89,
+      "labelled_by_model": 60
+    },
+    "drift": {
+      "columns_compared": 89,
+      "columns_drifted": 0,
+      "by_kind": {
+        "values": 0,
+        "retyped": 0,
+        "reformatted": 0
+      },
+      "drifted": [],
+      "drifted_columns": []
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 2,
+      "prompt_tokens": 5761,
+      "completion_tokens": 2317,
+      "reasoning_tokens": 0,
+      "total_tokens": 8078,
+      "cost_usd": 0.007521
+    }
+  },
+  "formula_1": {
+    "session_id": "8a959e8bac764f4a80648cb9b28ec8b3",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 95.0,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 51.4,
+        "usage": {
+          "calls": 2,
+          "prompt_tokens": 5170,
+          "completion_tokens": 2800,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 7970,
+          "cost_usd": 0.008551,
+          "api_errors": 0,
+          "call_seconds": 8.51,
+          "finish_reasons": {
+            "stop": 1
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 15.5,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 8.3,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791208575.8882,
+    "data_revision": 3,
+    "built_at": 1791208750.999275,
+    "model_written": {
+      "columns": 94,
+      "described_by_model": 94,
+      "labelled_by_model": 70
+    },
+    "drift": {
+      "columns_compared": 94,
+      "columns_drifted": 0,
+      "by_kind": {
+        "values": 0,
+        "retyped": 0,
+        "reformatted": 0
+      },
+      "drifted": [],
+      "drifted_columns": []
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 2,
+      "prompt_tokens": 5170,
+      "completion_tokens": 2800,
+      "reasoning_tokens": 0,
+      "total_tokens": 7970,
+      "cost_usd": 0.008551
+    }
+  },
+  "student_club": {
+    "session_id": "06095d5a1f7a45439ec4d3d6e4db9c95",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 22.6,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 84.0,
+        "usage": {
+          "calls": 4,
+          "prompt_tokens": 6453,
+          "completion_tokens": 1979,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 8432,
+          "cost_usd": 0.006883,
+          "api_errors": 0,
+          "call_seconds": 10.01,
+          "finish_reasons": {
+            "stop": 2
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 40.3,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 9.9,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791208575.7910588,
+    "data_revision": 3,
+    "built_at": 1791208734.706171,
+    "model_written": {
+      "columns": 48,
+      "described_by_model": 48,
+      "labelled_by_model": 15
+    },
+    "drift": {
+      "columns_compared": 48,
+      "columns_drifted": 0,
+      "by_kind": {
+        "values": 0,
+        "retyped": 0,
+        "reformatted": 0
+      },
+      "drifted": [],
+      "drifted_columns": []
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 4,
+      "prompt_tokens": 6453,
+      "completion_tokens": 1979,
+      "reasoning_tokens": 0,
+      "total_tokens": 8432,
+      "cost_usd": 0.006883
+    }
+  },
+  "superhero": {
+    "session_id": "caaeccdc24934495bf416f505140080e",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 12.1,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 18.6,
+        "usage": {
+          "calls": 4,
+          "prompt_tokens": 3741,
+          "completion_tokens": 1561,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 5302,
+          "cost_usd": 0.005025,
+          "api_errors": 0,
+          "call_seconds": 7.44,
+          "finish_reasons": {
+            "stop": 2
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 0.3,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 0.6,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791310022.989335,
+    "data_revision": 3,
+    "built_at": 1791310735.7128572,
+    "model_written": {
+      "columns": 31,
+      "described_by_model": 31,
+      "labelled_by_model": 17
+    },
+    "drift": {
+      "columns_compared": 31,
+      "columns_drifted": 0,
+      "by_kind": {
+        "values": 0,
+        "retyped": 0,
+        "reformatted": 0
+      },
+      "drifted": [],
+      "drifted_columns": []
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 4,
+      "prompt_tokens": 3741,
+      "completion_tokens": 1561,
+      "reasoning_tokens": 0,
+      "total_tokens": 5302,
+      "cost_usd": 0.005025
+    }
+  },
+  "thrombosis_prediction": {
+    "session_id": "6d243eaacb734b5188039dfcafe498e6",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 11.6,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 13.4,
+        "usage": {
+          "calls": 2,
+          "prompt_tokens": 4232,
+          "completion_tokens": 2080,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 6312,
+          "cost_usd": 0.00647,
+          "api_errors": 0,
+          "call_seconds": 6.45,
+          "finish_reasons": {
+            "stop": 1
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 7.8,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 1.3,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791208746.7566435,
+    "data_revision": 3,
+    "built_at": 1791208781.7514374,
+    "model_written": {
+      "columns": 64,
+      "described_by_model": 64,
+      "labelled_by_model": 55
+    },
+    "drift": {
+      "columns_compared": 64,
+      "columns_drifted": 0,
+      "by_kind": {
+        "values": 0,
+        "retyped": 0,
+        "reformatted": 0
+      },
+      "drifted": [],
+      "drifted_columns": []
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 2,
+      "prompt_tokens": 4232,
+      "completion_tokens": 2080,
+      "reasoning_tokens": 0,
+      "total_tokens": 6312,
+      "cost_usd": 0.00647
+    }
+  },
+  "toxicology": {
+    "session_id": "00aba2f20b9f4c3882d8178906e0ee48",
+    "stage": "exported",
+    "stages": {
+      "ingested": {
+        "seconds": 0.9,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "semantics": {
+        "seconds": 5.6,
+        "usage": {
+          "calls": 4,
+          "prompt_tokens": 1718,
+          "completion_tokens": 510,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 2228,
+          "cost_usd": 0.00179,
+          "api_errors": 0,
+          "call_seconds": 4.16,
+          "finish_reasons": {
+            "stop": 2
+          }
+        }
+      },
+      "relationships": {
+        "seconds": 0.5,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      },
+      "exported": {
+        "seconds": 1.8,
+        "usage": {
+          "calls": 0,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "reasoning_tokens": 0,
+          "cached_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "api_errors": 0,
+          "call_seconds": 0.0,
+          "finish_reasons": {}
+        }
+      }
+    },
+    "started_at": 1791208772.5007,
+    "data_revision": 3,
+    "built_at": 1791208781.7391257,
+    "model_written": {
+      "columns": 11,
+      "described_by_model": 11,
+      "labelled_by_model": 3
+    },
+    "drift": {
+      "columns_compared": 11,
+      "columns_drifted": 0,
+      "by_kind": {
+        "values": 0,
+        "retyped": 0,
+        "reformatted": 0
+      },
+      "drifted": [],
+      "drifted_columns": []
+    },
+    "tables_missing_from_export": [],
+    "build_usage": {
+      "calls": 4,
+      "prompt_tokens": 1718,
+      "completion_tokens": 510,
+      "reasoning_tokens": 0,
+      "total_tokens": 2228,
+      "cost_usd": 0.00179
+    }
+  }
+}

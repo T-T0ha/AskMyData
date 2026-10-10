@@ -171,6 +171,41 @@ def test_a_large_table_is_truncated_and_says_so(tmp_path: Path):
     assert any("first 10 rows" in issue.message for issue in result.issues)
 
 
+def test_binary_columns_are_left_out_and_the_sheet_says_so(tmp_path: Path):
+    """A photo cannot be profiled, so it is not read, and the schema still lists it."""
+
+    path = tmp_path / "staff.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE staff (id INTEGER PRIMARY KEY, name TEXT, photo BLOB)")
+    connection.executemany(
+        "INSERT INTO staff VALUES (?, ?, ?)",
+        [(1, "Rahim", b"\x89PNG\r\n\x00\xff"), (2, "Karim", b""), (3, "Nusrat", None)],
+    )
+    connection.commit()
+    connection.close()
+
+    result = load_relational_tables(sqlite_url(path))[0]
+
+    assert list(result.dataframe.columns) == ["id", "name"]
+    assert [label[0] for label in result.header.original_labels] == ["id", "name"]
+    assert "photo" in [c["name"] for c in result.native_schema["columns"]]
+    skipped = [i for i in result.issues if i.code == "binary_columns_skipped"]
+    assert len(skipped) == 1 and skipped[0].severity == "info"
+    assert skipped[0].columns == ["photo"]
+
+
+def test_a_table_of_only_binary_columns_is_refused(tmp_path: Path):
+    path = tmp_path / "blobs.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE blobs (data BLOB)")
+    connection.execute("INSERT INTO blobs VALUES (x'00ff')")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(SourceError, match="only binary columns"):
+        load_relational_tables(sqlite_url(path))
+
+
 def test_unsupported_backends_are_refused():
     """The URL is user input; SQLAlchemy would load any dialect plugin named in it."""
 

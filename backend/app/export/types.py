@@ -71,6 +71,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.types import TypeEngine
 
 from app.core.schemas import ColumnType
+from app.ingestion.cleaning import ZERO_PADDED_SHARE, zero_padded_share
 from app.semantics.column_types import BOOLEAN_FALSE, BOOLEAN_TRUE
 
 #: ``INTEGER`` is 32-bit.  A count of milliseconds, a national ID number or a
@@ -278,6 +279,21 @@ def plan_type(
     values = series.dropna()
     if values.empty:
         return TypePlan(column_type, sql_type, notes)
+
+    # Ingestion kept these as text so their leading zeros survive; a numeric
+    # column would turn "01037" into 1037 on insert.  A nominal code is
+    # already stored as text and needs no help.
+    if (
+        column_type.is_numeric
+        and column_type is not ColumnType.INTEGER_NOMINAL
+        and not pd.api.types.is_numeric_dtype(values)
+        and (padded := zero_padded_share(values)) > ZERO_PADDED_SHARE
+    ):
+        notes.append(
+            f"declared {render_type(sql_type)} by type, kept as TEXT: {padded:.0%} of values "
+            "are digit strings with a leading zero, which a number would drop"
+        )
+        return TypePlan(column_type, Text(), notes, stored_as=ColumnType.TEXT)
 
     kept = _keep_declared(column_type, values, family) if family else None
     if kept is not None:
