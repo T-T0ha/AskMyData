@@ -604,7 +604,7 @@ def test_a_query_that_fails_only_at_execution_is_retried_with_the_error(
         ]
     )
 
-    real_run_readonly = services.run_readonly
+    real_run_readonly = services.query.run_readonly
     calls = {"n": 0}
 
     def flaky_run_readonly(session_id_, sql, row_cap):
@@ -613,7 +613,7 @@ def test_a_query_that_fails_only_at_execution_is_retried_with_the_error(
             raise RuntimeError('invalid input syntax for type numeric: ""')
         return real_run_readonly(session_id_, sql, row_cap)
 
-    monkeypatch.setattr(services, "run_readonly", flaky_run_readonly)
+    monkeypatch.setattr(services.query, "run_readonly", flaky_run_readonly)
 
     with _db() as db:
         record = db.get(IngestionSession, session_id)
@@ -640,7 +640,7 @@ def test_a_query_that_always_fails_at_execution_still_returns_a_normal_result(
     def always_fails(session_id_, sql, row_cap):
         raise RuntimeError('invalid value "TOTAL" for "Mon"')
 
-    monkeypatch.setattr(services, "run_readonly", always_fails)
+    monkeypatch.setattr(services.query, "run_readonly", always_fails)
 
     with _db() as db:
         record = db.get(IngestionSession, session_id)

@@ -253,11 +253,13 @@ def _install_query_timeouts(paths: dict[str, Path], timeout: float) -> None:
 
     ``app.export.runner`` bounds a runaway query only on PostgreSQL
     (``statement_timeout``).  On SQLite one bad cross join would hold a lane for
-    as long as it likes.  ``answer_question`` calls ``services.explain`` and
-    ``services.run_readonly``; these stand in for them with the same contract
-    (same exceptions to the retry loop, same ``(columns, row dicts, truncated)``
-    result) plus a deadline, whose message goes back to the model like any other
-    error.
+    as long as it likes.  ``answer_question`` calls ``explain`` and
+    ``run_readonly`` as names in ``app.api.services.query``; these stand in for
+    them with the same contract (same exceptions to the retry loop, same
+    ``(columns, row dicts, truncated)`` result) plus a deadline, whose message
+    goes back to the model like any other error.  They are installed on that
+    module, where ``answer_question`` looks them up — set on the ``services``
+    package they would never be called.
     """
 
     def explain(session_id: str, statement: str) -> None:
@@ -269,8 +271,8 @@ def _install_query_timeouts(paths: dict[str, Path], timeout: float) -> None:
         )
         return columns, [dict(zip(columns, row)) for row in rows], truncated
 
-    services.explain = explain  # type: ignore[assignment]
-    services.run_readonly = run_readonly  # type: ignore[assignment]
+    services.query.explain = explain  # type: ignore[assignment]
+    services.query.run_readonly = run_readonly  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------

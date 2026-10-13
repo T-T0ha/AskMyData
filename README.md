@@ -67,6 +67,7 @@ cp .env.example .env
 To skip Docker, point `DATABASE_URL` at a SQLite file (`sqlite:///./backend/var/semanticlayer.db`). Everything works except pgvector similarity search, which falls back to JSON embeddings.
 
 
+
 ## Evaluation on BIRD
 
 `backend/evaluation/bird/` benchmarks the full pipeline against a raw baseline on the [BIRD](https://bird-bench.github.io/) dev set, scoring by execution accuracy against the gold SQL.

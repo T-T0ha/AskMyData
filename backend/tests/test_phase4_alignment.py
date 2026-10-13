@@ -421,7 +421,7 @@ def test_the_archive_is_bounded(client, relational_workbook, monkeypatch):
 
     from app.api import services
 
-    monkeypatch.setattr(services, "MAX_LAYER_VERSIONS", 2)
+    monkeypatch.setattr(services.export, "MAX_LAYER_VERSIONS", 2)
     session_id = _uploaded(client, relational_workbook)
     for _ in range(3):
         client.post(f"/api/sessions/{session_id}/export")

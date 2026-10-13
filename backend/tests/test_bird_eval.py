@@ -1278,3 +1278,33 @@ def test_a_new_session_does_not_inherit_what_the_old_one_measured(tmp_path):
     assert session_build.read_manifest(tmp_path)["superhero"] == entry
     merged = session_build._update_manifest(tmp_path, "superhero", stage="ingested")
     assert merged == {"session_id": "new", "stage": "ingested"}, "later stages still merge"
+
+
+def test_the_query_deadline_replaces_what_answer_question_actually_calls(tmp_path, monkeypatch):
+    """``answer_question`` looks ``explain`` and ``run_readonly`` up in its own module.
+
+    The harness's SQLite deadline has to land there: installed anywhere else, every
+    semantic-arm query would run with no deadline at all, and nothing would say so.
+    """
+
+    import sqlite3
+
+    from app.api import services
+    from evaluation.bird import runner
+
+    # Whatever the harness installs over these, monkeypatch puts the real ones back.
+    monkeypatch.setattr(services.query, "explain", services.query.explain)
+    monkeypatch.setattr(services.query, "run_readonly", services.query.run_readonly)
+
+    path = tmp_path / "export.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE t (n INTEGER)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(1,), (2,), (3,)])
+    conn.commit()
+    conn.close()
+
+    runner._install_query_timeouts({"s1": path}, 5.0)
+
+    services.query.explain("s1", "SELECT n FROM t")
+    result = services.query.run_readonly("s1", "SELECT n FROM t ORDER BY n", 2)
+    assert result == (["n"], [{"n": 1}, {"n": 2}], True)
